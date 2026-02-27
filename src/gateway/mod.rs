@@ -16,6 +16,7 @@ use crate::channels::{
     Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel, WhatsAppChannel,
 };
 use crate::config::Config;
+use crate::config::GatewayConfig;
 use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, ChatMessage, Provider};
@@ -529,9 +530,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             .map(Arc::from);
 
     // ── Pairing guard ──────────────────────────────────────
+    // Where PairingGuard::new() is called, inject the pre-shared token into the existing tokens list
+    let mut initial_tokens = config.gateway.paired_tokens.clone();
+    if let Some(ref pst) = config.gateway.pre_shared_token {
+        initial_tokens.push(pst.clone());
+    }
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
-        &config.gateway.paired_tokens,
+        &initial_tokens,
     ));
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
@@ -2773,5 +2779,49 @@ mod tests {
 
         // Should be allowed again
         assert!(limiter.allow("burst-ip"));
+    }
+
+    #[test]
+    fn pre_shared_token_is_accepted_by_pairing_guard() {
+        let token = "my-secret-pre-shared-token";
+        let guard = PairingGuard::new(true, &[token.to_string()]);
+        assert!(guard.is_authenticated(token));
+    }
+
+    #[test]
+    fn pre_shared_token_coexists_with_paired_tokens() {
+        let pst = "pre-shared-token";
+        let guard = PairingGuard::new(true, &[pst.to_string()]);
+
+        assert!(guard.is_authenticated(pst));
+        assert!(!guard.is_authenticated("wrong-token"));
+    }
+
+    #[tokio::test]
+    async fn pre_shared_token_survives_normal_pairing_flow() {
+        let pst = "pre-shared-token";
+        let guard = PairingGuard::new(true, &[pst.to_string()]);
+
+        if let Some(code) = guard.pairing_code() {
+            let paired = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
+            assert!(guard.is_authenticated(pst));
+            assert!(guard.is_authenticated(&paired));
+        }
+
+        assert!(guard.is_authenticated(pst));
+    }
+
+    #[test]
+    fn pre_shared_token_config_field_deserializes_from_toml() {
+        let toml_str = r#"pre_shared_token = "test-token-123""#;
+        let gw: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(gw.pre_shared_token.as_deref(), Some("test-token-123"));
+    }
+
+    #[test]
+    fn missing_pre_shared_token_defaults_to_none() {
+        let toml_str = "";
+        let gw: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert!(gw.pre_shared_token.is_none());
     }
 }

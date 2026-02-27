@@ -56,6 +56,21 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 
 <p align="center"><code>Trait-driven architecture · secure-by-default runtime · provider/channel/tool swappable · pluggable everything</code></p>
 
+### Fork Details
+This is a fork of the official Zeroclaw repo that is patched with a pre-shared token functionality. This allows the claw instance to be pre-seeded with a pairing token to allow faster cold starts and simpler infrastructure design through configmap injection of tokens for cloud-provisioned services.
+
+#### Change Log
+*
+
+#### Build Process
+```
+GIT_SHA=$(git rev-parse --short HEAD)
+  IMAGE="northamerica-northeast1-docker.pkg.dev/rinkai-prod/rinkai-images/rinkai-claw-
+  runtime"
+
+docker build --target release -t ${IMAGE}:${GIT_SHA} -t ${IMAGE}:latest .
+```
+
 ### 📢 Announcements
 
 Use this board for important notices (breaking changes, security advisories, maintenance windows, and release blockers).
