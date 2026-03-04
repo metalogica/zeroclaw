@@ -63,9 +63,14 @@ Sovereign fork with a pre-shared token functionality to simplify and speed up co
 * **0.1.8-alpha-p1**: Adds a pre-shared token functionality. This allows the claw instance to be pre-seeded with a pairing token to allow faster cold starts and simpler infrastructure design through configmap injection of tokens for cloud-provisioned services.
 
 #### Dev process
+Sync latest upstream changes to `main`.
+
 ```
+git co main
+
 git fetch upstream
 
+# only sync code from release tags; avoid nightly builds
 git rebase 0.1.9
 
 cargo check
