@@ -57,8 +57,24 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 <p align="center"><code>Trait-driven architecture · secure-by-default runtime · provider/channel/tool swappable · pluggable everything</code></p>
 
 ### Fork Details
+Sovereign fork with a pre-shared token functionality to simplify and speed up container service load time when hosted in Kubernetes.
+
 #### Change Log
 * **0.1.8-alpha-p1**: Adds a pre-shared token functionality. This allows the claw instance to be pre-seeded with a pairing token to allow faster cold starts and simpler infrastructure design through configmap injection of tokens for cloud-provisioned services.
+
+#### Dev process
+```
+git fetch upstream
+
+git rebase 0.1.9
+
+cargo check
+
+## Open Claw migration wizard thread is unstable and causes false positive test failure
+cargo test -- -test-threads=1
+
+cargo clean
+```
 
 #### Build Process
 ```
