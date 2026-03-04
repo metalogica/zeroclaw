@@ -82,6 +82,7 @@ GIT_SHA=$(git rev-parse --short HEAD)
 
 IMAGE="northamerica-northeast1-docker.pkg.dev/rinkai-prod/rinkai-images/rinkai-claw-runtime"
 
+# Dont forget to set the container iamge tag in K8s
 docker build --target release -t ${IMAGE}:${GIT_SHA} -t ${IMAGE}:latest .
 docker push ${IMAGE}:${GIT_SHA}
 docker push ${IMAGE}:latest
