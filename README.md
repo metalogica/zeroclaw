@@ -100,11 +100,11 @@ docker buildx build \
   --push \
 
 # test docker image locally
- docker run --rm \
-  --network container:zeroclaw-test \
-  curlimages/curl \
-  curl -X POST http://localhost:42617/pair \
-  -H "X-Pairing-Code: <CODE>"
+docker run --rm --network container:zeroclaw-test curlimages/curl \
+  curl -s http://localhost:42617/api/chat \
+  -H "Authorization: Bearer my-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "hello"}'
 ```
 
 ### 📢 Announcements
