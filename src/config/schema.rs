@@ -1755,6 +1755,10 @@ pub struct GatewayConfig {
     /// Node-control protocol scaffold (`[gateway.node_control]`).
     #[serde(default)]
     pub node_control: NodeControlConfig,
+
+    /// Pre-shared bearer token — skips pairing dance for headless deployments
+    #[serde(default)]
+    pub pre_shared_token: Option<String>,
 }
 
 /// Node-control scaffold settings under `[gateway.node_control]`.
@@ -1822,6 +1826,7 @@ impl Default for GatewayConfig {
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             node_control: NodeControlConfig::default(),
+            pre_shared_token: None,
         }
     }
 }
@@ -11513,6 +11518,7 @@ channel_id = "C123"
                 auth_token: Some("node-token".into()),
                 allowed_node_ids: vec!["node-1".into(), "node-2".into()],
             },
+            pre_shared_token: None,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();

@@ -56,6 +56,21 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 
 <p align="center"><code>Trait-driven architecture · secure-by-default runtime · provider/channel/tool swappable · pluggable everything</code></p>
 
+### Fork Details
+#### Change Log
+* **0.1.8-alpha-p1**: Adds a pre-shared token functionality. This allows the claw instance to be pre-seeded with a pairing token to allow faster cold starts and simpler infrastructure design through configmap injection of tokens for cloud-provisioned services.
+
+#### Build Process
+```
+GIT_SHA=$(git rev-parse --short HEAD)
+
+IMAGE="northamerica-northeast1-docker.pkg.dev/rinkai-prod/rinkai-images/rinkai-claw-runtime"
+
+docker build --target release -t ${IMAGE}:${GIT_SHA} -t ${IMAGE}:latest .
+docker push ${IMAGE}:${GIT_SHA}
+docker push ${IMAGE}:latest
+```
+
 ### 📢 Announcements
 
 Use this board for important notices (breaking changes, security advisories, maintenance windows, and release blockers).
