@@ -85,10 +85,26 @@ cargo clean
 ```
 # Dont forget to set the container image tag in K8s
 GIT_SHA=$(git rev-parse --short HEAD) && \
-  IMAGE="northamerica-northeast1-docker.pkg.dev/rinkai-prod/rinkai-images/rinkai-claw-runtime" && \
-  docker build --target release -t ${IMAGE}:${GIT_SHA} -t ${IMAGE}:latest .
+  IMAGE="northamerica-northeast1-docker.pkg.dev/rinkai-prod/rinkai-images/rinkai-claw-runtime"
+
+# For ARM builds
+docker build --target release -t ${IMAGE}:${GIT_SHA} -t ${IMAGE}:latest .
   docker push ${IMAGE}:${GIT_SHA} && \
   docker push ${IMAGE}:latest
+
+# For Intel/AMD builds
+docker buildx build \
+  --platform linux/amd64 \
+  --target release \
+  -t northamerica-northeast1-docker.pkg.dev/rinkai-prod/rinkai-images/rinkai-claw-runtime:x86 \
+  --push \
+
+# test docker image locally
+ docker run --rm \
+  --network container:zeroclaw-test \
+  curlimages/curl \
+  curl -X POST http://localhost:42617/pair \
+  -H "X-Pairing-Code: <CODE>"
 ```
 
 ### 📢 Announcements
