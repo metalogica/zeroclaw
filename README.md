@@ -95,7 +95,7 @@ docker build --target release -t ${IMAGE}:${GIT_SHA} -t ${IMAGE}:latest .
   docker push ${IMAGE}:latest
 
 # For Intel/AMD builds
-dockerbuildx build \
+docker buildx build \
   --platform linux/amd64 \
   --target release \
   -t northamerica-northeast1-docker.pkg.dev/clawcraft-489901/clawcraft-images/clawcraft-claw-runtime:x86 \
