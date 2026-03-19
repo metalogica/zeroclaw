@@ -894,6 +894,7 @@ pub(crate) async fn agent_turn(
     silent: bool,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    excluded_tools: &[String],
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -911,7 +912,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         None,
-        &[],
+        excluded_tools,
     )
     .await
 }
@@ -3234,6 +3235,9 @@ pub async fn process_message_with_session(
             "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
         ));
     }
+    let excluded = &config.autonomy.non_cli_excluded_tools;
+    tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -3305,6 +3309,7 @@ pub async fn process_message_with_session(
                 true,
                 &config.multimodal,
                 config.agent.max_tool_iterations,
+                &config.autonomy.non_cli_excluded_tools,
             ),
         ),
     )
