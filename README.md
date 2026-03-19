@@ -66,7 +66,7 @@ Sovereign fork with a pre-shared token functionality to simplify and speed up co
 #### Dev process
 Sync latest upstream changes to `main`.
 
-```
+```bash
 git co main
 
 git fetch upstream
@@ -83,11 +83,12 @@ cargo clean
 ```
 
 #### Build Process
-```
+```bash
 # Dont forget to set the container image tag in K8s
 GIT_SHA=$(git rev-parse --short HEAD) && \
   IMAGE="northamerica-northeast1-docker.pkg.dev/clawcraft-489901/clawcraft-images/clawcraft-claw-runtime
 
+TAG=0.1.8-alpha-p2
 
 # For ARM builds
 docker build --target release -t ${IMAGE}:${GIT_SHA} -t ${IMAGE}:latest .
@@ -98,16 +99,24 @@ docker build --target release -t ${IMAGE}:${GIT_SHA} -t ${IMAGE}:latest .
 docker buildx build \
   --platform linux/amd64 \
   --target release \
-  -t northamerica-northeast1-docker.pkg.dev/clawcraft-489901/clawcraft-images/clawcraft-claw-runtime:x86 \
+  -t northamerica-northeast1-docker.pkg.dev/clawcraft-489901/clawcraft-images/clawcraft-claw-runtime:$TAG \
   --push \
   .
 
 # test docker image locally
+docker run -d --name zeroclaw-test \--platform linux/amd64 \
+  --platform linux/amd64 \
+  -p 42617:42617 \
+  -e CONTAINER_SERVICE_TOKEN="my-secret-token" \
+  northamerica-northeast1-docker.pkg.dev/clawcraft-489901/clawcraft-images/clawcraft-claw-runtime:0.1.8-alpha-p2
+
 docker run --rm --network container:zeroclaw-test curlimages/curl \
   curl -s http://localhost:42617/api/chat \
   -H "Authorization: Bearer my-secret-token" \
   -H "Content-Type: application/json" \
   -d '{"message": "hello"}'
+
+docker container rm zeroclaw-test --force
 ```
 
 ### 📢 Announcements
