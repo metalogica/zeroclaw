@@ -106,15 +106,19 @@ docker buildx build \
 # test docker image locally
 docker run -d --name zeroclaw-test \--platform linux/amd64 \
   --platform linux/amd64 \
+  -e ZEROCLAW_GATEWAY_HOST="0.0.0.0" \
   -p 42617:42617 \
   -e CONTAINER_SERVICE_TOKEN="my-secret-token" \
-  northamerica-northeast1-docker.pkg.dev/clawcraft-489901/clawcraft-images/clawcraft-claw-runtime:0.1.8-alpha-p2
+  -e ZEROCLAW_ALLOW_PUBLIC_BIND="true" \
+  northamerica-northeast1-docker.pkg.dev/clawcraft-489901/clawcraft-images/clawcraft-claw-runtime:$TAG
 
 docker run --rm --network container:zeroclaw-test curlimages/curl \
   curl -s http://localhost:42617/api/chat \
   -H "Authorization: Bearer my-secret-token" \
   -H "Content-Type: application/json" \
   -d '{"message": "hello"}'
+
+docker logs zeroclaw-test
 
 docker container rm zeroclaw-test --force
 ```
