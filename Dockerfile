@@ -127,7 +127,7 @@ FROM cgr.dev/chainguard/wolfi-base:latest AS release
 
 # Runtime deps: glibc-compatible, zero-CVE base, shell + tools
 RUN apk add --no-cache bash git curl ca-certificates && \
-    adduser -D -u 65534 zeroclaw
+    adduser -D -u 1000 zeroclaw
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /zeroclaw-data /zeroclaw-data
@@ -142,7 +142,7 @@ ENV ZEROCLAW_GATEWAY_PORT=42617
 # API_KEY must be provided at runtime!
 
 WORKDIR /zeroclaw-data
-USER zeroclaw
+USER 1000:1000
 EXPOSE 42617
 ENTRYPOINT ["zeroclaw"]
 CMD ["gateway"]

@@ -60,6 +60,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 Sovereign fork with a pre-shared token functionality to simplify and speed up container service load time when hosted in Kubernetes.
 
 #### Change Log
+* **0.1.8-alpha-p3**: Use Wolfi insteads iof distroless container image.
 * **0.1.8-alpha-p2**: Fix a bug in the non_cli_excluded_tools. The `/api/tools` and are callable despite being in the exclusion list.
 * **0.1.8-alpha-p1**: Adds a pre-shared token functionality. This allows the claw instance to be pre-seeded with a pairing token to allow faster cold starts and simpler infrastructure design through configmap injection of tokens for cloud-provisioned services.
 
@@ -85,15 +86,14 @@ cargo clean
 #### Build Process
 ```bash
 # Dont forget to set the container image tag in K8s
-GIT_SHA=$(git rev-parse --short HEAD) && \
-  IMAGE="northamerica-northeast1-docker.pkg.dev/clawcraft-489901/clawcraft-images/clawcraft-claw-runtime
+GIT_SHA=$(git rev-parse --short HEAD)
 
-TAG=0.1.8-alpha-p2
+IMAGE="northamerica-northeast1-docker.pkg.dev/clawcraft-489901/clawcraft-images/clawcraft-claw-runtime"
 
-# For ARM builds
-docker build --target release -t ${IMAGE}:${GIT_SHA} -t ${IMAGE}:latest .
-  docker push ${IMAGE}:${GIT_SHA} && \
-  docker push ${IMAGE}:latest
+TAG=0.1.8-alpha-p3
+
+# ARM builds for lcoal testing on MAC
+docker build --target release -t catonmat/zeroclaw:$TAG .
 
 # For Intel/AMD builds
 docker buildx build \
