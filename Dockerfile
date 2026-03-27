@@ -122,24 +122,27 @@ EXPOSE 42617
 ENTRYPOINT ["zeroclaw"]
 CMD ["gateway"]
 
-# ── Stage 3: Production Runtime (Distroless) ─────────────────
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
+# ── Stage 3: Production Runtime (Wolfi) ───────────────────────
+FROM cgr.dev/chainguard/wolfi-base:latest AS release
+
+# Runtime deps: glibc-compatible, zero-CVE base, shell + tools
+RUN apk add --no-cache bash git curl ca-certificates && \
+    adduser -D -u 65534 zeroclaw
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /zeroclaw-data /zeroclaw-data
+RUN chown -R zeroclaw:zeroclaw /zeroclaw-data
 
 # Environment setup
 ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
 ENV HOME=/zeroclaw-data
-# Default provider and model are set in config.toml, not here,
-# so config file edits are not silently overridden
-#ENV PROVIDER=
+ENV SHELL=/bin/bash
 ENV ZEROCLAW_GATEWAY_PORT=42617
 
 # API_KEY must be provided at runtime!
 
 WORKDIR /zeroclaw-data
-USER 65534:65534
+USER zeroclaw
 EXPOSE 42617
 ENTRYPOINT ["zeroclaw"]
 CMD ["gateway"]
