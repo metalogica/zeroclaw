@@ -2095,6 +2095,13 @@ pub struct GatewayConfig {
     /// Persist gateway WebSocket chat sessions to SQLite. Default: true.
     #[serde(default = "default_true")]
     pub session_persistence: bool,
+    /// Node-control protocol scaffold (`[gateway.node_control]`).
+    #[serde(default)]
+    pub node_control: NodeControlConfig,
+
+    /// Pre-shared bearer token — skips pairing dance for headless deployments
+    #[serde(default)]
+    pub pre_shared_token: Option<String>,
 
     /// Auto-archive stale gateway sessions older than N hours. 0 = disabled. Default: 0.
     #[serde(default)]
@@ -2160,6 +2167,7 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+<<<<<<< HEAD
             session_persistence: true,
             session_ttl_hours: 0,
             pairing_dashboard: PairingDashboardConfig::default(),
@@ -2305,6 +2313,10 @@ impl Default for NodeTransportConfig {
             tls_key_path: None,
             mutual_tls: false,
             connection_pool_size: default_connection_pool_size(),
+=======
+            node_control: NodeControlConfig::default(),
+            pre_shared_token: None,
+>>>>>>> ab149855 (feat: add preshared token and update docs)
         }
     }
 }
@@ -13303,10 +13315,19 @@ channel_ids = ["C123", "D456"]
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
+<<<<<<< HEAD
             session_persistence: true,
             session_ttl_hours: 0,
             pairing_dashboard: PairingDashboardConfig::default(),
             tls: None,
+=======
+            node_control: NodeControlConfig {
+                enabled: true,
+                auth_token: Some("node-token".into()),
+                allowed_node_ids: vec!["node-1".into(), "node-2".into()],
+            },
+            pre_shared_token: None,
+>>>>>>> ab149855 (feat: add preshared token and update docs)
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
