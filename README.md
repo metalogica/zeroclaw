@@ -191,6 +191,57 @@ Default behavior on all channels:
 <!-- BEGIN:WHATS_NEW -->
 <!-- END:WHATS_NEW -->
 
+### Fork Details
+Sovereign fork with a pre-shared token functionality to simplify and speed up container service load time when hosted in Kubernetes.
+
+#### Change Log
+* **0.1.8-alpha-p1**: Adds a pre-shared token functionality. This allows the claw instance to be pre-seeded with a pairing token to allow faster cold starts and simpler infrastructure design through configmap injection of tokens for cloud-provisioned services.
+
+#### Dev process
+Sync latest upstream changes to `main`.
+
+```
+git co main
+
+git fetch upstream
+
+# only sync code from release tags; avoid nightly builds
+git rebase 0.1.9
+
+cargo check
+
+## Open Claw migration wizard thread is unstable and causes false positive test failure
+cargo test -- --test-threads=1
+
+cargo clean
+```
+
+#### Build Process
+```
+# Dont forget to set the container image tag in K8s
+GIT_SHA=$(git rev-parse --short HEAD) && \
+  IMAGE="northamerica-northeast1-docker.pkg.dev/rinkai-prod/rinkai-images/rinkai-claw-runtime"
+
+# For ARM builds
+docker build --target release -t ${IMAGE}:${GIT_SHA} -t ${IMAGE}:latest .
+  docker push ${IMAGE}:${GIT_SHA} && \
+  docker push ${IMAGE}:latest
+
+# For Intel/AMD builds
+docker buildx build \
+  --platform linux/amd64 \
+  --target release \
+  -t northamerica-northeast1-docker.pkg.dev/rinkai-prod/rinkai-images/rinkai-claw-runtime:x86 \
+  --push \
+
+# test docker image locally
+docker run --rm --network container:zeroclaw-test curlimages/curl \
+  curl -s http://localhost:42617/api/chat \
+  -H "Authorization: Bearer my-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "hello"}'
+```
+
 ### 📢 Announcements
 
 Use this board for important notices (breaking changes, security advisories, maintenance windows, and release blockers).

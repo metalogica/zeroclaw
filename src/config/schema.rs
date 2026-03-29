@@ -2212,6 +2212,10 @@ pub struct GatewayConfig {
     #[serde(default = "default_true")]
     pub session_persistence: bool,
 
+    /// Pre-shared bearer token — skips pairing dance for headless deployments
+    #[serde(default)]
+    pub pre_shared_token: Option<String>,
+
     /// Auto-archive stale gateway sessions older than N hours. 0 = disabled. Default: 0.
     #[serde(default)]
     pub session_ttl_hours: u32,
@@ -2279,6 +2283,7 @@ impl Default for GatewayConfig {
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             session_persistence: true,
+            pre_shared_token: None,
             session_ttl_hours: 0,
             pairing_dashboard: PairingDashboardConfig::default(),
             tls: None,
@@ -12872,6 +12877,7 @@ channel_ids = ["C123", "D456"]
             session_ttl_hours: 0,
             pairing_dashboard: PairingDashboardConfig::default(),
             tls: None,
+            pre_shared_token: None,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
