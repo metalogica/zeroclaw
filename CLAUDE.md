@@ -1,7 +1,75 @@
-# CLAUDE.md — ZeroClaw Agent Engineering Protocol
+# CLAUDE.md
 
-This file defines the default working protocol for Claude agents in this repository.
-Scope: entire repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+---
+
+ZeroClaw Agent Engineering Protocol — scope: entire repository.
+
+## 0) Fork Context
+
+This is a **sovereign fork** of `zeroclaw-labs/zeroclaw` with pre-shared token functionality for containerized/Kubernetes deployments. Key fork additions:
+
+- **Pre-shared bearer token** (`config.gateway.pre_shared_token`): skip the pairing dance for faster container cold starts
+- **`non_cli_excluded_tools` enforcement** on `/api/chat` requests
+- Sync upstream changes from release tags only (not nightly); see README for sync process
+
+## 0.1) Quick Dev Reference
+
+### Build & Check
+
+```bash
+cargo build                              # debug build
+cargo build --release --locked           # release build (what CI runs)
+cargo check --workspace --locked         # workspace-wide check
+cargo check -p zeroclaw-types --locked   # single crate
+```
+
+### Test
+
+```bash
+cargo test --locked --verbose            # all tests (unit + integration)
+cargo test --locked -- --test-threads=1  # recommended: migration wizard thread is unstable
+cargo test --test agent_e2e --locked     # single integration test file
+cargo test test_name -- --nocapture      # single test by name
+cargo bench --locked                     # benchmarks (Criterion)
+```
+
+### Lint
+
+```bash
+cargo fmt --all -- --check               # format check (CI gate)
+cargo fmt --all                          # apply formatting
+cargo clippy --all-targets -- -D warnings  # strict clippy (CI gate)
+```
+
+### Local CI (Docker-based)
+
+```bash
+./dev/ci.sh all          # lint + test + build + security + docker-smoke
+./dev/ci.sh lint         # fmt + clippy correctness
+./dev/ci.sh test         # cargo test
+./dev/ci.sh build        # release build smoke
+./dev/ci.sh shell        # interactive shell in CI container
+```
+
+### Toolchain
+
+- **MSRV**: 1.87 (set in `Cargo.toml` `rust-version`)
+- **CI toolchain**: pinned to specific stable version (see `.github/workflows/ci-run.yml`)
+- **Binary size**: target 5 MB, advisory 20 MB, hard limit 28 MB (`scripts/ci/check_binary_size.sh`)
+- **Release profile**: `opt-level = "z"`, fat LTO, `codegen-units = 1`, strip, panic=abort
+
+### Workspace Crates
+
+- `zeroclaw` (root) — main binary and library
+- `crates/zeroclaw-types` — shared type definitions
+- `crates/zeroclaw-core` — core abstractions
+- `crates/robot-kit` — robotics/hardware kit
+
+### Feature Flags (all off by default)
+
+Key optional features: `hardware`, `channel-matrix`, `channel-lark`, `memory-postgres`, `observability-otel`, `peripheral-rpi`, `browser-native`, `runtime-wasm`, `sandbox-landlock`, `wasm-tools`, `whatsapp-web`, `rag-pdf`, `web-fetch-html2md`. See `Cargo.toml [features]` for full list.
 
 ## 1) Project Snapshot (Read First)
 
