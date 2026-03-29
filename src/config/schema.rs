@@ -13315,19 +13315,16 @@ channel_ids = ["C123", "D456"]
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
-<<<<<<< HEAD
             session_persistence: true,
             session_ttl_hours: 0,
             pairing_dashboard: PairingDashboardConfig::default(),
             tls: None,
-=======
             node_control: NodeControlConfig {
                 enabled: true,
                 auth_token: Some("node-token".into()),
                 allowed_node_ids: vec!["node-1".into(), "node-2".into()],
             },
             pre_shared_token: None,
->>>>>>> ab149855 (feat: add preshared token and update docs)
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
