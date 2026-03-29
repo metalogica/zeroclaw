@@ -198,12 +198,14 @@ Default behavior on all channels:
 Sovereign fork with a pre-shared token functionality to simplify and speed up container service load time when hosted in Kubernetes.
 
 #### Change Log
+* **0.1.8-alpha-p3**: Use Wolfi insteads of distroless container image.
+* **0.1.8-alpha-p2**: Fix a bug in the non_cli_excluded_tools. The `/api/tools` and are callable despite being in the exclusion list.
 * **0.1.8-alpha-p1**: Adds a pre-shared token functionality. This allows the claw instance to be pre-seeded with a pairing token to allow faster cold starts and simpler infrastructure design through configmap injection of tokens for cloud-provisioned services.
 
 #### Dev process
 Sync latest upstream changes to `main`.
 
-```
+```bash
 git co main
 
 git fetch upstream
@@ -220,29 +222,51 @@ cargo clean
 ```
 
 #### Build Process
-```
-# Dont forget to set the container image tag in K8s
-GIT_SHA=$(git rev-parse --short HEAD) && \
-  IMAGE="northamerica-northeast1-docker.pkg.dev/rinkai-prod/rinkai-images/rinkai-claw-runtime"
+```bash
+# ARM builds for lcoal testing on MAC
+TAG=0.1.8-alpha-p3 && \
+IMAGE=catonmat/zeroclaw && \
+docker build --target release -t $IMAGE:$TAG .
 
-# For ARM builds
-docker build --target release -t ${IMAGE}:${GIT_SHA} -t ${IMAGE}:latest .
-  docker push ${IMAGE}:${GIT_SHA} && \
-  docker push ${IMAGE}:latest
+OPEN_ROUTER_API_KEY=
+# test docker image locally
+docker run -d --name zeroclaw-test \
+  -e ZEROCLAW_GATEWAY_HOST="0.0.0.0" \
+  -p 42617:42617 \
+  -e CONTAINER_SERVICE_TOKEN="my-secret-token" \
+  -e ZEROCLAW_ALLOW_PUBLIC_BIND="true" \
+  -e OPEN_ROUTER_API_KEY \
+  $IMAGE:$TAG daemon
 
-# For Intel/AMD builds
+# Intel/AMD builds for official builds
+TAG=0.1.8-alpha-p3 && \
+IMAGE="northamerica-northeast1-docker.pkg.dev/clawcraft-489901/clawcraft-images/clawcraft-claw-runtime" && \
 docker buildx build \
   --platform linux/amd64 \
+  --no-cache \
   --target release \
-  -t northamerica-northeast1-docker.pkg.dev/rinkai-prod/rinkai-images/rinkai-claw-runtime:x86 \
+  -t $IMAGE:$TAG \
   --push \
+  .
 
 # test docker image locally
+docker run -d --name zeroclaw-test \--platform linux/amd64 \
+  --platform linux/amd64 \
+  -e ZEROCLAW_GATEWAY_HOST="0.0.0.0" \
+  -p 42617:42617 \
+  -e CONTAINER_SERVICE_TOKEN="my-secret-token" \
+  -e ZEROCLAW_ALLOW_PUBLIC_BIND="true" \
+  $IMAGE:$TAG
+
 docker run --rm --network container:zeroclaw-test curlimages/curl \
   curl -s http://localhost:42617/api/chat \
   -H "Authorization: Bearer my-secret-token" \
   -H "Content-Type: application/json" \
   -d '{"message": "hello"}'
+
+docker logs zeroclaw-test
+
+docker container rm zeroclaw-test --force
 ```
 
 ### 📢 Announcements

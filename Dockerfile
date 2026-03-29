@@ -130,26 +130,29 @@ HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
 ENTRYPOINT ["zeroclaw"]
 CMD ["daemon"]
 
-# ── Stage 3: Production Runtime (Distroless) ─────────────────
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:9c4fe2381c2e6d53c4cfdefeff6edbd2a67ec7713e2c3ca6653806cbdbf27a1e AS release
+# ── Stage 3: Production Runtime (Wolfi) ───────────────────────
+FROM cgr.dev/chainguard/wolfi-base:latest AS release
+
+# Runtime deps: glibc-compatible, zero-CVE base, shell + tools
+RUN apk add --no-cache bash git curl ca-certificates && \
+    adduser -D -u 1000 zeroclaw
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /zeroclaw-data /zeroclaw-data
+RUN chown -R zeroclaw:zeroclaw /zeroclaw-data
 
 # Environment setup
 # Ensure UTF-8 locale so CJK / multibyte input is handled correctly
 ENV LANG=C.UTF-8
 ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
 ENV HOME=/zeroclaw-data
-# Default provider and model are set in config.toml, not here,
-# so config file edits are not silently overridden
-#ENV PROVIDER=
+ENV SHELL=/bin/bash
 ENV ZEROCLAW_GATEWAY_PORT=42617
 
 # API_KEY must be provided at runtime!
 
 WORKDIR /zeroclaw-data
-USER 65534:65534
+USER 1000:1000
 EXPOSE 42617
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
     CMD ["zeroclaw", "status", "--format=exit-code"]
