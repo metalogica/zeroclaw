@@ -4094,48 +4094,49 @@ mod tests {
         ));
         let err = require_localhost(&peer).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
-    // Preshared token tests
-    #[test]
-    fn pre_shared_token_is_accepted_by_pairing_guard() {
-        let token = "my-secret-pre-shared-token";
-        let guard = PairingGuard::new(true, &[token.to_string()]);
-        assert!(guard.is_authenticated(token));
-    }
-
-    #[test]
-    fn pre_shared_token_coexists_with_paired_tokens() {
-        let pst = "pre-shared-token";
-        let guard = PairingGuard::new(true, &[pst.to_string()]);
-
-        assert!(guard.is_authenticated(pst));
-        assert!(!guard.is_authenticated("wrong-token"));
-    }
-
-    #[tokio::test]
-    async fn pre_shared_token_survives_normal_pairing_flow() {
-        let pst = "pre-shared-token";
-        let guard = PairingGuard::new(true, &[pst.to_string()]);
-
-        if let Some(code) = guard.pairing_code() {
-            let paired = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
-            assert!(guard.is_authenticated(pst));
-            assert!(guard.is_authenticated(&paired));
+        // Preshared token tests
+        #[test]
+        fn pre_shared_token_is_accepted_by_pairing_guard() {
+            let token = "my-secret-pre-shared-token";
+            let guard = PairingGuard::new(true, &[token.to_string()]);
+            assert!(guard.is_authenticated(token));
         }
 
-        assert!(guard.is_authenticated(pst));
-    }
+        #[test]
+        fn pre_shared_token_coexists_with_paired_tokens() {
+            let pst = "pre-shared-token";
+            let guard = PairingGuard::new(true, &[pst.to_string()]);
 
-    #[test]
-    fn pre_shared_token_config_field_deserializes_from_toml() {
-        let toml_str = r#"pre_shared_token = "test-token-123""#;
-        let gw: GatewayConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(gw.pre_shared_token.as_deref(), Some("test-token-123"));
-    }
+            assert!(guard.is_authenticated(pst));
+            assert!(!guard.is_authenticated("wrong-token"));
+        }
 
-    #[test]
-    fn missing_pre_shared_token_defaults_to_none() {
-        let toml_str = "";
-        let gw: GatewayConfig = toml::from_str(toml_str).unwrap();
-        assert!(gw.pre_shared_token.is_none());
+        #[tokio::test]
+        async fn pre_shared_token_survives_normal_pairing_flow() {
+            let pst = "pre-shared-token";
+            let guard = PairingGuard::new(true, &[pst.to_string()]);
+
+            if let Some(code) = guard.pairing_code() {
+                let paired = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
+                assert!(guard.is_authenticated(pst));
+                assert!(guard.is_authenticated(&paired));
+            }
+
+            assert!(guard.is_authenticated(pst));
+        }
+
+        #[test]
+        fn pre_shared_token_config_field_deserializes_from_toml() {
+            let toml_str = r#"pre_shared_token = "test-token-123""#;
+            let gw: GatewayConfig = toml::from_str(toml_str).unwrap();
+            assert_eq!(gw.pre_shared_token.as_deref(), Some("test-token-123"));
+        }
+
+        #[test]
+        fn missing_pre_shared_token_defaults_to_none() {
+            let toml_str = "";
+            let gw: GatewayConfig = toml::from_str(toml_str).unwrap();
+            assert!(gw.pre_shared_token.is_none());
+        }
     }
 }
