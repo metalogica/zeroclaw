@@ -2167,7 +2167,6 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
-<<<<<<< HEAD
             session_persistence: true,
             session_ttl_hours: 0,
             pairing_dashboard: PairingDashboardConfig::default(),
@@ -2313,10 +2312,8 @@ impl Default for NodeTransportConfig {
             tls_key_path: None,
             mutual_tls: false,
             connection_pool_size: default_connection_pool_size(),
-=======
             node_control: NodeControlConfig::default(),
             pre_shared_token: None,
->>>>>>> ab149855 (feat: add preshared token and update docs)
         }
     }
 }
@@ -7200,7 +7197,9 @@ impl MqttConfig {
         }
 
         if is_tls_scheme && !self.use_tls {
-            anyhow::bail!("use_tls is false but broker_url uses 'mqtts://' (requires use_tls: true)");
+            anyhow::bail!(
+                "use_tls is false but broker_url uses 'mqtts://' (requires use_tls: true)"
+            );
         }
 
         // Topics validation
@@ -9574,7 +9573,9 @@ impl Config {
                 if std::env::var(key).is_err() {
                     // SAFETY: called during single-threaded config load before
                     // any concurrent access to the environment.
-                    unsafe { std::env::set_var(key, value); }
+                    unsafe {
+                        std::env::set_var(key, value);
+                    }
                     tracing::debug!(key = %key, "Injected provider_env into process environment");
                 }
             }
