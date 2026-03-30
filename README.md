@@ -78,7 +78,7 @@ git rebase 0.1.9
 cargo check
 
 ## Open Claw migration wizard thread is unstable and causes false positive test failure
-cargo test -- -test-threads=1
+cargo test -- --test-threads=1
 
 cargo clean
 ```
@@ -86,7 +86,7 @@ cargo clean
 #### Build Process
 ```bash
 # ARM builds for lcoal testing on MAC
-TAG=0.1.8-alpha-p3 && \
+TAG=0.6.5-alpha-p3 && \
 IMAGE=catonmat/zeroclaw && \
 docker build --target release -t $IMAGE:$TAG .
 
@@ -101,7 +101,7 @@ docker run -d --name zeroclaw-test \
   $IMAGE:$TAG daemon
 
 # Intel/AMD builds for official builds
-TAG=0.1.8-alpha-p3 && \
+TAG=0.6.5-alpha-p3 && \
 IMAGE="northamerica-northeast1-docker.pkg.dev/clawcraft-489901/clawcraft-images/clawcraft-claw-runtime" && \
 docker buildx build \
   --platform linux/amd64 \

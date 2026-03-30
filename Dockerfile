@@ -130,8 +130,10 @@ HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
 ENTRYPOINT ["zeroclaw"]
 CMD ["daemon"]
 
-# ── Stage 3: Production Runtime (Distroless) ─────────────────
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
+# ── Stage 3: Production Runtime (Wolfi) ───────────────────────
+FROM cgr.dev/chainguard/wolfi-base:latest AS release
+
+RUN apk add --no-cache ca-certificates bash coreutils vim
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /zeroclaw-data /zeroclaw-data
