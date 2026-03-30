@@ -60,9 +60,10 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 Sovereign fork with a pre-shared token functionality to simplify and speed up container service load time when hosted in Kubernetes.
 
 #### Change Log
-* **0.1.8-alpha-p3**: Use Wolfi insteads of distroless container image.
-* **0.1.8-alpha-p2**: Fix a bug in the non_cli_excluded_tools. The `/api/tools` and are callable despite being in the exclusion list.
-* **0.1.8-alpha-p1**: Adds a pre-shared token functionality. This allows the claw instance to be pre-seeded with a pairing token to allow faster cold starts and simpler infrastructure design through configmap injection of tokens for cloud-provisioned services.
+* **alpha-p4**: Add vim to image.
+* **alpha-p3**: Use Wolfi insteads of distroless container image.
+* **alpha-p2**: Fix a bug in the non_cli_excluded_tools. The `/api/tools` and are callable despite being in the exclusion list.
+* **alpha-p1**: Adds a pre-shared token functionality. This allows the claw instance to be pre-seeded with a pairing token to allow faster cold starts and simpler infrastructure design through configmap injection of tokens for cloud-provisioned services.
 
 #### Dev process
 Sync latest upstream changes to `main`.

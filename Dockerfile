@@ -130,10 +130,13 @@ HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
 ENTRYPOINT ["zeroclaw"]
 CMD ["daemon"]
 
-# ── Stage 3: Production Runtime (Wolfi) ───────────────────────
-FROM cgr.dev/chainguard/wolfi-base:latest AS release
+# ── Stage 3: Production Runtime (Debian slim) ────────────────
+FROM debian:trixie-slim AS release
 
-RUN apk add --no-cache ca-certificates bash coreutils vim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates bash coreutils vim-tiny curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/vim.tiny /usr/local/bin/vim
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /zeroclaw-data /zeroclaw-data
