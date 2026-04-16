@@ -28,6 +28,7 @@ COPY Cargo.toml Cargo.lock ./
 # with the lockfile and caused `cargo --locked` to fail (Cargo refused to rewrite the lock).
 COPY crates/robot-kit/ crates/robot-kit/
 COPY crates/aardvark-sys/ crates/aardvark-sys/
+COPY crates/zeroclaw-macros/ crates/zeroclaw-macros/
 # Include tauri workspace member manifest (desktop app, but needed for workspace resolution).
 # .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
@@ -130,8 +131,10 @@ HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
 ENTRYPOINT ["zeroclaw"]
 CMD ["daemon"]
 
-# ── Stage 3: Production Runtime (Distroless) ─────────────────
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
+# ── Stage 3: Production Runtime (Wolfi) ───────────────────────
+FROM cgr.dev/chainguard/wolfi-base:latest AS release
+
+RUN apk add --no-cache ca-certificates bash coreutils vim
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /zeroclaw-data /zeroclaw-data
