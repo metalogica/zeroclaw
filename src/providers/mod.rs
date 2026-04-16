@@ -712,6 +712,14 @@ pub struct ProviderRuntimeOptions {
     /// When true, system messages are merged into the first user message before
     /// sending. Propagated from `ModelProviderConfig::merge_system_into_user`.
     pub merge_system_into_user: bool,
+    /// Output modalities for the request (e.g. `["image"]`, `["image", "text"]`).
+    /// Only supported by OpenRouter. When set, the provider includes a `modalities`
+    /// field in the API request, enabling image generation models.
+    pub modalities: Option<Vec<String>>,
+    /// Workspace directory for providers to save generated files (images, etc.).
+    /// When set, the OpenRouter provider writes image generation responses to
+    /// `{workspace}/media/` instead of returning raw base64 in the response.
+    pub workspace_dir: Option<PathBuf>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -728,6 +736,8 @@ impl Default for ProviderRuntimeOptions {
             api_path: None,
             provider_max_tokens: None,
             merge_system_into_user: false,
+            modalities: None,
+            workspace_dir: None,
         }
     }
 }
@@ -768,6 +778,8 @@ pub fn provider_runtime_options_from_config(
         api_path: config.api_path.clone(),
         provider_max_tokens: config.provider_max_tokens,
         merge_system_into_user,
+        modalities: None,
+        workspace_dir: Some(config.workspace_dir.clone()),
     }
 }
 
@@ -1178,10 +1190,17 @@ fn create_provider_with_url_and_options(
             )?))
         }
         // ── Primary providers (custom implementations) ───────
-        "openrouter" => Ok(Box::new(
-            openrouter::OpenRouterProvider::new(key, options.provider_timeout_secs)
-                .with_max_tokens(options.provider_max_tokens),
-        )),
+        "openrouter" => {
+            let mut p = openrouter::OpenRouterProvider::new(key, options.provider_timeout_secs)
+                .with_max_tokens(options.provider_max_tokens);
+            if let Some(ref modalities) = options.modalities {
+                p = p.with_modalities(modalities.clone());
+            }
+            if let Some(ref workspace) = options.workspace_dir {
+                p = p.with_workspace_dir(workspace.clone());
+            }
+            Ok(Box::new(p))
+        }
         "anthropic" => {
             let mut p = anthropic::AnthropicProvider::new(key);
             if let Some(mt) = options.provider_max_tokens {
@@ -3784,5 +3803,61 @@ mod tests {
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_PROVIDER_URL") };
+    }
+
+    // ── Image Generation: ProviderRuntimeOptions (#32-33) ──────
+
+    #[test]
+    fn runtime_options_default_has_no_modalities_or_workspace() {
+        let options = ProviderRuntimeOptions::default();
+        assert!(options.modalities.is_none());
+        assert!(options.workspace_dir.is_none());
+    }
+
+    // ── Image Generation: Factory (#34-36) ─────────────────────
+
+    #[test]
+    fn factory_openrouter_with_workspace_does_not_crash() {
+        let options = ProviderRuntimeOptions {
+            workspace_dir: Some(std::env::temp_dir()),
+            modalities: Some(vec!["image".into()]),
+            ..ProviderRuntimeOptions::default()
+        };
+        let result = create_provider_with_url_and_options(
+            "openrouter",
+            Some("test-key"),
+            None,
+            &options,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn factory_openrouter_without_workspace_does_not_crash() {
+        let options = ProviderRuntimeOptions::default();
+        let result = create_provider_with_url_and_options(
+            "openrouter",
+            Some("test-key"),
+            None,
+            &options,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn factory_anthropic_with_modalities_does_not_crash() {
+        let options = ProviderRuntimeOptions {
+            modalities: Some(vec!["image".into()]),
+            workspace_dir: Some(std::env::temp_dir()),
+            ..ProviderRuntimeOptions::default()
+        };
+        let result = create_provider_with_url_and_options(
+            "anthropic",
+            Some("test-key"),
+            None,
+            &options,
+        );
+        // Anthropic ignores modalities/workspace — should not crash
+        assert!(result.is_ok());
     }
 }

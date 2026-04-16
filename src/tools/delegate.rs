@@ -438,10 +438,16 @@ impl DelegateTool {
         #[allow(clippy::option_as_ref_deref)]
         let provider_credential = provider_credential_owned.as_ref().map(String::as_str);
 
+        // Apply per-agent overrides (e.g. modalities for image generation agents)
+        let mut agent_runtime_options = self.provider_runtime_options.clone();
+        if agent_config.modalities.is_some() {
+            agent_runtime_options.modalities = agent_config.modalities.clone();
+        }
+
         let provider: Box<dyn Provider> = match providers::create_provider_with_options(
             &agent_config.provider,
             provider_credential,
-            &self.provider_runtime_options,
+            &agent_runtime_options,
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -1287,6 +1293,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                modalities: None,
             },
         );
         agents.insert(
@@ -1305,6 +1312,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                modalities: None,
             },
         );
         agents
@@ -1462,6 +1470,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            modalities: None,
         }
     }
 
@@ -1578,6 +1587,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                modalities: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1692,6 +1702,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                modalities: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1733,6 +1744,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                modalities: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -2022,6 +2034,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            modalities: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2076,6 +2089,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            modalities: None,
         };
 
         struct MockShellTool;
@@ -2147,6 +2161,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            modalities: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2176,6 +2191,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            modalities: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2210,6 +2226,7 @@ mod tests {
             agentic_timeout_secs: Some(600),
             skills_directory: None,
             memory_namespace: None,
+            modalities: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2266,6 +2283,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                modalities: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2294,6 +2312,7 @@ mod tests {
                 agentic_timeout_secs: Some(0),
                 skills_directory: None,
                 memory_namespace: None,
+                modalities: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2322,6 +2341,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                modalities: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2350,6 +2370,7 @@ mod tests {
                 agentic_timeout_secs: Some(5000),
                 skills_directory: None,
                 memory_namespace: None,
+                modalities: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2378,6 +2399,7 @@ mod tests {
                 agentic_timeout_secs: Some(3600),
                 skills_directory: None,
                 memory_namespace: None,
+                modalities: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2402,6 +2424,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                modalities: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2435,6 +2458,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: Some("skills/code-review".to_string()),
             memory_namespace: None,
+            modalities: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2482,6 +2506,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            modalities: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];

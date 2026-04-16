@@ -652,6 +652,10 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+    /// Output modalities for the provider request (e.g. `["image"]`).
+    /// Only supported by OpenRouter. Enables image generation models.
+    #[serde(default)]
+    pub modalities: Option<Vec<String>>,
     /// Optional timeout in seconds for non-agentic sub-agent provider calls.
     /// When `None`, falls back to `[delegate].timeout_secs` (default: 120).
     #[serde(default)]
@@ -11998,6 +12002,7 @@ default_temperature = 0.7
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                modalities: None,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,

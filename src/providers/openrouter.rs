@@ -5,14 +5,23 @@ use crate::providers::traits::{
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
+use base64::Engine;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 pub struct OpenRouterProvider {
     credential: Option<String>,
     timeout_secs: u64,
     max_tokens: Option<u32>,
+    /// Output modalities for the request (e.g. `["image"]`, `["image", "text"]`).
+    /// When `None`, the standard text-only chat completion behavior is used.
+    modalities: Option<Vec<String>>,
+    /// Workspace directory for saving generated images to disk.
+    /// When set, image generation responses are written to `{workspace}/media/`
+    /// and the response text is replaced with the file path.
+    workspace_dir: Option<PathBuf>,
 }
 
 const DEFAULT_OPENROUTER_TIMEOUT_SECS: u64 = 120;
@@ -25,6 +34,8 @@ struct ChatRequest {
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modalities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -64,7 +75,20 @@ struct Choice {
 
 #[derive(Debug, Deserialize)]
 struct ResponseMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    /// Image generation models (e.g. Gemini image preview) return image data
+    /// here instead of in `content`.
+    #[serde(default)]
+    reasoning_details: Option<Vec<ReasoningDetail>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReasoningDetail {
+    #[serde(rename = "type")]
+    detail_type: Option<String>,
+    /// Base64-encoded image data when `detail_type` is `"reasoning.encrypted"`.
+    data: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,6 +102,8 @@ struct NativeChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modalities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,6 +179,9 @@ struct NativeResponseMessage {
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<NativeToolCall>>,
+    /// Image generation models may return image data here.
+    #[serde(default)]
+    reasoning_details: Option<Vec<ReasoningDetail>>,
 }
 
 impl OpenRouterProvider {
@@ -163,7 +192,25 @@ impl OpenRouterProvider {
                 .filter(|secs| *secs > 0)
                 .unwrap_or(DEFAULT_OPENROUTER_TIMEOUT_SECS),
             max_tokens: None,
+            modalities: None,
+            workspace_dir: None,
         }
+    }
+
+    /// Set output modalities (e.g. `["image"]` for image generation models).
+    pub fn with_modalities(mut self, modalities: Vec<String>) -> Self {
+        if modalities.is_empty() {
+            self.modalities = None;
+        } else {
+            self.modalities = Some(modalities);
+        }
+        self
+    }
+
+    /// Set workspace directory for saving generated images.
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
     }
 
     /// Override the HTTP request timeout for LLM API calls.
@@ -271,6 +318,68 @@ impl OpenRouterProvider {
                 }
             })
             .collect()
+    }
+
+    /// Extract base64 image data from `reasoning_details` if present.
+    fn extract_image_data(details: &Option<Vec<ReasoningDetail>>) -> Option<Vec<u8>> {
+        let details = details.as_ref()?;
+        for detail in details {
+            if detail.detail_type.as_deref() == Some("reasoning.encrypted") {
+                if let Some(ref data) = detail.data {
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
+                        if !bytes.is_empty() {
+                            return Some(bytes);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Save image bytes to `{workspace}/media/{name}.png` and return the path.
+    /// Creates the `media/` directory if it doesn't exist.
+    fn save_image_to_workspace(workspace: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+        let media_dir = workspace.join("media");
+        std::fs::create_dir_all(&media_dir)?;
+        let filename = format!("generated-{}.png", uuid::Uuid::new_v4());
+        let path = media_dir.join(&filename);
+        std::fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    /// If the response contains image data and we have a workspace, save it
+    /// to disk and return a text description. Otherwise return the text content.
+    fn process_response_with_image_save(
+        &self,
+        content: Option<String>,
+        reasoning_details: &Option<Vec<ReasoningDetail>>,
+    ) -> String {
+        // Try to extract image data from reasoning_details
+        if let Some(ref workspace) = self.workspace_dir {
+            if let Some(image_bytes) = Self::extract_image_data(reasoning_details) {
+                match Self::save_image_to_workspace(workspace, &image_bytes) {
+                    Ok(path) => {
+                        let text_part = content
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| format!("\n\n{s}"))
+                            .unwrap_or_default();
+                        return format!(
+                            "Image saved to: {}{}",
+                            path.display(),
+                            text_part
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to save generated image: {e}");
+                    }
+                }
+            }
+        }
+
+        // Fallback: return text content as-is
+        content.unwrap_or_default()
     }
 
     fn to_message_content(role: &str, content: &str) -> MessageContent {
@@ -415,6 +524,7 @@ impl Provider for OpenRouterProvider {
             messages,
             temperature,
             max_tokens: self.max_tokens,
+            modalities: self.modalities.clone(),
         };
 
         let response = self
@@ -439,7 +549,12 @@ impl Provider for OpenRouterProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| {
+                self.process_response_with_image_save(
+                    c.message.content,
+                    &c.message.reasoning_details,
+                )
+            })
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
     }
 
@@ -465,6 +580,7 @@ impl Provider for OpenRouterProvider {
             messages: api_messages,
             temperature,
             max_tokens: self.max_tokens,
+            modalities: self.modalities.clone(),
         };
 
         let response = self
@@ -489,7 +605,12 @@ impl Provider for OpenRouterProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| {
+                self.process_response_with_image_save(
+                    c.message.content,
+                    &c.message.reasoning_details,
+                )
+            })
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
     }
 
@@ -513,6 +634,7 @@ impl Provider for OpenRouterProvider {
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
             max_tokens: self.max_tokens,
+            modalities: self.modalities.clone(),
         };
 
         let response = self
@@ -537,13 +659,30 @@ impl Provider for OpenRouterProvider {
             output_tokens: u.completion_tokens,
             cached_input_tokens: None,
         });
-        let message = native_response
+        let native_choice = native_response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
-        let mut result = Self::parse_native_response(message);
+        let reasoning_details = native_choice.message.reasoning_details.clone();
+        let mut result = Self::parse_native_response(native_choice.message);
+        // Save image data from reasoning_details to disk if present.
+        if result.text.as_deref().map_or(true, str::is_empty) {
+            if let Some(ref workspace) = self.workspace_dir {
+                if let Some(image_bytes) = Self::extract_image_data(&reasoning_details) {
+                    match Self::save_image_to_workspace(workspace, &image_bytes) {
+                        Ok(path) => {
+                            let text_part = result.text.as_deref()
+                                .filter(|s| !s.is_empty())
+                                .map(|s| format!("\n\n{s}"))
+                                .unwrap_or_default();
+                            result.text = Some(format!("Image saved to: {}{}", path.display(), text_part));
+                        }
+                        Err(e) => tracing::warn!("Failed to save generated image: {e}"),
+                    }
+                }
+            }
+        }
         result.usage = usage;
         Ok(result)
     }
@@ -604,6 +743,7 @@ impl Provider for OpenRouterProvider {
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
             max_tokens: self.max_tokens,
+            modalities: self.modalities.clone(),
         };
 
         let response = self
@@ -628,13 +768,30 @@ impl Provider for OpenRouterProvider {
             output_tokens: u.completion_tokens,
             cached_input_tokens: None,
         });
-        let message = native_response
+        let native_choice = native_response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
-        let mut result = Self::parse_native_response(message);
+        let reasoning_details = native_choice.message.reasoning_details.clone();
+        let mut result = Self::parse_native_response(native_choice.message);
+        // Save image data from reasoning_details to disk if present.
+        if result.text.as_deref().map_or(true, str::is_empty) {
+            if let Some(ref workspace) = self.workspace_dir {
+                if let Some(image_bytes) = Self::extract_image_data(&reasoning_details) {
+                    match Self::save_image_to_workspace(workspace, &image_bytes) {
+                        Ok(path) => {
+                            let text_part = result.text.as_deref()
+                                .filter(|s| !s.is_empty())
+                                .map(|s| format!("\n\n{s}"))
+                                .unwrap_or_default();
+                            result.text = Some(format!("Image saved to: {}{}", path.display(), text_part));
+                        }
+                        Err(e) => tracing::warn!("Failed to save generated image: {e}"),
+                    }
+                }
+            }
+        }
         result.usage = usage;
         Ok(result)
     }
@@ -746,6 +903,7 @@ mod tests {
             ],
             temperature: 0.5,
             max_tokens: None,
+            modalities: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -780,6 +938,7 @@ mod tests {
                 .collect(),
             temperature: 0.0,
             max_tokens: None,
+            modalities: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -795,7 +954,7 @@ mod tests {
         let response: ApiChatResponse = serde_json::from_str(json).unwrap();
 
         assert_eq!(response.choices.len(), 1);
-        assert_eq!(response.choices[0].message.content, "Hi from OpenRouter");
+        assert_eq!(response.choices[0].message.content.as_deref(), Some("Hi from OpenRouter"));
     }
 
     #[test]
@@ -918,6 +1077,7 @@ mod tests {
         let message = NativeResponseMessage {
             content: Some("Here you go.".into()),
             reasoning_content: None,
+            reasoning_details: None,
             tool_calls: Some(vec![NativeToolCall {
                 id: Some("call_789".into()),
                 kind: Some("function".into()),
@@ -1032,6 +1192,7 @@ mod tests {
         let message = NativeResponseMessage {
             content: Some("answer".into()),
             reasoning_content: Some("thinking step".into()),
+            reasoning_details: None,
             tool_calls: Some(vec![NativeToolCall {
                 id: Some("call_1".into()),
                 kind: Some("function".into()),
@@ -1051,6 +1212,7 @@ mod tests {
         let message = NativeResponseMessage {
             content: Some("hello".into()),
             reasoning_content: None,
+            reasoning_details: None,
             tool_calls: None,
         };
         let parsed = OpenRouterProvider::parse_native_response(message);
@@ -1225,5 +1387,424 @@ mod tests {
         }];
 
         assert!(OpenRouterProvider::convert_tools(Some(&tools)).is_none());
+    }
+
+    // ── Image Generation: Serialization (#1-4) ──────────────────
+
+    #[test]
+    fn chat_request_serializes_modalities_when_present() {
+        let request = ChatRequest {
+            model: "flux".into(),
+            messages: vec![],
+            temperature: 0.7,
+            max_tokens: None,
+            modalities: Some(vec!["image".into()]),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains(r#""modalities":["image"]"#));
+    }
+
+    #[test]
+    fn chat_request_omits_modalities_when_none() {
+        let request = ChatRequest {
+            model: "gpt".into(),
+            messages: vec![],
+            temperature: 0.7,
+            max_tokens: None,
+            modalities: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("modalities"));
+    }
+
+    #[test]
+    fn native_chat_request_serializes_modalities() {
+        let request = NativeChatRequest {
+            model: "flux".into(),
+            messages: vec![],
+            temperature: 0.7,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            modalities: Some(vec!["image".into(), "text".into()]),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains(r#""modalities":["image","text"]"#));
+    }
+
+    #[test]
+    fn native_chat_request_omits_modalities_when_none() {
+        let request = NativeChatRequest {
+            model: "gpt".into(),
+            messages: vec![],
+            temperature: 0.7,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            modalities: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("modalities"));
+    }
+
+    // ── Image Generation: Response Deserialization (#5-10) ──────
+
+    #[test]
+    fn response_deserializes_null_content_with_reasoning_details() {
+        let json = r#"{
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "reasoning_details": [{"type": "reasoning.encrypted", "data": "aGVsbG8="}]
+                }
+            }]
+        }"#;
+        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert!(response.choices[0].message.content.is_none());
+        assert!(response.choices[0].message.reasoning_details.is_some());
+    }
+
+    #[test]
+    fn response_deserializes_text_content_without_reasoning_details() {
+        let json = r#"{"choices": [{"message": {"content": "hello"}}]}"#;
+        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.choices[0].message.content.as_deref(), Some("hello"));
+        assert!(response.choices[0].message.reasoning_details.is_none());
+    }
+
+    #[test]
+    fn response_deserializes_both_content_and_reasoning_details() {
+        let json = r#"{
+            "choices": [{
+                "message": {
+                    "content": "description",
+                    "reasoning_details": [{"type": "reasoning.encrypted", "data": "aGVsbG8="}]
+                }
+            }]
+        }"#;
+        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.choices[0].message.content.as_deref(), Some("description"));
+        assert!(response.choices[0].message.reasoning_details.is_some());
+    }
+
+    #[test]
+    fn native_response_deserializes_reasoning_details() {
+        let json = r#"{
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "reasoning_details": [{"type": "reasoning.encrypted", "data": "dGVzdA=="}]
+                }
+            }]
+        }"#;
+        let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let details = response.choices[0].message.reasoning_details.as_ref().unwrap();
+        assert_eq!(details[0].detail_type.as_deref(), Some("reasoning.encrypted"));
+        assert_eq!(details[0].data.as_deref(), Some("dGVzdA=="));
+    }
+
+    #[test]
+    fn native_response_defaults_reasoning_details_to_none() {
+        let json = r#"{"choices": [{"message": {"content": "hi"}}]}"#;
+        let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+        assert!(response.choices[0].message.reasoning_details.is_none());
+    }
+
+    #[test]
+    fn reasoning_detail_parses_type_and_data() {
+        let json = r#"{"type": "reasoning.encrypted", "data": "abc123"}"#;
+        let detail: ReasoningDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(detail.detail_type.as_deref(), Some("reasoning.encrypted"));
+        assert_eq!(detail.data.as_deref(), Some("abc123"));
+    }
+
+    // ── Image Generation: Extraction (#11-17) ──────────────────
+
+    #[test]
+    fn extract_image_data_valid_base64() {
+        let details = Some(vec![ReasoningDetail {
+            detail_type: Some("reasoning.encrypted".into()),
+            data: Some(base64::engine::general_purpose::STANDARD.encode(b"PNG_BYTES")),
+        }]);
+        let result = OpenRouterProvider::extract_image_data(&details);
+        assert_eq!(result.unwrap(), b"PNG_BYTES");
+    }
+
+    #[test]
+    fn extract_image_data_invalid_base64() {
+        let details = Some(vec![ReasoningDetail {
+            detail_type: Some("reasoning.encrypted".into()),
+            data: Some("not!valid!base64!!!".into()),
+        }]);
+        assert!(OpenRouterProvider::extract_image_data(&details).is_none());
+    }
+
+    #[test]
+    fn extract_image_data_empty_data_field() {
+        let details = Some(vec![ReasoningDetail {
+            detail_type: Some("reasoning.encrypted".into()),
+            data: Some(String::new()),
+        }]);
+        assert!(OpenRouterProvider::extract_image_data(&details).is_none());
+    }
+
+    #[test]
+    fn extract_image_data_wrong_type() {
+        let details = Some(vec![ReasoningDetail {
+            detail_type: Some("reasoning.text".into()),
+            data: Some(base64::engine::general_purpose::STANDARD.encode(b"data")),
+        }]);
+        assert!(OpenRouterProvider::extract_image_data(&details).is_none());
+    }
+
+    #[test]
+    fn extract_image_data_empty_vec() {
+        let details: Option<Vec<ReasoningDetail>> = Some(vec![]);
+        assert!(OpenRouterProvider::extract_image_data(&details).is_none());
+    }
+
+    #[test]
+    fn extract_image_data_none() {
+        assert!(OpenRouterProvider::extract_image_data(&None).is_none());
+    }
+
+    #[test]
+    fn extract_image_data_multiple_entries_picks_valid() {
+        let details = Some(vec![
+            ReasoningDetail {
+                detail_type: Some("reasoning.text".into()),
+                data: Some("ignored".into()),
+            },
+            ReasoningDetail {
+                detail_type: Some("reasoning.encrypted".into()),
+                data: Some(base64::engine::general_purpose::STANDARD.encode(b"IMG")),
+            },
+        ]);
+        assert_eq!(OpenRouterProvider::extract_image_data(&details).unwrap(), b"IMG");
+    }
+
+    // ── Image Generation: Disk Write (#18-22) ──────────────────
+
+    #[tokio::test]
+    async fn save_image_creates_media_dir_and_writes_file() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_img_save");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let bytes = b"fake PNG data";
+        let path = OpenRouterProvider::save_image_to_workspace(&dir, bytes).unwrap();
+
+        assert!(path.exists());
+        assert!(path.starts_with(dir.join("media")));
+        assert!(path.file_name().unwrap().to_str().unwrap().starts_with("generated-"));
+        assert!(path.extension().unwrap() == "png");
+
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(written, bytes);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn save_image_filename_is_uuid_pattern() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_img_uuid");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = OpenRouterProvider::save_image_to_workspace(&dir, b"data").unwrap();
+        let stem = path.file_stem().unwrap().to_str().unwrap();
+        assert!(stem.starts_with("generated-"));
+        // UUID after prefix should be 36 chars (8-4-4-4-12)
+        assert_eq!(stem.len(), "generated-".len() + 36);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_image_succeeds_when_media_dir_exists() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_img_existing_media");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("media")).unwrap();
+
+        let result = OpenRouterProvider::save_image_to_workspace(&dir, b"data");
+        assert!(result.is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_image_fails_on_unwritable_path() {
+        let result = OpenRouterProvider::save_image_to_workspace(
+            Path::new("/nonexistent/impossible/path"),
+            b"data",
+        );
+        assert!(result.is_err());
+    }
+
+    // ── Image Generation: Response Processing (#23-28) ─────────
+
+    #[test]
+    fn process_response_saves_image_when_workspace_set() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_img_process_save");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let provider = OpenRouterProvider::new(None, None)
+            .with_workspace_dir(dir.clone());
+        let details = Some(vec![ReasoningDetail {
+            detail_type: Some("reasoning.encrypted".into()),
+            data: Some(base64::engine::general_purpose::STANDARD.encode(b"IMG_DATA")),
+        }]);
+
+        let result = provider.process_response_with_image_save(None, &details);
+        assert!(result.starts_with("Image saved to:"));
+        assert!(result.contains("media/generated-"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_response_appends_text_content_after_path() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_img_process_text");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let provider = OpenRouterProvider::new(None, None)
+            .with_workspace_dir(dir.clone());
+        let details = Some(vec![ReasoningDetail {
+            detail_type: Some("reasoning.encrypted".into()),
+            data: Some(base64::engine::general_purpose::STANDARD.encode(b"IMG")),
+        }]);
+
+        let result = provider.process_response_with_image_save(
+            Some("A beautiful sunset".into()),
+            &details,
+        );
+        assert!(result.starts_with("Image saved to:"));
+        assert!(result.contains("A beautiful sunset"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_response_returns_text_when_no_image() {
+        let provider = OpenRouterProvider::new(None, None)
+            .with_workspace_dir(std::env::temp_dir());
+
+        let result = provider.process_response_with_image_save(
+            Some("normal text".into()),
+            &None,
+        );
+        assert_eq!(result, "normal text");
+    }
+
+    #[test]
+    fn process_response_returns_empty_when_no_image_and_null_content() {
+        let provider = OpenRouterProvider::new(None, None)
+            .with_workspace_dir(std::env::temp_dir());
+
+        let result = provider.process_response_with_image_save(None, &None);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn process_response_skips_save_when_no_workspace() {
+        let provider = OpenRouterProvider::new(None, None); // no workspace_dir
+        let details = Some(vec![ReasoningDetail {
+            detail_type: Some("reasoning.encrypted".into()),
+            data: Some(base64::engine::general_purpose::STANDARD.encode(b"IMG")),
+        }]);
+
+        let result = provider.process_response_with_image_save(None, &details);
+        // No workspace → falls back to empty content
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn process_response_falls_back_on_save_failure() {
+        let provider = OpenRouterProvider::new(None, None)
+            .with_workspace_dir(PathBuf::from("/nonexistent/impossible"));
+        let details = Some(vec![ReasoningDetail {
+            detail_type: Some("reasoning.encrypted".into()),
+            data: Some(base64::engine::general_purpose::STANDARD.encode(b"IMG")),
+        }]);
+
+        let result = provider.process_response_with_image_save(
+            Some("fallback text".into()),
+            &details,
+        );
+        // Save failed → falls back to text content
+        assert_eq!(result, "fallback text");
+    }
+
+    // ── Image Generation: Provider Struct (#29-31) ─────────────
+
+    #[test]
+    fn provider_new_has_no_workspace_dir() {
+        let provider = OpenRouterProvider::new(None, None);
+        assert!(provider.workspace_dir.is_none());
+    }
+
+    #[test]
+    fn provider_with_workspace_dir_sets_field() {
+        let provider = OpenRouterProvider::new(None, None)
+            .with_workspace_dir(PathBuf::from("/tmp/ws"));
+        assert_eq!(provider.workspace_dir.as_deref(), Some(Path::new("/tmp/ws")));
+    }
+
+    #[test]
+    fn provider_builder_chain_preserves_all_fields() {
+        let provider = OpenRouterProvider::new(Some("key"), Some(300))
+            .with_max_tokens(Some(4096))
+            .with_modalities(vec!["image".into()])
+            .with_workspace_dir(PathBuf::from("/ws"));
+
+        assert_eq!(provider.credential.as_deref(), Some("key"));
+        assert_eq!(provider.timeout_secs, 300);
+        assert_eq!(provider.max_tokens, Some(4096));
+        assert_eq!(provider.modalities, Some(vec!["image".to_string()]));
+        assert_eq!(provider.workspace_dir.as_deref(), Some(Path::new("/ws")));
+    }
+
+    // ── Image Generation: Provider modalities (#32-33) ─────────
+
+    #[test]
+    fn with_modalities_sets_field() {
+        let provider = OpenRouterProvider::new(None, None)
+            .with_modalities(vec!["image".into()]);
+        assert_eq!(provider.modalities, Some(vec!["image".to_string()]));
+    }
+
+    #[test]
+    fn with_modalities_empty_resets_to_none() {
+        let provider = OpenRouterProvider::new(None, None)
+            .with_modalities(vec![]);
+        assert!(provider.modalities.is_none());
+    }
+
+    // ── Image Generation: Backward Compatibility (#42-44) ──────
+
+    #[test]
+    fn provider_without_modalities_or_workspace_unchanged() {
+        let provider = OpenRouterProvider::new(Some("key"), None);
+        assert!(provider.modalities.is_none());
+        assert!(provider.workspace_dir.is_none());
+        // Existing fields unaffected
+        assert_eq!(provider.credential.as_deref(), Some("key"));
+        assert_eq!(provider.timeout_secs, DEFAULT_OPENROUTER_TIMEOUT_SECS);
+        assert!(provider.max_tokens.is_none());
+    }
+
+    #[test]
+    fn text_only_response_unaffected_by_image_handling() {
+        let provider = OpenRouterProvider::new(None, None)
+            .with_workspace_dir(std::env::temp_dir());
+
+        // Normal text response, no reasoning_details
+        let result = provider.process_response_with_image_save(
+            Some("just text".into()),
+            &None,
+        );
+        assert_eq!(result, "just text");
     }
 }

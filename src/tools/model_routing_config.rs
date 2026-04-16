@@ -705,6 +705,7 @@ impl ModelRoutingConfigTool {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: DEFAULT_AGENT_MAX_ITERATIONS,
+                modalities: None,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
