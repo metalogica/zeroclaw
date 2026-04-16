@@ -56,6 +56,13 @@ enum MessageContent {
 enum MessagePart {
     Text { text: String },
     ImageUrl { image_url: ImageUrlPart },
+    InputAudio { input_audio: InputAudioPart },
+}
+
+#[derive(Debug, Serialize)]
+struct InputAudioPart {
+    data: String,
+    format: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -388,11 +395,13 @@ impl OpenRouterProvider {
         }
 
         let (cleaned_text, image_refs) = multimodal::parse_image_markers(content);
-        if image_refs.is_empty() {
+        let (cleaned_text, audio_refs) = multimodal::parse_audio_markers(&cleaned_text);
+
+        if image_refs.is_empty() && audio_refs.is_empty() {
             return MessageContent::Text(content.to_string());
         }
 
-        let mut parts = Vec::with_capacity(image_refs.len() + 1);
+        let mut parts = Vec::with_capacity(image_refs.len() + audio_refs.len() + 1);
         let trimmed_text = cleaned_text.trim();
         if !trimmed_text.is_empty() {
             parts.push(MessagePart::Text {
@@ -404,6 +413,19 @@ impl OpenRouterProvider {
             parts.push(MessagePart::ImageUrl {
                 image_url: ImageUrlPart { url: image_ref },
             });
+        }
+
+        // Audio markers are embedded as [AUDIO:base64data|format] by
+        // prepare_messages_for_provider. Parse the pipe-separated payload.
+        for audio_ref in audio_refs {
+            if let Some((data, format)) = audio_ref.split_once('|') {
+                parts.push(MessagePart::InputAudio {
+                    input_audio: InputAudioPart {
+                        data: data.to_string(),
+                        format: format.to_string(),
+                    },
+                });
+            }
         }
 
         MessageContent::Parts(parts)
@@ -1162,6 +1184,71 @@ mod tests {
         assert_eq!(parts[0]["text"], "Describe this");
         assert_eq!(parts[1]["type"], "image_url");
         assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,abcd");
+    }
+
+    #[test]
+    fn to_message_content_converts_audio_markers_to_input_audio() {
+        let content = "Transcribe this\n\n[AUDIO:dGVzdA==|webm]";
+        let value =
+            serde_json::to_value(OpenRouterProvider::to_message_content("user", content)).unwrap();
+        let parts = value.as_array().expect("multimodal content should be an array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "Transcribe this");
+        assert_eq!(parts[1]["type"], "input_audio");
+        assert_eq!(parts[1]["input_audio"]["data"], "dGVzdA==");
+        assert_eq!(parts[1]["input_audio"]["format"], "webm");
+    }
+
+    #[test]
+    fn to_message_content_mixed_image_and_audio() {
+        let content = "[IMAGE:data:image/png;base64,img]\n\n[AUDIO:aud|mp3]\n\nDescribe both";
+        let value =
+            serde_json::to_value(OpenRouterProvider::to_message_content("user", content)).unwrap();
+        let parts = value.as_array().expect("multimodal content should be an array");
+        assert_eq!(parts.len(), 3);
+        // Text part
+        assert_eq!(parts[0]["type"], "text");
+        assert!(parts[0]["text"].as_str().unwrap().contains("Describe both"));
+        // Image part
+        assert_eq!(parts[1]["type"], "image_url");
+        // Audio part
+        assert_eq!(parts[2]["type"], "input_audio");
+        assert_eq!(parts[2]["input_audio"]["format"], "mp3");
+    }
+
+    #[test]
+    fn to_message_content_audio_only_no_text() {
+        let content = "[AUDIO:dGVzdA==|wav]";
+        let value =
+            serde_json::to_value(OpenRouterProvider::to_message_content("user", content)).unwrap();
+        let parts = value.as_array().expect("should be array");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "input_audio");
+    }
+
+    #[test]
+    fn to_message_content_ignores_audio_in_non_user_role() {
+        let content = "[AUDIO:dGVzdA==|wav]";
+        let value =
+            serde_json::to_value(OpenRouterProvider::to_message_content("assistant", content))
+                .unwrap();
+        // Non-user messages are plain text, not parsed
+        assert!(value.is_string());
+    }
+
+    #[test]
+    fn input_audio_serializes_correctly() {
+        let part = MessagePart::InputAudio {
+            input_audio: InputAudioPart {
+                data: "abc123".into(),
+                format: "mp3".into(),
+            },
+        };
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(json["type"], "input_audio");
+        assert_eq!(json["input_audio"]["data"], "abc123");
+        assert_eq!(json["input_audio"]["format"], "mp3");
     }
 
     #[test]

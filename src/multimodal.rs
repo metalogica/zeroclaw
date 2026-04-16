@@ -5,6 +5,8 @@ use reqwest::Client;
 use std::path::Path;
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
+const AUDIO_MARKER_PREFIX: &str = "[AUDIO:";
+
 const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &[
     "image/png",
     "image/jpeg",
@@ -13,10 +15,31 @@ const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &[
     "image/bmp",
 ];
 
+/// Maps audio file extension → (MIME type, OpenRouter format string).
+const AUDIO_EXTENSION_MAP: &[(&str, &str, &str)] = &[
+    ("mp3", "audio/mpeg", "mp3"),
+    ("wav", "audio/wav", "wav"),
+    ("webm", "audio/webm", "webm"),
+    ("ogg", "audio/ogg", "ogg"),
+    ("flac", "audio/flac", "flac"),
+    ("m4a", "audio/mp4", "m4a"),
+    ("aac", "audio/aac", "aac"),
+    ("aiff", "audio/aiff", "aiff"),
+    ("pcm", "audio/pcm", "pcm16"),
+];
+
 #[derive(Debug, Clone)]
 pub struct PreparedMessages {
     pub messages: Vec<ChatMessage>,
     pub contains_images: bool,
+    pub contains_audio: bool,
+}
+
+/// Normalized audio reference: base64 data + format string for the provider.
+#[derive(Debug, Clone)]
+pub struct AudioRef {
+    pub data: String,
+    pub format: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -53,15 +76,49 @@ pub enum MultimodalError {
 }
 
 pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
+    parse_markers(content, IMAGE_MARKER_PREFIX)
+}
+
+pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| parse_image_markers(&m.content).1.len())
+        .sum()
+}
+
+pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
+    count_image_markers(messages) > 0
+}
+
+/// Parse `[AUDIO:/path/to/file.mp3]` markers from message content.
+pub fn parse_audio_markers(content: &str) -> (String, Vec<String>) {
+    parse_markers(content, AUDIO_MARKER_PREFIX)
+}
+
+pub fn count_audio_markers(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| parse_audio_markers(&m.content).1.len())
+        .sum()
+}
+
+pub fn contains_audio_markers(messages: &[ChatMessage]) -> bool {
+    count_audio_markers(messages) > 0
+}
+
+/// Shared marker parser — extracts `[PREFIX:reference]` patterns.
+fn parse_markers(content: &str, prefix: &str) -> (String, Vec<String>) {
     let mut refs = Vec::new();
     let mut cleaned = String::with_capacity(content.len());
     let mut cursor = 0usize;
 
-    while let Some(rel_start) = content[cursor..].find(IMAGE_MARKER_PREFIX) {
+    while let Some(rel_start) = content[cursor..].find(prefix) {
         let start = cursor + rel_start;
         cleaned.push_str(&content[cursor..start]);
 
-        let marker_start = start + IMAGE_MARKER_PREFIX.len();
+        let marker_start = start + prefix.len();
         let Some(rel_end) = content[marker_start..].find(']') else {
             cleaned.push_str(&content[start..]);
             cursor = content.len();
@@ -87,18 +144,6 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
     (cleaned.trim().to_string(), refs)
 }
 
-pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
-    messages
-        .iter()
-        .filter(|m| m.role == "user")
-        .map(|m| parse_image_markers(&m.content).1.len())
-        .sum()
-}
-
-pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
-    count_image_markers(messages) > 0
-}
-
 pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     if image_ref.starts_with("data:") {
         let comma_idx = image_ref.find(',')?;
@@ -119,25 +164,34 @@ pub async fn prepare_messages_for_provider(
     config: &MultimodalConfig,
 ) -> anyhow::Result<PreparedMessages> {
     let (max_images, max_image_size_mb) = config.effective_limits();
-    let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
+    let max_image_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
+    let (max_audio, max_audio_size_mb) = config.effective_audio_limits();
+    let max_audio_bytes = max_audio_size_mb.saturating_mul(1024 * 1024);
 
     let total_images = count_image_markers(messages);
+    let total_audio = count_audio_markers(messages);
 
-    if total_images == 0 {
+    if total_images == 0 && total_audio == 0 {
         return Ok(PreparedMessages {
             messages: messages.to_vec(),
             contains_images: false,
+            contains_audio: false,
         });
     }
 
     // When image count exceeds the limit, strip markers from oldest messages
-    // first so that the most recent (most relevant) images survive. This
-    // prevents conversations from becoming permanently stuck once the
-    // cumulative image count crosses the threshold.
+    // first so that the most recent (most relevant) images survive.
     let trimmed = if total_images > max_images {
         trim_old_images(messages, max_images)
     } else {
         messages.to_vec()
+    };
+
+    // Same for audio markers.
+    let trimmed = if total_audio > max_audio {
+        trim_old_markers(&trimmed, AUDIO_MARKER_PREFIX, max_audio)
+    } else {
+        trimmed
     };
 
     let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
@@ -149,20 +203,47 @@ pub async fn prepare_messages_for_provider(
             continue;
         }
 
-        let (cleaned_text, refs) = parse_image_markers(&message.content);
-        if refs.is_empty() {
+        let (cleaned_text, image_refs) = parse_image_markers(&message.content);
+        let (cleaned_text, audio_refs) = parse_audio_markers(&cleaned_text);
+
+        if image_refs.is_empty() && audio_refs.is_empty() {
             normalized_messages.push(message.clone());
             continue;
         }
 
-        let mut normalized_refs = Vec::with_capacity(refs.len());
-        for reference in refs {
+        // Normalize image references → data URIs
+        let mut normalized_image_refs = Vec::with_capacity(image_refs.len());
+        for reference in image_refs {
             let data_uri =
-                normalize_image_reference(&reference, config, max_bytes, &remote_client).await?;
-            normalized_refs.push(data_uri);
+                normalize_image_reference(&reference, config, max_image_bytes, &remote_client)
+                    .await?;
+            normalized_image_refs.push(data_uri);
         }
 
-        let content = compose_multimodal_message(&cleaned_text, &normalized_refs);
+        // Normalize audio references → AudioRef (base64 + format)
+        let mut normalized_audio_refs = Vec::with_capacity(audio_refs.len());
+        for reference in &audio_refs {
+            let audio_ref = normalize_local_audio(reference, max_audio_bytes).await?;
+            normalized_audio_refs.push(audio_ref);
+        }
+
+        // Re-compose message with normalized markers
+        let mut content = compose_multimodal_message(&cleaned_text, &normalized_image_refs);
+        // Append audio markers back (they'll be parsed by the provider's to_message_content)
+        for (i, audio_ref) in normalized_audio_refs.iter().enumerate() {
+            if !content.is_empty() && i == 0 {
+                content.push_str("\n\n");
+            } else if i > 0 {
+                content.push('\n');
+            }
+            // Embed as [AUDIO:base64data|format] — provider parses this
+            content.push_str(AUDIO_MARKER_PREFIX);
+            content.push_str(&audio_ref.data);
+            content.push('|');
+            content.push_str(&audio_ref.format);
+            content.push(']');
+        }
+
         normalized_messages.push(ChatMessage {
             role: message.role.clone(),
             content,
@@ -171,8 +252,55 @@ pub async fn prepare_messages_for_provider(
 
     Ok(PreparedMessages {
         messages: normalized_messages,
-        contains_images: true,
+        contains_images: total_images > 0,
+        contains_audio: total_audio > 0,
     })
+}
+
+/// Strip markers of the given type from older messages, keeping the newest `max_keep`.
+fn trim_old_markers(messages: &[ChatMessage], prefix: &str, max_keep: usize) -> Vec<ChatMessage> {
+    let image_positions: Vec<(usize, usize)> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "user")
+        .filter_map(|(i, m)| {
+            let count = parse_markers(&m.content, prefix).1.len();
+            if count > 0 { Some((i, count)) } else { None }
+        })
+        .collect();
+
+    let total: usize = image_positions.iter().map(|(_, c)| c).sum();
+    let mut to_drop = total.saturating_sub(max_keep);
+
+    let mut strip_indices = std::collections::HashSet::new();
+    for &(idx, count) in &image_positions {
+        if to_drop == 0 {
+            break;
+        }
+        strip_indices.insert(idx);
+        to_drop = to_drop.saturating_sub(count);
+    }
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if strip_indices.contains(&i) {
+                let (cleaned, _) = parse_markers(&m.content, prefix);
+                let text = if cleaned.trim().is_empty() {
+                    "[media removed from history]".to_string()
+                } else {
+                    cleaned
+                };
+                ChatMessage {
+                    role: m.role.clone(),
+                    content: text,
+                }
+            } else {
+                m.clone()
+            }
+        })
+        .collect()
 }
 
 /// Strip image markers from older messages (oldest first) until total image
@@ -407,6 +535,68 @@ async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result
     validate_mime(source, &mime)?;
 
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
+}
+
+/// Normalize a local audio file to an `AudioRef` (base64 data + format string).
+/// Unlike images which use data URIs, audio uses raw base64 + a separate format field.
+pub async fn normalize_local_audio(source: &str, max_bytes: usize) -> anyhow::Result<AudioRef> {
+    let path = Path::new(source);
+    if !path.exists() || !path.is_file() {
+        return Err(MultimodalError::ImageSourceNotFound {
+            input: source.to_string(),
+        }
+        .into());
+    }
+
+    let metadata =
+        tokio::fs::metadata(path)
+            .await
+            .map_err(|error| MultimodalError::LocalReadFailed {
+                input: source.to_string(),
+                reason: error.to_string(),
+            })?;
+
+    validate_size(
+        source,
+        usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+        max_bytes,
+    )?;
+
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|error| MultimodalError::LocalReadFailed {
+            input: source.to_string(),
+            reason: error.to_string(),
+        })?;
+
+    validate_size(source, bytes.len(), max_bytes)?;
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let (_, format) = audio_format_from_extension(&ext).ok_or_else(|| {
+        MultimodalError::UnsupportedMime {
+            input: source.to_string(),
+            mime: format!("unknown audio extension: .{ext}"),
+        }
+    })?;
+
+    Ok(AudioRef {
+        data: STANDARD.encode(&bytes),
+        format: format.to_string(),
+    })
+}
+
+/// Look up audio MIME type and OpenRouter format string from file extension.
+pub fn audio_format_from_extension(ext: &str) -> Option<(&'static str, &'static str)> {
+    let lower = ext.to_ascii_lowercase();
+    AUDIO_EXTENSION_MAP
+        .iter()
+        .find(|(e, _, _)| *e == lower.as_str())
+        .map(|(_, mime, fmt)| (*mime, *fmt))
 }
 
 fn validate_size(source: &str, size_bytes: usize, max_bytes: usize) -> anyhow::Result<()> {
@@ -849,5 +1039,173 @@ mod tests {
             "expected empty string, got: {cleaned:?}"
         );
         assert_eq!(refs.len(), 1);
+    }
+
+    // ── Audio Marker Parsing ───────────────────────────────────
+
+    #[test]
+    fn parse_audio_markers_extracts_single() {
+        let input = "Transcribe this [AUDIO:/tmp/voice.webm]";
+        let (cleaned, refs) = parse_audio_markers(input);
+        assert_eq!(cleaned, "Transcribe this");
+        assert_eq!(refs, vec!["/tmp/voice.webm"]);
+    }
+
+    #[test]
+    fn parse_audio_markers_extracts_multiple() {
+        let input = "Compare [AUDIO:/a.mp3] with [AUDIO:/b.wav]";
+        let (cleaned, refs) = parse_audio_markers(input);
+        assert_eq!(cleaned, "Compare  with");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0], "/a.mp3");
+        assert_eq!(refs[1], "/b.wav");
+    }
+
+    #[test]
+    fn parse_audio_markers_ignores_empty() {
+        let input = "hello [AUDIO:] world";
+        let (cleaned, refs) = parse_audio_markers(input);
+        assert_eq!(cleaned, "hello [AUDIO:] world");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn parse_audio_markers_audio_only_becomes_empty() {
+        let input = "[AUDIO:/tmp/voice.webm]";
+        let (cleaned, refs) = parse_audio_markers(input);
+        assert!(cleaned.is_empty());
+        assert_eq!(refs.len(), 1);
+    }
+
+    #[test]
+    fn parse_audio_markers_does_not_match_image() {
+        let input = "Look at [IMAGE:/tmp/photo.png]";
+        let (cleaned, refs) = parse_audio_markers(input);
+        assert_eq!(cleaned, "Look at [IMAGE:/tmp/photo.png]");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn parse_image_markers_does_not_match_audio() {
+        let input = "Listen to [AUDIO:/tmp/voice.mp3]";
+        let (cleaned, refs) = parse_image_markers(input);
+        assert_eq!(cleaned, "Listen to [AUDIO:/tmp/voice.mp3]");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn mixed_image_and_audio_markers_parsed_independently() {
+        let input = "Check [IMAGE:/tmp/a.png] and listen [AUDIO:/tmp/b.mp3]";
+        let (img_cleaned, img_refs) = parse_image_markers(input);
+        assert_eq!(img_refs, vec!["/tmp/a.png"]);
+        let (final_cleaned, audio_refs) = parse_audio_markers(&img_cleaned);
+        assert_eq!(audio_refs, vec!["/tmp/b.mp3"]);
+        assert_eq!(final_cleaned, "Check  and listen");
+    }
+
+    // ── Audio Extension Detection ──────────────────────────────
+
+    #[test]
+    fn audio_format_from_extension_known_formats() {
+        assert_eq!(audio_format_from_extension("mp3"), Some(("audio/mpeg", "mp3")));
+        assert_eq!(audio_format_from_extension("wav"), Some(("audio/wav", "wav")));
+        assert_eq!(audio_format_from_extension("webm"), Some(("audio/webm", "webm")));
+        assert_eq!(audio_format_from_extension("ogg"), Some(("audio/ogg", "ogg")));
+        assert_eq!(audio_format_from_extension("flac"), Some(("audio/flac", "flac")));
+        assert_eq!(audio_format_from_extension("m4a"), Some(("audio/mp4", "m4a")));
+        assert_eq!(audio_format_from_extension("aac"), Some(("audio/aac", "aac")));
+    }
+
+    #[test]
+    fn audio_format_from_extension_case_insensitive() {
+        assert_eq!(audio_format_from_extension("MP3"), Some(("audio/mpeg", "mp3")));
+        assert_eq!(audio_format_from_extension("WAV"), Some(("audio/wav", "wav")));
+    }
+
+    #[test]
+    fn audio_format_from_extension_unknown() {
+        assert!(audio_format_from_extension("txt").is_none());
+        assert!(audio_format_from_extension("png").is_none());
+        assert!(audio_format_from_extension("").is_none());
+    }
+
+    // ── Audio Count/Contains ───────────────────────────────────
+
+    #[test]
+    fn count_audio_markers_counts_user_messages_only() {
+        let messages = vec![
+            ChatMessage::user("[AUDIO:/a.mp3] first".to_string()),
+            ChatMessage { role: "assistant".into(), content: "[AUDIO:/b.mp3] ignored".into() },
+            ChatMessage::user("[AUDIO:/c.wav] second".to_string()),
+        ];
+        assert_eq!(count_audio_markers(&messages), 2);
+    }
+
+    #[test]
+    fn contains_audio_markers_true_when_present() {
+        let messages = vec![ChatMessage::user("[AUDIO:/a.mp3]".to_string())];
+        assert!(contains_audio_markers(&messages));
+    }
+
+    #[test]
+    fn contains_audio_markers_false_when_absent() {
+        let messages = vec![ChatMessage::user("no audio here".to_string())];
+        assert!(!contains_audio_markers(&messages));
+    }
+
+    // ── Normalize Local Audio ──────────────────────────────────
+
+    #[tokio::test]
+    async fn normalize_local_audio_reads_and_encodes() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_audio_normalize");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("test.mp3");
+        tokio::fs::write(&path, b"fake mp3 data").await.unwrap();
+
+        let result = normalize_local_audio(path.to_str().unwrap(), 10 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(result.format, "mp3");
+        assert!(!result.data.is_empty());
+        // Verify round-trip
+        let decoded = base64::engine::general_purpose::STANDARD.decode(&result.data).unwrap();
+        assert_eq!(decoded, b"fake mp3 data");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn normalize_local_audio_rejects_unknown_extension() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_audio_bad_ext");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("test.xyz");
+        tokio::fs::write(&path, b"data").await.unwrap();
+
+        let result = normalize_local_audio(path.to_str().unwrap(), 10 * 1024 * 1024).await;
+        assert!(result.is_err());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn normalize_local_audio_rejects_oversized() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_audio_oversize");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("big.wav");
+        tokio::fs::write(&path, vec![0u8; 1024]).await.unwrap();
+
+        let result = normalize_local_audio(path.to_str().unwrap(), 512).await;
+        assert!(result.is_err());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn normalize_local_audio_rejects_missing_file() {
+        let result = normalize_local_audio("/nonexistent/audio.mp3", 10 * 1024 * 1024).await;
+        assert!(result.is_err());
     }
 }
