@@ -60,6 +60,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 Sovereign fork with a pre-shared token functionality to simplify and speed up container service load time when hosted in Kubernetes.
 
 #### Change Log
+* **alpha-p6**: Fix webhook channel and add multi-modality: sub-agent image generation, and speech to text
 * **alpha-p5**: Add `/system` folder for read-only configuration.
 * **alpha-p4**: Add vim to image.
 * **alpha-p3**: Use Wolfi insteads of distroless container image.
