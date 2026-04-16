@@ -900,11 +900,18 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
-    config
+    // Include webhook channel — it should start independently of real-time channels
+    let has_webhook = config
         .channels_config
-        .channels_except_webhook()
-        .iter()
-        .any(|(_, ok)| *ok)
+        .webhook
+        .as_ref()
+        .is_some_and(|w| w.enabled);
+    has_webhook
+        || config
+            .channels_config
+            .channels_except_webhook()
+            .iter()
+            .any(|(_, ok)| *ok)
 }
 
 async fn run_mqtt_sop_listener(config: &crate::config::MqttConfig) -> Result<()> {
@@ -1069,6 +1076,95 @@ mod tests {
             bot_name: None,
         });
         assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn detects_webhook_only_as_supervised_channel() {
+        let mut config = Config::default();
+        config.channels_config.webhook = Some(crate::config::WebhookConfig {
+            enabled: true,
+            port: 42618,
+            listen_path: None,
+            send_url: None,
+            send_method: None,
+            auth_header: None,
+            secret: None,
+        });
+        assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn webhook_disabled_no_other_channels_returns_false() {
+        let mut config = Config::default();
+        config.channels_config.webhook = Some(crate::config::WebhookConfig {
+            enabled: false,
+            port: 42618,
+            listen_path: None,
+            send_url: None,
+            send_method: None,
+            auth_header: None,
+            secret: None,
+        });
+        assert!(!has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn webhook_disabled_with_other_channel_returns_true() {
+        let mut config = Config::default();
+        config.channels_config.webhook = Some(crate::config::WebhookConfig {
+            enabled: false,
+            port: 42618,
+            listen_path: None,
+            send_url: None,
+            send_method: None,
+            auth_header: None,
+            secret: None,
+        });
+        config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            enabled: true,
+            bot_token: "token".into(),
+            allowed_users: vec![],
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+            ack_reactions: None,
+            proxy_url: None,
+        });
+        assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn webhook_enabled_alongside_other_channel_returns_true() {
+        let mut config = Config::default();
+        config.channels_config.webhook = Some(crate::config::WebhookConfig {
+            enabled: true,
+            port: 42618,
+            listen_path: None,
+            send_url: None,
+            send_method: None,
+            auth_header: None,
+            secret: None,
+        });
+        config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            enabled: true,
+            bot_token: "token".into(),
+            allowed_users: vec![],
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+            ack_reactions: None,
+            proxy_url: None,
+        });
+        assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn webhook_none_no_other_channels_returns_false() {
+        let mut config = Config::default();
+        config.channels_config.webhook = None;
+        assert!(!has_supervised_channels(&config));
     }
 
     #[test]
