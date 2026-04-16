@@ -84,10 +84,23 @@ struct Choice {
 struct ResponseMessage {
     #[serde(default)]
     content: Option<String>,
-    /// Image generation models (e.g. Gemini image preview) return image data
-    /// here instead of in `content`.
     #[serde(default)]
     reasoning_details: Option<Vec<ReasoningDetail>>,
+    /// Image generation models return generated images here as data URIs.
+    #[serde(default)]
+    images: Option<Vec<ImageResponse>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ImageResponse {
+    #[serde(default)]
+    image_url: Option<ImageResponseUrl>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ImageResponseUrl {
+    #[serde(default)]
+    url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -186,9 +199,11 @@ struct NativeResponseMessage {
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<NativeToolCall>>,
-    /// Image generation models may return image data here.
     #[serde(default)]
     reasoning_details: Option<Vec<ReasoningDetail>>,
+    /// Image generation models return generated images here as data URIs.
+    #[serde(default)]
+    images: Option<Vec<ImageResponse>>,
 }
 
 impl OpenRouterProvider {
@@ -327,20 +342,47 @@ impl OpenRouterProvider {
             .collect()
     }
 
-    /// Extract base64 image data from `reasoning_details` if present.
-    fn extract_image_data(details: &Option<Vec<ReasoningDetail>>) -> Option<Vec<u8>> {
-        let details = details.as_ref()?;
-        for detail in details {
-            if detail.detail_type.as_deref() == Some("reasoning.encrypted") {
-                if let Some(ref data) = detail.data {
-                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
-                        if !bytes.is_empty() {
-                            return Some(bytes);
+    /// Extract image bytes from the response. Checks the `images` field first
+    /// (where OpenRouter returns generated images as data URIs), then falls back
+    /// to `reasoning_details` for older response formats.
+    fn extract_image_data(
+        images: &Option<Vec<ImageResponse>>,
+        reasoning_details: &Option<Vec<ReasoningDetail>>,
+    ) -> Option<Vec<u8>> {
+        // Primary: check `images` field (data URI format)
+        if let Some(images) = images.as_ref() {
+            for img in images {
+                if let Some(ref url_obj) = img.image_url {
+                    if let Some(ref url) = url_obj.url {
+                        // Parse data URI: "data:image/jpeg;base64,/9j/4AAQ..."
+                        if let Some(comma_idx) = url.find(',') {
+                            let payload = &url[comma_idx + 1..];
+                            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload) {
+                                if !bytes.is_empty() {
+                                    return Some(bytes);
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+
+        // Fallback: check reasoning_details
+        if let Some(details) = reasoning_details.as_ref() {
+            for detail in details {
+                if detail.detail_type.as_deref() == Some("reasoning.encrypted") {
+                    if let Some(ref data) = detail.data {
+                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
+                            if !bytes.is_empty() {
+                                return Some(bytes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         None
     }
 
@@ -349,7 +391,17 @@ impl OpenRouterProvider {
     fn save_image_to_workspace(workspace: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
         let media_dir = workspace.join("media");
         std::fs::create_dir_all(&media_dir)?;
-        let filename = format!("generated-{}.png", uuid::Uuid::new_v4());
+        // Detect format from magic bytes to use correct extension
+        let ext = if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+            "jpg"
+        } else if bytes.len() >= 8 && bytes[0] == 0x89 && bytes[1] == b'P' && bytes[2] == b'N' && bytes[3] == b'G' {
+            "png"
+        } else if bytes.len() >= 4 && bytes[0] == b'R' && bytes[1] == b'I' && bytes[2] == b'F' && bytes[3] == b'F' {
+            "webp"
+        } else {
+            "png" // fallback
+        };
+        let filename = format!("generated-{}.{}", uuid::Uuid::new_v4(), ext);
         let path = media_dir.join(&filename);
         std::fs::write(&path, bytes)?;
         Ok(path)
@@ -360,11 +412,12 @@ impl OpenRouterProvider {
     fn process_response_with_image_save(
         &self,
         content: Option<String>,
+        images: &Option<Vec<ImageResponse>>,
         reasoning_details: &Option<Vec<ReasoningDetail>>,
     ) -> String {
-        // Try to extract image data from reasoning_details
+        // Try to extract image data from images field (primary) or reasoning_details (fallback)
         if let Some(ref workspace) = self.workspace_dir {
-            if let Some(image_bytes) = Self::extract_image_data(reasoning_details) {
+            if let Some(image_bytes) = Self::extract_image_data(images, reasoning_details) {
                 match Self::save_image_to_workspace(workspace, &image_bytes) {
                     Ok(path) => {
                         let text_part = content
@@ -574,6 +627,7 @@ impl Provider for OpenRouterProvider {
             .map(|c| {
                 self.process_response_with_image_save(
                     c.message.content,
+                    &c.message.images,
                     &c.message.reasoning_details,
                 )
             })
@@ -630,6 +684,7 @@ impl Provider for OpenRouterProvider {
             .map(|c| {
                 self.process_response_with_image_save(
                     c.message.content,
+                    &c.message.images,
                     &c.message.reasoning_details,
                 )
             })
@@ -686,12 +741,13 @@ impl Provider for OpenRouterProvider {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
+        let images = native_choice.message.images.clone();
         let reasoning_details = native_choice.message.reasoning_details.clone();
         let mut result = Self::parse_native_response(native_choice.message);
-        // Save image data from reasoning_details to disk if present.
+        // Save image data to disk if present.
         if result.text.as_deref().map_or(true, str::is_empty) {
             if let Some(ref workspace) = self.workspace_dir {
-                if let Some(image_bytes) = Self::extract_image_data(&reasoning_details) {
+                if let Some(image_bytes) = Self::extract_image_data(&images, &reasoning_details) {
                     match Self::save_image_to_workspace(workspace, &image_bytes) {
                         Ok(path) => {
                             let text_part = result.text.as_deref()
@@ -795,12 +851,13 @@ impl Provider for OpenRouterProvider {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
+        let images = native_choice.message.images.clone();
         let reasoning_details = native_choice.message.reasoning_details.clone();
         let mut result = Self::parse_native_response(native_choice.message);
-        // Save image data from reasoning_details to disk if present.
+        // Save image data to disk if present.
         if result.text.as_deref().map_or(true, str::is_empty) {
             if let Some(ref workspace) = self.workspace_dir {
-                if let Some(image_bytes) = Self::extract_image_data(&reasoning_details) {
+                if let Some(image_bytes) = Self::extract_image_data(&images, &reasoning_details) {
                     match Self::save_image_to_workspace(workspace, &image_bytes) {
                         Ok(path) => {
                             let text_part = result.text.as_deref()
@@ -1100,6 +1157,7 @@ mod tests {
             content: Some("Here you go.".into()),
             reasoning_content: None,
             reasoning_details: None,
+            images: None,
             tool_calls: Some(vec![NativeToolCall {
                 id: Some("call_789".into()),
                 kind: Some("function".into()),
@@ -1280,6 +1338,7 @@ mod tests {
             content: Some("answer".into()),
             reasoning_content: Some("thinking step".into()),
             reasoning_details: None,
+            images: None,
             tool_calls: Some(vec![NativeToolCall {
                 id: Some("call_1".into()),
                 kind: Some("function".into()),
@@ -1300,6 +1359,7 @@ mod tests {
             content: Some("hello".into()),
             reasoning_content: None,
             reasoning_details: None,
+            images: None,
             tool_calls: None,
         };
         let parsed = OpenRouterProvider::parse_native_response(message);
@@ -1608,12 +1668,43 @@ mod tests {
     // ── Image Generation: Extraction (#11-17) ──────────────────
 
     #[test]
+    fn extract_image_data_from_images_field() {
+        let jpeg_data = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]; // JPEG header
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_data);
+        let images = Some(vec![ImageResponse {
+            image_url: Some(ImageResponseUrl {
+                url: Some(format!("data:image/jpeg;base64,{b64}")),
+            }),
+        }]);
+        let result = OpenRouterProvider::extract_image_data(&images, &None);
+        assert_eq!(result.unwrap(), jpeg_data);
+    }
+
+    #[test]
+    fn extract_image_data_images_field_takes_priority_over_reasoning() {
+        let jpeg_data = vec![0xFF, 0xD8, 0xFF];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_data);
+        let images = Some(vec![ImageResponse {
+            image_url: Some(ImageResponseUrl {
+                url: Some(format!("data:image/jpeg;base64,{b64}")),
+            }),
+        }]);
+        let details = Some(vec![ReasoningDetail {
+            detail_type: Some("reasoning.encrypted".into()),
+            data: Some(base64::engine::general_purpose::STANDARD.encode(b"WRONG")),
+        }]);
+        // images field should win
+        let result = OpenRouterProvider::extract_image_data(&images, &details);
+        assert_eq!(result.unwrap(), jpeg_data);
+    }
+
+    #[test]
     fn extract_image_data_valid_base64() {
         let details = Some(vec![ReasoningDetail {
             detail_type: Some("reasoning.encrypted".into()),
             data: Some(base64::engine::general_purpose::STANDARD.encode(b"PNG_BYTES")),
         }]);
-        let result = OpenRouterProvider::extract_image_data(&details);
+        let result = OpenRouterProvider::extract_image_data(&None, &details);
         assert_eq!(result.unwrap(), b"PNG_BYTES");
     }
 
@@ -1623,7 +1714,7 @@ mod tests {
             detail_type: Some("reasoning.encrypted".into()),
             data: Some("not!valid!base64!!!".into()),
         }]);
-        assert!(OpenRouterProvider::extract_image_data(&details).is_none());
+        assert!(OpenRouterProvider::extract_image_data(&None, &details).is_none());
     }
 
     #[test]
@@ -1632,7 +1723,7 @@ mod tests {
             detail_type: Some("reasoning.encrypted".into()),
             data: Some(String::new()),
         }]);
-        assert!(OpenRouterProvider::extract_image_data(&details).is_none());
+        assert!(OpenRouterProvider::extract_image_data(&None, &details).is_none());
     }
 
     #[test]
@@ -1641,18 +1732,18 @@ mod tests {
             detail_type: Some("reasoning.text".into()),
             data: Some(base64::engine::general_purpose::STANDARD.encode(b"data")),
         }]);
-        assert!(OpenRouterProvider::extract_image_data(&details).is_none());
+        assert!(OpenRouterProvider::extract_image_data(&None, &details).is_none());
     }
 
     #[test]
     fn extract_image_data_empty_vec() {
         let details: Option<Vec<ReasoningDetail>> = Some(vec![]);
-        assert!(OpenRouterProvider::extract_image_data(&details).is_none());
+        assert!(OpenRouterProvider::extract_image_data(&None, &details).is_none());
     }
 
     #[test]
     fn extract_image_data_none() {
-        assert!(OpenRouterProvider::extract_image_data(&None).is_none());
+        assert!(OpenRouterProvider::extract_image_data(&None, &None).is_none());
     }
 
     #[test]
@@ -1667,7 +1758,7 @@ mod tests {
                 data: Some(base64::engine::general_purpose::STANDARD.encode(b"IMG")),
             },
         ]);
-        assert_eq!(OpenRouterProvider::extract_image_data(&details).unwrap(), b"IMG");
+        assert_eq!(OpenRouterProvider::extract_image_data(&None, &details).unwrap(), b"IMG");
     }
 
     // ── Image Generation: Disk Write (#18-22) ──────────────────
@@ -1743,7 +1834,7 @@ mod tests {
             data: Some(base64::engine::general_purpose::STANDARD.encode(b"IMG_DATA")),
         }]);
 
-        let result = provider.process_response_with_image_save(None, &details);
+        let result = provider.process_response_with_image_save(None, &None, &details);
         assert!(result.starts_with("Image saved to:"));
         assert!(result.contains("media/generated-"));
 
@@ -1765,6 +1856,7 @@ mod tests {
 
         let result = provider.process_response_with_image_save(
             Some("A beautiful sunset".into()),
+            &None,
             &details,
         );
         assert!(result.starts_with("Image saved to:"));
@@ -1781,6 +1873,7 @@ mod tests {
         let result = provider.process_response_with_image_save(
             Some("normal text".into()),
             &None,
+            &None,
         );
         assert_eq!(result, "normal text");
     }
@@ -1790,7 +1883,7 @@ mod tests {
         let provider = OpenRouterProvider::new(None, None)
             .with_workspace_dir(std::env::temp_dir());
 
-        let result = provider.process_response_with_image_save(None, &None);
+        let result = provider.process_response_with_image_save(None, &None, &None);
         assert_eq!(result, "");
     }
 
@@ -1802,7 +1895,7 @@ mod tests {
             data: Some(base64::engine::general_purpose::STANDARD.encode(b"IMG")),
         }]);
 
-        let result = provider.process_response_with_image_save(None, &details);
+        let result = provider.process_response_with_image_save(None, &None, &details);
         // No workspace → falls back to empty content
         assert_eq!(result, "");
     }
@@ -1818,6 +1911,7 @@ mod tests {
 
         let result = provider.process_response_with_image_save(
             Some("fallback text".into()),
+            &None,
             &details,
         );
         // Save failed → falls back to text content
@@ -1887,9 +1981,10 @@ mod tests {
         let provider = OpenRouterProvider::new(None, None)
             .with_workspace_dir(std::env::temp_dir());
 
-        // Normal text response, no reasoning_details
+        // Normal text response, no images or reasoning_details
         let result = provider.process_response_with_image_save(
             Some("just text".into()),
+            &None,
             &None,
         );
         assert_eq!(result, "just text");
