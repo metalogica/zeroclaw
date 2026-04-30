@@ -33,25 +33,27 @@ pub struct OpenRouterProvider {
 const DEFAULT_OPENROUTER_TIMEOUT_SECS: u64 = 120;
 const OPENROUTER_CONNECT_TIMEOUT_SECS: u64 = 10;
 
-static POD_NAMESPACE_USER_ID_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^claw-([a-z0-9]{32})$").expect("valid regex"));
+static USER_ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z0-9]{32}$").expect("valid regex"));
 
-/// Pure extraction: given a Kubernetes namespace string, pull the bare 32-char
-/// Convex user id out of the `claw-<id>` envelope. Returns `None` for any
-/// shape mismatch (wrong prefix, wrong length, wrong alphabet).
-fn extract_pod_user_id(namespace: &str) -> Option<String> {
-    POD_NAMESPACE_USER_ID_RE
-        .captures(namespace)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
+/// Pure validation: accept the value only if it's a bare 32-char lowercase
+/// alphanumeric identifier (Convex document id shape). Rejects anything with
+/// a `claw-` prefix, whitespace, wrong length, or wrong alphabet.
+fn validate_pod_user_id(value: &str) -> Option<String> {
+    if USER_ID_RE.is_match(value) {
+        Some(value.to_string())
+    } else {
+        None
+    }
 }
 
-/// Read `POD_NAMESPACE` from the environment and extract the user id.
-/// Returns `None` when the env var is unset or doesn't match the expected shape.
+/// Read `CLAW_USER_ID` from the environment (set by the clawcraft K8s
+/// deployment) and validate the shape. Returns `None` when unset or malformed.
 fn detect_pod_user_id() -> Option<String> {
-    std::env::var("POD_NAMESPACE")
+    std::env::var("CLAW_USER_ID")
         .ok()
-        .and_then(|ns| extract_pod_user_id(&ns))
+        .as_deref()
+        .and_then(validate_pod_user_id)
 }
 
 #[derive(Debug, Serialize)]
@@ -945,53 +947,39 @@ mod tests {
     }
 
     #[test]
-    fn extract_pod_user_id_accepts_canonical_namespace() {
-        let ns = "claw-kd7a2a1aqrrxyhqjbdz449f3kh84mev6";
-        assert_eq!(
-            extract_pod_user_id(ns).as_deref(),
-            Some("kd7a2a1aqrrxyhqjbdz449f3kh84mev6")
-        );
+    fn validate_pod_user_id_accepts_canonical_id() {
+        let id = "kd76fb7wr1pba28mavncxb8pnd84r3mn";
+        assert_eq!(validate_pod_user_id(id).as_deref(), Some(id));
     }
 
     #[test]
-    fn extract_pod_user_id_rejects_wrong_prefix() {
-        assert!(extract_pod_user_id("pod-kd7a2a1aqrrxyhqjbdz449f3kh84mev6").is_none());
-        assert!(extract_pod_user_id("kd7a2a1aqrrxyhqjbdz449f3kh84mev6").is_none());
+    fn validate_pod_user_id_rejects_claw_prefix() {
+        // A bare-id contract: anything wrapped in `claw-` is rejected so we
+        // never accidentally pass the namespace shape upstream.
+        assert!(validate_pod_user_id("claw-kd76fb7wr1pba28mavncxb8pnd84r3mn").is_none());
     }
 
     #[test]
-    fn extract_pod_user_id_rejects_short_suffix() {
+    fn validate_pod_user_id_rejects_wrong_length() {
         // 31 chars
-        assert!(extract_pod_user_id("claw-kd7a2a1aqrrxyhqjbdz449f3kh84mev").is_none());
-        assert!(extract_pod_user_id("claw-abc").is_none());
-        assert!(extract_pod_user_id("claw-").is_none());
-    }
-
-    #[test]
-    fn extract_pod_user_id_rejects_long_suffix() {
+        assert!(validate_pod_user_id("kd76fb7wr1pba28mavncxb8pnd84r3m").is_none());
         // 33 chars
-        assert!(extract_pod_user_id("claw-kd7a2a1aqrrxyhqjbdz449f3kh84mev6x").is_none());
+        assert!(validate_pod_user_id("kd76fb7wr1pba28mavncxb8pnd84r3mnx").is_none());
+        assert!(validate_pod_user_id("abc").is_none());
+        assert!(validate_pod_user_id("").is_none());
     }
 
     #[test]
-    fn extract_pod_user_id_rejects_non_lowercase_alphanumeric() {
-        // Uppercase
-        assert!(extract_pod_user_id("claw-KD7A2A1AQRRXYHQJBDZ449F3KH84MEV6").is_none());
-        // Hyphens in suffix
-        assert!(extract_pod_user_id("claw-kd7a2a1aqrrxyhqjbdz449f3kh84-ev6").is_none());
-        // Underscores
-        assert!(extract_pod_user_id("claw-kd7a2a1aqrrxyhqjbdz449f3kh84_ev6").is_none());
+    fn validate_pod_user_id_rejects_non_lowercase_alphanumeric() {
+        assert!(validate_pod_user_id("KD76FB7WR1PBA28MAVNCXB8PND84R3MN").is_none());
+        assert!(validate_pod_user_id("kd76fb7wr1pba28mavncxb8pnd84r-mn").is_none());
+        assert!(validate_pod_user_id("kd76fb7wr1pba28mavncxb8pnd84r_mn").is_none());
     }
 
     #[test]
-    fn extract_pod_user_id_rejects_empty_string() {
-        assert!(extract_pod_user_id("").is_none());
-    }
-
-    #[test]
-    fn extract_pod_user_id_rejects_trailing_whitespace() {
-        assert!(extract_pod_user_id("claw-kd7a2a1aqrrxyhqjbdz449f3kh84mev6\n").is_none());
-        assert!(extract_pod_user_id(" claw-kd7a2a1aqrrxyhqjbdz449f3kh84mev6").is_none());
+    fn validate_pod_user_id_rejects_surrounding_whitespace() {
+        assert!(validate_pod_user_id(" kd76fb7wr1pba28mavncxb8pnd84r3mn").is_none());
+        assert!(validate_pod_user_id("kd76fb7wr1pba28mavncxb8pnd84r3mn\n").is_none());
     }
 
     #[test]
