@@ -6,10 +6,12 @@ use crate::providers::traits::{
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use base64::Engine;
+use regex::Regex;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 pub struct OpenRouterProvider {
     credential: Option<String>,
@@ -22,10 +24,35 @@ pub struct OpenRouterProvider {
     /// When set, image generation responses are written to `{workspace}/media/`
     /// and the response text is replaced with the file path.
     workspace_dir: Option<PathBuf>,
+    /// Stable end-user identifier sent as the `user` field on every chat
+    /// completions request. Surfaces as `external_user` in OpenRouter
+    /// generation logs and as the `user.id` attribute in OTLP traces.
+    pod_user_id: Option<String>,
 }
 
 const DEFAULT_OPENROUTER_TIMEOUT_SECS: u64 = 120;
 const OPENROUTER_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+static POD_NAMESPACE_USER_ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^claw-([a-z0-9]{32})$").expect("valid regex"));
+
+/// Pure extraction: given a Kubernetes namespace string, pull the bare 32-char
+/// Convex user id out of the `claw-<id>` envelope. Returns `None` for any
+/// shape mismatch (wrong prefix, wrong length, wrong alphabet).
+fn extract_pod_user_id(namespace: &str) -> Option<String> {
+    POD_NAMESPACE_USER_ID_RE
+        .captures(namespace)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
+/// Read `POD_NAMESPACE` from the environment and extract the user id.
+/// Returns `None` when the env var is unset or doesn't match the expected shape.
+fn detect_pod_user_id() -> Option<String> {
+    std::env::var("POD_NAMESPACE")
+        .ok()
+        .and_then(|ns| extract_pod_user_id(&ns))
+}
 
 #[derive(Debug, Serialize)]
 struct ChatRequest {
@@ -36,6 +63,8 @@ struct ChatRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     modalities: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,6 +153,8 @@ struct NativeChatRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     modalities: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,6 +247,7 @@ impl OpenRouterProvider {
             max_tokens: None,
             modalities: None,
             workspace_dir: None,
+            pod_user_id: detect_pod_user_id(),
         }
     }
 
@@ -600,6 +632,7 @@ impl Provider for OpenRouterProvider {
             temperature,
             max_tokens: self.max_tokens,
             modalities: self.modalities.clone(),
+            user: self.pod_user_id.clone(),
         };
 
         let response = self
@@ -657,6 +690,7 @@ impl Provider for OpenRouterProvider {
             temperature,
             max_tokens: self.max_tokens,
             modalities: self.modalities.clone(),
+            user: self.pod_user_id.clone(),
         };
 
         let response = self
@@ -712,6 +746,7 @@ impl Provider for OpenRouterProvider {
             tools,
             max_tokens: self.max_tokens,
             modalities: self.modalities.clone(),
+            user: self.pod_user_id.clone(),
         };
 
         let response = self
@@ -822,6 +857,7 @@ impl Provider for OpenRouterProvider {
             tools: native_tools,
             max_tokens: self.max_tokens,
             modalities: self.modalities.clone(),
+            user: self.pod_user_id.clone(),
         };
 
         let response = self
@@ -909,6 +945,56 @@ mod tests {
     }
 
     #[test]
+    fn extract_pod_user_id_accepts_canonical_namespace() {
+        let ns = "claw-kd7a2a1aqrrxyhqjbdz449f3kh84mev6";
+        assert_eq!(
+            extract_pod_user_id(ns).as_deref(),
+            Some("kd7a2a1aqrrxyhqjbdz449f3kh84mev6")
+        );
+    }
+
+    #[test]
+    fn extract_pod_user_id_rejects_wrong_prefix() {
+        assert!(extract_pod_user_id("pod-kd7a2a1aqrrxyhqjbdz449f3kh84mev6").is_none());
+        assert!(extract_pod_user_id("kd7a2a1aqrrxyhqjbdz449f3kh84mev6").is_none());
+    }
+
+    #[test]
+    fn extract_pod_user_id_rejects_short_suffix() {
+        // 31 chars
+        assert!(extract_pod_user_id("claw-kd7a2a1aqrrxyhqjbdz449f3kh84mev").is_none());
+        assert!(extract_pod_user_id("claw-abc").is_none());
+        assert!(extract_pod_user_id("claw-").is_none());
+    }
+
+    #[test]
+    fn extract_pod_user_id_rejects_long_suffix() {
+        // 33 chars
+        assert!(extract_pod_user_id("claw-kd7a2a1aqrrxyhqjbdz449f3kh84mev6x").is_none());
+    }
+
+    #[test]
+    fn extract_pod_user_id_rejects_non_lowercase_alphanumeric() {
+        // Uppercase
+        assert!(extract_pod_user_id("claw-KD7A2A1AQRRXYHQJBDZ449F3KH84MEV6").is_none());
+        // Hyphens in suffix
+        assert!(extract_pod_user_id("claw-kd7a2a1aqrrxyhqjbdz449f3kh84-ev6").is_none());
+        // Underscores
+        assert!(extract_pod_user_id("claw-kd7a2a1aqrrxyhqjbdz449f3kh84_ev6").is_none());
+    }
+
+    #[test]
+    fn extract_pod_user_id_rejects_empty_string() {
+        assert!(extract_pod_user_id("").is_none());
+    }
+
+    #[test]
+    fn extract_pod_user_id_rejects_trailing_whitespace() {
+        assert!(extract_pod_user_id("claw-kd7a2a1aqrrxyhqjbdz449f3kh84mev6\n").is_none());
+        assert!(extract_pod_user_id(" claw-kd7a2a1aqrrxyhqjbdz449f3kh84mev6").is_none());
+    }
+
+    #[test]
     fn creates_without_key() {
         let provider = OpenRouterProvider::new(None, None);
         assert!(provider.credential.is_none());
@@ -983,6 +1069,7 @@ mod tests {
             temperature: 0.5,
             max_tokens: None,
             modalities: None,
+            user: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1018,6 +1105,7 @@ mod tests {
             temperature: 0.0,
             max_tokens: None,
             modalities: None,
+            user: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1546,6 +1634,7 @@ mod tests {
             temperature: 0.7,
             max_tokens: None,
             modalities: Some(vec!["image".into()]),
+            user: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""modalities":["image"]"#));
@@ -1559,6 +1648,7 @@ mod tests {
             temperature: 0.7,
             max_tokens: None,
             modalities: None,
+            user: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("modalities"));
@@ -1574,6 +1664,7 @@ mod tests {
             tool_choice: None,
             max_tokens: None,
             modalities: Some(vec!["image".into(), "text".into()]),
+            user: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""modalities":["image","text"]"#));
@@ -1589,9 +1680,54 @@ mod tests {
             tool_choice: None,
             max_tokens: None,
             modalities: None,
+            user: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("modalities"));
+    }
+
+    #[test]
+    fn chat_request_serializes_user_when_present() {
+        let request = ChatRequest {
+            model: "any/model".into(),
+            messages: vec![],
+            temperature: 0.0,
+            max_tokens: None,
+            modalities: None,
+            user: Some("kd7a2a1aqrrxyhqjbdz449f3kh84mev6".into()),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains(r#""user":"kd7a2a1aqrrxyhqjbdz449f3kh84mev6""#));
+    }
+
+    #[test]
+    fn chat_request_omits_user_when_none() {
+        let request = ChatRequest {
+            model: "any/model".into(),
+            messages: vec![],
+            temperature: 0.0,
+            max_tokens: None,
+            modalities: None,
+            user: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("\"user\""));
+    }
+
+    #[test]
+    fn native_chat_request_serializes_user_when_present() {
+        let request = NativeChatRequest {
+            model: "any/model".into(),
+            messages: vec![],
+            temperature: 0.0,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            modalities: None,
+            user: Some("kd7a2a1aqrrxyhqjbdz449f3kh84mev6".into()),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains(r#""user":"kd7a2a1aqrrxyhqjbdz449f3kh84mev6""#));
     }
 
     // ── Image Generation: Response Deserialization (#5-10) ──────
