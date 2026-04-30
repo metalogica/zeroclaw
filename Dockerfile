@@ -134,7 +134,11 @@ CMD ["daemon"]
 # ── Stage 3: Production Runtime (Wolfi) ───────────────────────
 FROM cgr.dev/chainguard/wolfi-base:latest AS release
 
-RUN apk add --no-cache ca-certificates bash coreutils vim
+ARG LINK_CLI_VERSION=0.4.1
+
+RUN apk add --no-cache ca-certificates bash coreutils vim nodejs npm \
+    && npm install -g --omit=dev "@stripe/link-cli@${LINK_CLI_VERSION}" \
+    && npm cache clean --force
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /zeroclaw-data /zeroclaw-data
