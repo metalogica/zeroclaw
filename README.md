@@ -91,7 +91,7 @@ cargo clean
 
 #### Build Process
 ```bash
-export TAG=0.6.9-alpha-p8
+export TAG=0.6.9-alpha-p9
 
 # ARM builds for lcoal testing on MAC
 IMAGE=catonmat/zeroclaw && \
