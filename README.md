@@ -60,7 +60,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 Sovereign fork with a pre-shared token functionality to simplify and speed up container service load time when hosted in Kubernetes.
 
 #### Change Log
-* **alpha-p9**: Add .git
+* **alpha-p9**: Fix user id attribution from p8; add .git
 * **alpha-p8**: Add Node: TBD and Link cli; add open router user metadata
 * **alpha-p7**: Debug image generation openm router response.
 * **alpha-p6**: Fix webhook channel and add multi-modality: sub-agent image generation, and speech to text
