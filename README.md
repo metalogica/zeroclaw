@@ -60,7 +60,8 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 Sovereign fork with a pre-shared token functionality to simplify and speed up container service load time when hosted in Kubernetes.
 
 #### Change Log
-* **alpha-p7**: Debug iamge generation openm router response.
+* **alpha-p8**: Add Node: TBD and Link cli; add open router user metadata
+* **alpha-p7**: Debug image generation openm router response.
 * **alpha-p6**: Fix webhook channel and add multi-modality: sub-agent image generation, and speech to text
 * **alpha-p5**: Add `/system` folder for read-only configuration.
 * **alpha-p4**: Add vim to image.
@@ -89,7 +90,7 @@ cargo clean
 
 #### Build Process
 ```bash
-TAG=0.6.9-alpha-p7
+TAG=0.6.9-alpha-p8
 
 # ARM builds for lcoal testing on MAC
 IMAGE=catonmat/zeroclaw && \
