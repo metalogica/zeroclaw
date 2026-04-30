@@ -137,7 +137,7 @@ FROM cgr.dev/chainguard/wolfi-base:latest AS release
 ARG LINK_CLI_VERSION=0.4.1
 ARG TBD_VERSION=0.1.26
 
-RUN apk add --no-cache ca-certificates bash coreutils vim nodejs npm \
+RUN apk add --no-cache ca-certificates bash coreutils vim git nodejs npm \
     && npm install -g --omit=dev \
         "@stripe/link-cli@${LINK_CLI_VERSION}" \
         "get-tbd@${TBD_VERSION}" \
