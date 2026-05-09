@@ -60,6 +60,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 Sovereign fork with a pre-shared token functionality to simplify and speed up container service load time when hosted in Kubernetes.
 
 #### Change Log
+* **alpha-p10**: Add Praxis 0.1.0; remove Link pay and TBD.
 * **alpha-p9**: Fix user id attribution from p8; add .git
 * **alpha-p8**: Add Node: TBD and Link cli; add open router user metadata
 * **alpha-p7**: Debug image generation openm router response.
@@ -90,12 +91,29 @@ cargo clean
 ```
 
 #### Build Process
+
+The Wolfi `release` stage installs the private `@soulbound-labs/praxis` CLI
+from GitHub Packages. Builds need a token with `read:packages` for the
+`soulbound-labs` org, passed in via a BuildKit secret mount (never baked
+into a layer). Pin the praxis version with `--build-arg PRAXIS_VERSION=...`
+(default lives in the `praxis-install` stage of the `Dockerfile`).
+
 ```bash
-export TAG=0.6.9-alpha-p9
+# One-time: authenticate gh with read:packages scope and confirm soulbound-labs access
+gh auth login --scopes read:packages
+gh auth status
+```
+
+```bash
+export TAG=0.6.9-alpha-p10
+export GITHUB_TOKEN=$(gh auth token)
 
 # ARM builds for lcoal testing on MAC
 IMAGE=catonmat/zeroclaw && \
-docker build --target release -t $IMAGE:$TAG .
+docker build --target release \
+  --secret id=npm_token,env=GITHUB_TOKEN \
+  --build-arg PRAXIS_VERSION=0.1.0 \
+  -t $IMAGE:$TAG .
 # test docker image locally
 docker run -d --name zeroclaw-test \
   -e ZEROCLAW_GATEWAY_HOST="0.0.0.0" \
@@ -104,6 +122,8 @@ docker run -d --name zeroclaw-test \
   -e ZEROCLAW_ALLOW_PUBLIC_BIND="true" \
   -e OPEN_ROUTER_API_KEY \
   $IMAGE:$TAG daemon
+# smoke-check praxis is on PATH
+docker run --rm $IMAGE:$TAG praxis --version   # expect: praxis-v0.1.0
 # cleanup
 docker logs zeroclaw-test
 docker container rm zeroclaw-test --force
@@ -114,6 +134,8 @@ docker buildx build \
   --platform linux/amd64 \
   --no-cache \
   --target release \
+  --secret id=npm_token,env=GITHUB_TOKEN \
+  --build-arg PRAXIS_VERSION=0.1.0 \
   --provenance=false \
   --sbom=false \
   -t $IMAGE:$TAG \

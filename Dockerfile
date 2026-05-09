@@ -131,20 +131,32 @@ HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
 ENTRYPOINT ["zeroclaw"]
 CMD ["daemon"]
 
+# ── Stage 2.5: Praxis install (private GH Packages) ──────────
+FROM node:20-alpine AS praxis-install
+
+ARG PRAXIS_VERSION=0.1.0
+
+RUN --mount=type=secret,id=npm_token \
+    sh -c 'set -eu; \
+      { \
+        echo "@soulbound-labs:registry=https://npm.pkg.github.com"; \
+        echo "//npm.pkg.github.com/:_authToken=$(cat /run/secrets/npm_token)"; \
+        echo "always-auth=true"; \
+      } > ~/.npmrc; \
+      npm install -g "@soulbound-labs/praxis@${PRAXIS_VERSION}"; \
+      rm -f ~/.npmrc'
+
 # ── Stage 3: Production Runtime (Wolfi) ───────────────────────
 FROM cgr.dev/chainguard/wolfi-base:latest AS release
 
-ARG LINK_CLI_VERSION=0.4.1
-ARG TBD_VERSION=0.1.26
-
-RUN apk add --no-cache ca-certificates bash coreutils vim git nodejs npm \
-    && npm install -g --omit=dev \
-        "@stripe/link-cli@${LINK_CLI_VERSION}" \
-        "get-tbd@${TBD_VERSION}" \
-    && npm cache clean --force
+RUN apk add --no-cache ca-certificates bash coreutils vim git nodejs
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /zeroclaw-data /zeroclaw-data
+
+# Praxis CLI (private @soulbound-labs/praxis from GH Packages)
+COPY --from=praxis-install /usr/local/lib/node_modules/@soulbound-labs/praxis /opt/praxis
+RUN ln -sf /opt/praxis/dist/bin-bootstrap.cjs /usr/local/bin/praxis
 
 # Environment setup
 # Ensure UTF-8 locale so CJK / multibyte input is handled correctly
