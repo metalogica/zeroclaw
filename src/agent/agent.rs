@@ -55,6 +55,19 @@ pub struct Agent {
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     auto_save: bool,
     memory_session_id: Option<String>,
+    /// Per-turn thread identifier surfaced to the LLM as a `[thread_id: …]`
+    /// hint prefix on the user message. Set externally by the gateway/WS
+    /// layer when the inbound `WsClientMessage` envelope carries `threadId`
+    /// (or its legacy `[conversationId:]` content-prefix fallback). The LLM
+    /// reads this so it can write `<threadId>.spec.md` to its workspace.
+    ///
+    /// Deliberately distinct from `memory_session_id` and the gateway's
+    /// `session_key`: those drive memory recall scope and per-session
+    /// serialization, and remain tied to the connection's `session_id`.
+    /// See `clawcraft:relay.ts:43` ("Do NOT send session_id — global
+    /// memory recall") — the B1/B2 FMEA decision keeps memory recall
+    /// global, independent of the per-turn thread.
+    current_thread_id: Option<String>,
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
@@ -323,6 +336,7 @@ impl AgentBuilder {
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
             memory_session_id: self.memory_session_id,
+            current_thread_id: None,
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
@@ -355,6 +369,21 @@ impl Agent {
 
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
         self.memory_session_id = session_id;
+    }
+
+    /// Set the per-turn thread identifier the agent will surface to the LLM
+    /// as a `[thread_id: …]` hint on the next user message.
+    ///
+    /// Pass `None` to clear (e.g. when an inbound message carries no
+    /// `threadId` and no legacy `[conversationId:]` prefix).
+    ///
+    /// Deliberately separate from [`set_memory_session_id`] and from the
+    /// gateway session key — those control memory recall and per-session
+    /// serialization, and remain bound to the connection's `session_id`.
+    /// Using the thread id for either would change product shape; see the
+    /// FMEA B1/B2 note at `clawcraft:relay.ts:43`.
+    pub fn set_current_thread_id(&mut self, thread_id: Option<String>) {
+        self.current_thread_id = thread_id;
     }
 
     /// Hydrate the agent with prior chat messages (e.g. from a session backend).
@@ -852,10 +881,15 @@ impl Agent {
         let date_str =
             format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
 
+        let thread_hint = self
+            .current_thread_id
+            .as_deref()
+            .map(|t| format!("[thread_id: {t}]\n"))
+            .unwrap_or_default();
         let enriched = if context.is_empty() {
-            format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
+            format!("{thread_hint}[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
         } else {
-            format!("[CURRENT DATE & TIME: {date_str}]\n\n{context}\n\n{user_message}")
+            format!("{thread_hint}[CURRENT DATE & TIME: {date_str}]\n\n{context}\n\n{user_message}")
         };
 
         self.history
@@ -1026,10 +1060,15 @@ impl Agent {
         }
 
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let thread_hint = self
+            .current_thread_id
+            .as_deref()
+            .map(|t| format!("[thread_id: {t}]\n"))
+            .unwrap_or_default();
         let enriched = if context.is_empty() {
-            format!("[{now}] {user_message}")
+            format!("{thread_hint}[{now}] {user_message}")
         } else {
-            format!("{context}[{now}] {user_message}")
+            format!("{thread_hint}{context}[{now}] {user_message}")
         };
 
         self.history

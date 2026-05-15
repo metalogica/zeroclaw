@@ -27,7 +27,9 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
+use regex::Regex;
 use serde::Deserialize;
+use std::sync::OnceLock;
 use tracing::debug;
 
 /// Optional connection parameters sent as the first WebSocket message.
@@ -49,6 +51,79 @@ struct ConnectParams {
     /// Client capabilities
     #[serde(default)]
     capabilities: Vec<String>,
+}
+
+/// Legacy `[conversationId: <id>]` content prefix used by older clawcraft
+/// clients before the typed `threadId` envelope field existed.
+///
+/// Matches the real emission `[conversationId: <id>]\n<content>`.
+///
+/// RETIREMENT: This fallback is purely transitional. Bead `rnk-eaja` on the
+/// clawcraft repo tracks its removal — scheduled ≥7 days after the clawcraft
+/// Phase 4 cutover is verified stable in prod. Once removed, only the typed
+/// `threadId` envelope field will be honored.
+fn conversation_id_prefix_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\[conversationId:\s*([^\]]+?)\s*\]\s*").unwrap())
+}
+
+/// Where the thread identifier was sourced from on an inbound message.
+/// Reported in logs during the transition window for observability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadIdSource {
+    TypedField,
+    PrefixFallback,
+    None,
+}
+
+impl ThreadIdSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TypedField => "typed_field",
+            Self::PrefixFallback => "prefix_fallback",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Parse the thread identifier from a `WsClientMessage` envelope.
+///
+/// Priority:
+/// 1. `parsed.threadId` (typed field) — authoritative when present and non-empty.
+/// 2. Legacy `[conversationId: <id>]` content prefix — extracted via
+///    [`conversation_id_prefix_regex`], stripped from the returned content.
+///
+/// Other content prefixes (`[SYSTEM]`, `[MEDIA_UPLOAD: …]`) are left intact —
+/// the strip is path-explicit to `[conversationId:]`.
+///
+/// Returns `(thread_id, cleaned_content, source)`.
+fn parse_thread_id(
+    parsed: &serde_json::Value,
+    content: &str,
+) -> (Option<String>, String, ThreadIdSource) {
+    if let Some(tid) = parsed.get("threadId").and_then(|v| v.as_str()) {
+        let trimmed = tid.trim();
+        if !trimmed.is_empty() {
+            return (
+                Some(trimmed.to_string()),
+                content.to_string(),
+                ThreadIdSource::TypedField,
+            );
+        }
+    }
+
+    if let Some(caps) = conversation_id_prefix_regex().captures(content) {
+        let id = caps
+            .get(1)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
+        let stripped = content[caps.get(0).unwrap().end()..].to_string();
+        if !id.is_empty() {
+            return (Some(id), stripped, ThreadIdSource::PrefixFallback);
+        }
+    }
+
+    (None, content.to_string(), ThreadIdSource::None)
 }
 
 /// The sub-protocol we support for the chat WebSocket.
@@ -273,7 +348,21 @@ async fn handle_socket(
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
-                let content = parsed["content"].as_str().unwrap_or("").to_string();
+                let raw_content = parsed["content"].as_str().unwrap_or("").to_string();
+                let (thread_id, content, src) = parse_thread_id(&parsed, &raw_content);
+                match src {
+                    ThreadIdSource::None => tracing::warn!(
+                        session_id = %session_id,
+                        "WS message has no threadId (typed or legacy prefix); spec write will be skipped this turn",
+                    ),
+                    _ => tracing::info!(
+                        session_id = %session_id,
+                        thread_id = %thread_id.as_deref().unwrap_or(""),
+                        source = src.as_str(),
+                        "WS message threadId parsed",
+                    ),
+                }
+                agent.set_current_thread_id(thread_id);
                 if !content.is_empty() {
                     // Persist user message
                     if let Some(ref backend) = state.session_backend {
@@ -344,7 +433,20 @@ async fn handle_socket(
                     continue;
                 }
 
-                let content = parsed["content"].as_str().unwrap_or("").to_string();
+                let raw_content = parsed["content"].as_str().unwrap_or("").to_string();
+                let (thread_id, content, src) = parse_thread_id(&parsed, &raw_content);
+                match src {
+                    ThreadIdSource::None => tracing::warn!(
+                        session_id = %session_id,
+                        "WS message has no threadId (typed or legacy prefix); spec write will be skipped this turn",
+                    ),
+                    _ => tracing::info!(
+                        session_id = %session_id,
+                        thread_id = %thread_id.as_deref().unwrap_or(""),
+                        source = src.as_str(),
+                        "WS message threadId parsed",
+                    ),
+                }
                 if content.is_empty() {
                     let err = serde_json::json!({
                         "type": "error",
@@ -368,6 +470,8 @@ async fn handle_socket(
                         continue;
                     }
                 };
+
+                agent.set_current_thread_id(thread_id);
 
                 // Persist user message
                 if let Some(ref backend) = state.session_backend {
@@ -626,5 +730,116 @@ mod tests {
             "zeroclaw.v1, bearer.zc_tok, other".parse().unwrap(),
         );
         assert_eq!(extract_ws_token(&headers, None), Some("zc_tok"));
+    }
+
+    // ── parse_thread_id ─────────────────────────────────────────────
+    // Covers the WsClientMessage envelope parse used by /ws/chat to
+    // identify the active clawcraft thread (B2 `thread-spec-binding`).
+
+    #[test]
+    fn parse_thread_id_prefers_typed_field_over_prefix() {
+        let parsed = serde_json::json!({
+            "type": "message",
+            "threadId": "tid_typed",
+            "content": "[conversationId: tid_legacy]\nhello",
+        });
+        let raw = parsed["content"].as_str().unwrap();
+        let (tid, content, src) = parse_thread_id(&parsed, raw);
+        assert_eq!(tid.as_deref(), Some("tid_typed"));
+        assert_eq!(src, ThreadIdSource::TypedField);
+        // Typed field wins → legacy prefix is NOT stripped (content untouched).
+        assert_eq!(content, "[conversationId: tid_legacy]\nhello");
+    }
+
+    #[test]
+    fn parse_thread_id_falls_back_to_legacy_prefix() {
+        let parsed = serde_json::json!({
+            "type": "message",
+            "content": "[conversationId: tid_legacy]\nhello world",
+        });
+        let raw = parsed["content"].as_str().unwrap();
+        let (tid, content, src) = parse_thread_id(&parsed, raw);
+        assert_eq!(tid.as_deref(), Some("tid_legacy"));
+        assert_eq!(src, ThreadIdSource::PrefixFallback);
+        assert_eq!(content, "hello world");
+    }
+
+    #[test]
+    fn parse_thread_id_returns_none_when_neither_present() {
+        let parsed = serde_json::json!({
+            "type": "message",
+            "content": "just a plain message",
+        });
+        let raw = parsed["content"].as_str().unwrap();
+        let (tid, content, src) = parse_thread_id(&parsed, raw);
+        assert!(tid.is_none());
+        assert_eq!(src, ThreadIdSource::None);
+        assert_eq!(content, "just a plain message");
+    }
+
+    #[test]
+    fn parse_thread_id_leaves_unrelated_prefixes_untouched() {
+        let parsed = serde_json::json!({
+            "type": "message",
+            "content": "[SYSTEM] note something\n[MEDIA_UPLOAD: foo.png] continues",
+        });
+        let raw = parsed["content"].as_str().unwrap();
+        let (tid, content, src) = parse_thread_id(&parsed, raw);
+        assert!(tid.is_none());
+        assert_eq!(src, ThreadIdSource::None);
+        assert_eq!(
+            content,
+            "[SYSTEM] note something\n[MEDIA_UPLOAD: foo.png] continues"
+        );
+    }
+
+    #[test]
+    fn parse_thread_id_trims_captured_group_whitespace() {
+        let parsed = serde_json::json!({
+            "type": "message",
+            "content": "[conversationId:   tid_padded   ]\nhi",
+        });
+        let raw = parsed["content"].as_str().unwrap();
+        let (tid, content, src) = parse_thread_id(&parsed, raw);
+        assert_eq!(tid.as_deref(), Some("tid_padded"));
+        assert_eq!(src, ThreadIdSource::PrefixFallback);
+        assert_eq!(content, "hi");
+    }
+
+    #[test]
+    fn parse_thread_id_treats_empty_typed_field_as_absent() {
+        let parsed = serde_json::json!({
+            "type": "message",
+            "threadId": "   ",
+            "content": "[conversationId: tid_legacy]\nfallback please",
+        });
+        let raw = parsed["content"].as_str().unwrap();
+        let (tid, content, src) = parse_thread_id(&parsed, raw);
+        assert_eq!(tid.as_deref(), Some("tid_legacy"));
+        assert_eq!(src, ThreadIdSource::PrefixFallback);
+        assert_eq!(content, "fallback please");
+    }
+
+    #[test]
+    fn parse_thread_id_handles_real_emission_format() {
+        // The exact emission shape from clawcraft's pre-B2 relay:
+        //   `[conversationId: <id>]\n<content>`
+        // Verifies the inner `\s*` after `:` and the `\n` separator both match.
+        let parsed = serde_json::json!({
+            "type": "message",
+            "content": "[conversationId: j97abc123]\nWhat's the weather?",
+        });
+        let raw = parsed["content"].as_str().unwrap();
+        let (tid, content, src) = parse_thread_id(&parsed, raw);
+        assert_eq!(tid.as_deref(), Some("j97abc123"));
+        assert_eq!(src, ThreadIdSource::PrefixFallback);
+        assert_eq!(content, "What's the weather?");
+    }
+
+    #[test]
+    fn parse_thread_id_source_string_labels() {
+        assert_eq!(ThreadIdSource::TypedField.as_str(), "typed_field");
+        assert_eq!(ThreadIdSource::PrefixFallback.as_str(), "prefix_fallback");
+        assert_eq!(ThreadIdSource::None.as_str(), "none");
     }
 }
