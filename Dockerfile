@@ -134,7 +134,7 @@ CMD ["daemon"]
 # ── Stage 2.5: Praxis install (private GH Packages) ──────────
 FROM node:20-alpine AS praxis-install
 
-ARG PRAXIS_VERSION=0.1.0
+ARG PRAXIS_VERSION=0.3.0
 
 RUN --mount=type=secret,id=npm_token \
     sh -c 'set -eu; \
