@@ -60,6 +60,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 Sovereign fork with a pre-shared token functionality to simplify and speed up container service load time when hosted in Kubernetes.
 
 #### Change Log
+* **alpha-p10.4**: Add Praxis 0.4.0.
 * **alpha-p10.3**: Add Praxis 0.3.0 and websocket thread-id for spec sync.
 * **alpha-p10.2**: Add Praxis 0.2.0
 * **alpha-p10**: Add Praxis 0.1.0; remove Link pay and TBD; enabled PDF read.
@@ -107,20 +108,21 @@ gh auth status
 ```
 
 ```bash
-export TAG=0.6.9-alpha-p10.2
+export TAG=0.6.9-alpha-p10.4
 export GITHUB_TOKEN=$(gh auth token)
+export PRAXIS_VERSION=0.4.0
 
 # ARM builds for lcoal testing on MAC
 IMAGE=catonmat/zeroclaw && \
 docker build --target release \
   --secret id=npm_token,env=GITHUB_TOKEN \
-  --build-arg PRAXIS_VERSION=0.1.0 \
+  --build-arg PRAXIS_VERSION=$PRAXIS_VERSION \
   -t $IMAGE:$TAG .
 
 # test docker image locally
 docker run -d --name zeroclaw-test \
   -e ZEROCLAW_GATEWAY_HOST="0.0.0.0" \
-  -p 42617:42617 \
+  -p 42618:42617 \
   -e CONTAINER_SERVICE_TOKEN="my-secret-token" \
   -e ZEROCLAW_ALLOW_PUBLIC_BIND="true" \
   -e OPEN_ROUTER_API_KEY \
@@ -132,13 +134,13 @@ docker logs zeroclaw-test
 docker container rm zeroclaw-test --force
 
 # Intel/AMD builds for official builds
+## REMEMBER TO HAVE GOOGLE CLOUD AUTHENTICATED
 IMAGE="northamerica-northeast1-docker.pkg.dev/clawcraft-489901/clawcraft-images/clawcraft-claw-runtime" && \
 docker buildx build \
   --platform linux/amd64 \
-  --no-cache \
   --target release \
   --secret id=npm_token,env=GITHUB_TOKEN \
-  --build-arg PRAXIS_VERSION=0.1.0 \
+  --build-arg PRAXIS_VERSION=$PRAXIS_VERSION \
   --provenance=false \
   --sbom=false \
   -t $IMAGE:$TAG \
