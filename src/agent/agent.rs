@@ -405,6 +405,13 @@ impl Agent {
         }
     }
 
+    /// Replace the agent's history with the given messages, re-seeding the
+    /// system prompt. Used when switching threads on a single connection.
+    pub fn replace_history(&mut self, messages: &[ChatMessage]) {
+        self.history.clear();
+        self.seed_history(messages);
+    }
+
     pub async fn from_config(config: &Config) -> Result<Self> {
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
@@ -1842,6 +1849,119 @@ mod tests {
             matches!(&history[2], ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi there")
         );
         assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn replace_history_clears_existing_messages() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        agent.seed_history(&[
+            ChatMessage::user("first thread msg"),
+            ChatMessage::assistant("first thread reply"),
+        ]);
+        assert!(
+            agent.history().iter().any(|m| matches!(
+                m,
+                ConversationMessage::Chat(c) if c.content == "first thread msg"
+            )),
+            "precondition: original messages should be in history"
+        );
+
+        agent.replace_history(&[ChatMessage::user("second thread msg")]);
+
+        let history = agent.history();
+        assert!(
+            !history.iter().any(|m| matches!(
+                m,
+                ConversationMessage::Chat(c) if c.content == "first thread msg"
+                    || c.content == "first thread reply"
+            )),
+            "replace_history must drop messages from the previous thread"
+        );
+        assert!(
+            history.iter().any(|m| matches!(
+                m,
+                ConversationMessage::Chat(c) if c.content == "second thread msg"
+            )),
+            "replace_history must seed the new messages"
+        );
+    }
+
+    #[test]
+    fn replace_history_preserves_system_prompt_seeding() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        agent.seed_history(&[ChatMessage::user("warmup")]);
+
+        agent.replace_history(&[
+            ChatMessage::system("stale system prompt that should be skipped"),
+            ChatMessage::user("new thread first message"),
+        ]);
+
+        let history = agent.history();
+        assert!(
+            matches!(&history[0], ConversationMessage::Chat(m) if m.role == "system"),
+            "replace_history must re-seed a freshly built system prompt at index 0"
+        );
+        assert!(
+            history
+                .iter()
+                .filter(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "system"))
+                .count()
+                == 1,
+            "stale system message in the seed must be skipped, leaving exactly one system entry"
+        );
+        assert!(
+            matches!(
+                &history[1],
+                ConversationMessage::Chat(m) if m.role == "user" && m.content == "new thread first message"
+            ),
+            "non-system seed messages must follow the system prompt"
+        );
     }
 
     /// Mock provider that captures whether tool specs were passed to `stream_chat`

@@ -227,6 +227,14 @@ pub async fn handle_ws_chat(
 /// Gateway session key prefix to avoid collisions with channel sessions.
 const GW_SESSION_PREFIX: &str = "gw_";
 
+/// Gateway thread key prefix for thread-scoped session storage.
+const GW_THREAD_PREFIX: &str = "gw_thread_";
+
+/// Build a session storage key for a given thread id.
+fn session_key_for_thread(thread_id: &str) -> String {
+    format!("{GW_THREAD_PREFIX}{thread_id}")
+}
+
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
