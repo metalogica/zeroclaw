@@ -60,6 +60,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 Sovereign fork with a pre-shared token functionality to simplify and speed up container service load time when hosted in Kubernetes.
 
 #### Change Log
+* **alpha-p10.5**: Add Praxis 0.9.0; add TBD to dev repo.
 * **alpha-p10.4**: Add Praxis 0.4.0.
 * **alpha-p10.3**: Add Praxis 0.3.0 and websocket thread-id for spec sync.
 * **alpha-p10.2**: Add Praxis 0.2.0
