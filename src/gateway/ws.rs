@@ -235,6 +235,19 @@ fn session_key_for_thread(thread_id: &str) -> String {
     format!("{GW_THREAD_PREFIX}{thread_id}")
 }
 
+/// Select the storage key for the current turn.
+///
+/// Prefers a thread-scoped key when `thread_id` is present and non-empty,
+/// otherwise falls back to the connection's session key. Behavior-preserving
+/// at every call site as long as thread_id is `None` — which is the case
+/// today, since callers still pass `None` until Step 3 wires real ids.
+fn pick_session_key(thread_id: Option<&str>, fallback: &str) -> String {
+    match thread_id {
+        Some(tid) if !tid.is_empty() => session_key_for_thread(tid),
+        _ => fallback.to_string(),
+    }
+}
+
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
@@ -370,15 +383,23 @@ async fn handle_socket(
                         "WS message threadId parsed",
                     ),
                 }
-                agent.set_current_thread_id(thread_id);
+                let turn_key = pick_session_key(thread_id.as_deref(), &session_key);
+                agent.set_current_thread_id(thread_id.clone());
                 if !content.is_empty() {
                     // Persist user message
                     if let Some(ref backend) = state.session_backend {
                         let user_msg = crate::providers::ChatMessage::user(&content);
-                        let _ = backend.append(&session_key, &user_msg);
+                        let _ = backend.append(&turn_key, &user_msg);
                     }
-                    process_chat_message(&state, &mut agent, &mut sender, &content, &session_key)
-                        .await;
+                    process_chat_message(
+                        &state,
+                        &mut agent,
+                        &mut sender,
+                        &content,
+                        &session_key,
+                        thread_id.as_deref(),
+                    )
+                    .await;
                 }
             } else {
                 let unknown_type = parsed["type"].as_str().unwrap_or("unknown");
@@ -465,8 +486,10 @@ async fn handle_socket(
                     continue;
                 }
 
+                let turn_key = pick_session_key(thread_id.as_deref(), &session_key);
+
                 // Acquire session lock to serialize concurrent turns
-                let _session_guard = match state.session_queue.acquire(&session_key).await {
+                let _session_guard = match state.session_queue.acquire(&turn_key).await {
                     Ok(guard) => guard,
                     Err(e) => {
                         let err = serde_json::json!({
@@ -479,15 +502,23 @@ async fn handle_socket(
                     }
                 };
 
-                agent.set_current_thread_id(thread_id);
+                agent.set_current_thread_id(thread_id.clone());
 
                 // Persist user message
                 if let Some(ref backend) = state.session_backend {
                     let user_msg = crate::providers::ChatMessage::user(&content);
-                    let _ = backend.append(&session_key, &user_msg);
+                    let _ = backend.append(&turn_key, &user_msg);
                 }
 
-                process_chat_message(&state, &mut agent, &mut sender, &content, &session_key).await;
+                process_chat_message(
+                    &state,
+                    &mut agent,
+                    &mut sender,
+                    &content,
+                    &session_key,
+                    thread_id.as_deref(),
+                )
+                .await;
             }
 
             // ── Broadcast event (cron/heartbeat results) ──────────────
@@ -510,8 +541,13 @@ async fn process_chat_message(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     content: &str,
     session_key: &str,
+    thread_id: Option<&str>,
 ) {
     use crate::agent::TurnEvent;
+
+    // Derive the storage key once per turn. Thread-scoped when a thread id
+    // is present, else the connection's session key — see [`pick_session_key`].
+    let storage_key = pick_session_key(thread_id, session_key);
 
     let provider_label = state
         .config
@@ -530,7 +566,7 @@ async fn process_chat_message(
     // Set session state to running
     let turn_id = uuid::Uuid::new_v4().to_string();
     if let Some(ref backend) = state.session_backend {
-        let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
+        let _ = backend.set_session_state(&storage_key, "running", Some(&turn_id));
     }
 
     // Channel for streaming turn events from the agent.
@@ -573,7 +609,7 @@ async fn process_chat_message(
             // Persist assistant response
             if let Some(ref backend) = state.session_backend {
                 let assistant_msg = crate::providers::ChatMessage::assistant(&response);
-                let _ = backend.append(session_key, &assistant_msg);
+                let _ = backend.append(&storage_key, &assistant_msg);
             }
 
             // Fire-and-forget memory consolidation so facts from WS sessions
@@ -612,7 +648,7 @@ async fn process_chat_message(
 
             // Set session state to idle
             if let Some(ref backend) = state.session_backend {
-                let _ = backend.set_session_state(session_key, "idle", None);
+                let _ = backend.set_session_state(&storage_key, "idle", None);
             }
 
             // Broadcast agent_end event
@@ -625,7 +661,7 @@ async fn process_chat_message(
         Err(e) => {
             // Set session state to error
             if let Some(ref backend) = state.session_backend {
-                let _ = backend.set_session_state(session_key, "error", Some(&turn_id));
+                let _ = backend.set_session_state(&storage_key, "error", Some(&turn_id));
             }
 
             tracing::error!(error = %e, "Agent turn failed");
