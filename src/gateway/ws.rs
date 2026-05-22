@@ -248,6 +248,65 @@ fn pick_session_key(thread_id: Option<&str>, fallback: &str) -> String {
     }
 }
 
+/// Hydrate the agent for a thread on the first message that carries its id,
+/// emit a `thread_resumed` frame, and remember which thread is now loaded.
+///
+/// - First hydration on this socket → `seed_history`.
+/// - Thread switch (different tid arrives mid-socket) → `replace_history`.
+/// - Same tid as the currently-hydrated thread → no-op.
+///
+/// Also persists the connect-time `session_name` query param against the
+/// thread-scoped key (deferred from Step 2 because tid is unknown at
+/// connection-open time).
+async fn hydrate_thread_if_changed(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    backend: &dyn crate::channels::session_backend::SessionBackend,
+    agent: &mut crate::agent::Agent,
+    hydrated_thread: &mut Option<String>,
+    tid: &str,
+    session_name: Option<&str>,
+) {
+    let mode = match hydrated_thread.as_deref() {
+        None => "seed",
+        Some(prev) if prev != tid => "replace",
+        _ => return,
+    };
+
+    let thread_key = session_key_for_thread(tid);
+    let messages = backend.load(&thread_key);
+    let count = messages.len();
+    tracing::debug!(
+        thread_id = %tid,
+        thread_key = %thread_key,
+        mode = mode,
+        message_count = count,
+        "WS first-message hydration"
+    );
+    if mode == "replace" {
+        agent.replace_history(&messages);
+    } else {
+        agent.seed_history(&messages);
+    }
+    *hydrated_thread = Some(tid.to_string());
+
+    if let Some(name) = session_name {
+        if !name.is_empty() {
+            let _ = backend.set_session_name(&thread_key, name);
+        }
+    }
+    let stored_name = backend.get_session_name(&thread_key).unwrap_or(None);
+
+    let mut frame = serde_json::json!({
+        "type": "thread_resumed",
+        "thread_id": tid,
+        "message_count": count,
+    });
+    if let Some(n) = stored_name {
+        frame["name"] = serde_json::Value::String(n);
+    }
+    let _ = sender.send(Message::Text(frame.to_string().into())).await;
+}
+
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
@@ -255,6 +314,13 @@ async fn handle_socket(
     session_name: Option<String>,
 ) {
     let (mut sender, mut receiver) = socket.split();
+
+    // Track whether the client passed an explicit session_id BEFORE we
+    // unwrap-or-default below. Used to gate the legacy connection-open
+    // hydration path: only CLI/test-harness direct connects pass an explicit
+    // session_id; browser/clawcraft clients omit it and rely on per-thread
+    // hydration on the first message-with-threadId (see `clawcraft:relay.ts:43`).
+    let has_explicit_session_id = session_id.is_some();
 
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -285,29 +351,45 @@ async fn handle_socket(
     };
     agent.set_memory_session_id(Some(session_id.clone()));
 
-    // Hydrate agent from persisted session (if available)
+    // Hydrate agent from persisted session (LEGACY connection-open path).
+    //
+    // This path runs only when the client passed an explicit `session_id`
+    // query param — i.e. CLI/test-harness direct connects that want to resume
+    // a connection-scoped session. Browser/clawcraft clients omit session_id
+    // and rely on the per-thread hydration that fires on the first message
+    // carrying a threadId (see the first-message hydration block below and
+    // `clawcraft:relay.ts:43`). For those clients this block is a no-op and
+    // `resumed`/`message_count` stay at their defaults.
     let mut resumed = false;
     let mut message_count: usize = 0;
     let mut effective_name: Option<String> = None;
-    if let Some(ref backend) = state.session_backend {
-        let messages = backend.load(&session_key);
-        if !messages.is_empty() {
-            message_count = messages.len();
-            agent.seed_history(&messages);
-            resumed = true;
-        }
-        // Set session name if provided (non-empty) on connect
-        if let Some(ref name) = session_name {
-            if !name.is_empty() {
-                let _ = backend.set_session_name(&session_key, name);
-                effective_name = Some(name.clone());
+    if has_explicit_session_id {
+        if let Some(ref backend) = state.session_backend {
+            let messages = backend.load(&session_key);
+            if !messages.is_empty() {
+                message_count = messages.len();
+                agent.seed_history(&messages);
+                resumed = true;
+            }
+            // Set session name if provided (non-empty) on connect
+            if let Some(ref name) = session_name {
+                if !name.is_empty() {
+                    let _ = backend.set_session_name(&session_key, name);
+                    effective_name = Some(name.clone());
+                }
+            }
+            // If no name was provided via query param, load the stored name
+            if effective_name.is_none() {
+                effective_name = backend.get_session_name(&session_key).unwrap_or(None);
             }
         }
-        // If no name was provided via query param, load the stored name
-        if effective_name.is_none() {
-            effective_name = backend.get_session_name(&session_key).unwrap_or(None);
-        }
     }
+
+    // Tracks the thread id currently hydrated into the agent's history.
+    // Updated by `hydrate_thread_if_changed` on the first message that
+    // carries a threadId, and again whenever a different thread id arrives
+    // mid-socket. Stays `None` for legacy clients that never send a threadId.
+    let mut hydrated_thread: Option<String> = None;
 
     // Send session_start message to client
     let mut session_start = serde_json::json!({
@@ -384,6 +466,19 @@ async fn handle_socket(
                     ),
                 }
                 let turn_key = pick_session_key(thread_id.as_deref(), &session_key);
+                if let (Some(tid), Some(backend)) =
+                    (thread_id.as_deref(), state.session_backend.as_ref())
+                {
+                    hydrate_thread_if_changed(
+                        &mut sender,
+                        backend.as_ref(),
+                        &mut agent,
+                        &mut hydrated_thread,
+                        tid,
+                        session_name.as_deref(),
+                    )
+                    .await;
+                }
                 agent.set_current_thread_id(thread_id.clone());
                 if !content.is_empty() {
                     // Persist user message
@@ -487,6 +582,20 @@ async fn handle_socket(
                 }
 
                 let turn_key = pick_session_key(thread_id.as_deref(), &session_key);
+
+                if let (Some(tid), Some(backend)) =
+                    (thread_id.as_deref(), state.session_backend.as_ref())
+                {
+                    hydrate_thread_if_changed(
+                        &mut sender,
+                        backend.as_ref(),
+                        &mut agent,
+                        &mut hydrated_thread,
+                        tid,
+                        session_name.as_deref(),
+                    )
+                    .await;
+                }
 
                 // Acquire session lock to serialize concurrent turns
                 let _session_guard = match state.session_queue.acquire(&turn_key).await {
