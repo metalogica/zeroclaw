@@ -248,12 +248,64 @@ fn pick_session_key(thread_id: Option<&str>, fallback: &str) -> String {
     }
 }
 
+/// Decision tag for the per-thread hydration branch.
+///
+/// Captures the three cases the WS handler cares about: first-thread on a
+/// socket, same-thread continuation (cheap no-op), and mid-socket thread
+/// switch (must clear stale history). Extracted as a pure function so the
+/// branch logic is unit-testable without a real WebSocket sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HydrationAction {
+    Seed,
+    Replace,
+    Skip,
+}
+
+fn classify_hydration(hydrated_thread: Option<&str>, incoming_tid: &str) -> HydrationAction {
+    match hydrated_thread {
+        None => HydrationAction::Seed,
+        Some(prev) if prev != incoming_tid => HydrationAction::Replace,
+        _ => HydrationAction::Skip,
+    }
+}
+
+/// Resolve the thread id for the current turn under the v1 forgiving policy:
+///
+/// - Inbound message has a threadId → use it (and emit a warn if it disagrees
+///   with the socket's hydrated thread; the new id wins, which triggers a
+///   thread switch downstream).
+/// - Inbound message has NO threadId but the socket has already hydrated a
+///   thread → treat as continuation of that thread, warn so the divergence
+///   is observable in production.
+/// - Neither → `None` (legacy connection-scoped flow).
+///
+/// We deliberately chose the forgiving option in v1: dropping such turns
+/// would break clients that fall back to the legacy `[conversationId:]`
+/// prefix when their typed envelope is misconfigured. Reversible.
+fn effective_thread_id(
+    inbound: Option<&str>,
+    hydrated_thread: Option<&str>,
+    session_id: &str,
+) -> Option<String> {
+    match (inbound, hydrated_thread) {
+        (Some(tid), _) => Some(tid.to_string()),
+        (None, Some(prev)) => {
+            tracing::warn!(
+                session_id = %session_id,
+                hydrated_thread = %prev,
+                "WS message has no threadId but socket already hydrated a thread; \
+                 treating as continuation (v1 forgiving policy)"
+            );
+            Some(prev.to_string())
+        }
+        (None, None) => None,
+    }
+}
+
 /// Hydrate the agent for a thread on the first message that carries its id,
 /// emit a `thread_resumed` frame, and remember which thread is now loaded.
 ///
-/// - First hydration on this socket → `seed_history`.
-/// - Thread switch (different tid arrives mid-socket) → `replace_history`.
-/// - Same tid as the currently-hydrated thread → no-op.
+/// See [`classify_hydration`] for the branch logic.
 ///
 /// Also persists the connect-time `session_name` query param against the
 /// thread-scoped key (deferred from Step 2 because tid is unknown at
@@ -266,11 +318,10 @@ async fn hydrate_thread_if_changed(
     tid: &str,
     session_name: Option<&str>,
 ) {
-    let mode = match hydrated_thread.as_deref() {
-        None => "seed",
-        Some(prev) if prev != tid => "replace",
-        _ => return,
-    };
+    let action = classify_hydration(hydrated_thread.as_deref(), tid);
+    if action == HydrationAction::Skip {
+        return;
+    }
 
     let thread_key = session_key_for_thread(tid);
     let messages = backend.load(&thread_key);
@@ -278,14 +329,14 @@ async fn hydrate_thread_if_changed(
     tracing::debug!(
         thread_id = %tid,
         thread_key = %thread_key,
-        mode = mode,
+        action = ?action,
         message_count = count,
         "WS first-message hydration"
     );
-    if mode == "replace" {
-        agent.replace_history(&messages);
-    } else {
-        agent.seed_history(&messages);
+    match action {
+        HydrationAction::Replace => agent.replace_history(&messages),
+        HydrationAction::Seed => agent.seed_history(&messages),
+        HydrationAction::Skip => unreachable!(),
     }
     *hydrated_thread = Some(tid.to_string());
 
@@ -325,6 +376,11 @@ async fn handle_socket(
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+
+    // Socket-local memory of which thread is currently hydrated into the
+    // agent's history. Updated by `hydrate_thread_if_changed` and used by
+    // the no-threadId continuity policy (see `effective_thread_id`).
+    let mut hydrated_thread: Option<String> = None;
 
     // Build a persistent Agent for this connection so history is maintained across turns.
     let config = state.config.lock().clone();
@@ -384,12 +440,6 @@ async fn handle_socket(
             }
         }
     }
-
-    // Tracks the thread id currently hydrated into the agent's history.
-    // Updated by `hydrate_thread_if_changed` on the first message that
-    // carries a threadId, and again whenever a different thread id arrives
-    // mid-socket. Stays `None` for legacy clients that never send a threadId.
-    let mut hydrated_thread: Option<String> = None;
 
     // Send session_start message to client
     let mut session_start = serde_json::json!({
@@ -465,7 +515,6 @@ async fn handle_socket(
                         "WS message threadId parsed",
                     ),
                 }
-                let turn_key = pick_session_key(thread_id.as_deref(), &session_key);
                 if let (Some(tid), Some(backend)) =
                     (thread_id.as_deref(), state.session_backend.as_ref())
                 {
@@ -479,7 +528,13 @@ async fn handle_socket(
                     )
                     .await;
                 }
-                agent.set_current_thread_id(thread_id.clone());
+                let effective = effective_thread_id(
+                    thread_id.as_deref(),
+                    hydrated_thread.as_deref(),
+                    &session_id,
+                );
+                let turn_key = pick_session_key(effective.as_deref(), &session_key);
+                agent.set_current_thread_id(effective.clone());
                 if !content.is_empty() {
                     // Persist user message
                     if let Some(ref backend) = state.session_backend {
@@ -492,7 +547,7 @@ async fn handle_socket(
                         &mut sender,
                         &content,
                         &session_key,
-                        thread_id.as_deref(),
+                        effective.as_deref(),
                     )
                     .await;
                 }
@@ -581,8 +636,6 @@ async fn handle_socket(
                     continue;
                 }
 
-                let turn_key = pick_session_key(thread_id.as_deref(), &session_key);
-
                 if let (Some(tid), Some(backend)) =
                     (thread_id.as_deref(), state.session_backend.as_ref())
                 {
@@ -596,6 +649,12 @@ async fn handle_socket(
                     )
                     .await;
                 }
+                let effective = effective_thread_id(
+                    thread_id.as_deref(),
+                    hydrated_thread.as_deref(),
+                    &session_id,
+                );
+                let turn_key = pick_session_key(effective.as_deref(), &session_key);
 
                 // Acquire session lock to serialize concurrent turns
                 let _session_guard = match state.session_queue.acquire(&turn_key).await {
@@ -611,7 +670,7 @@ async fn handle_socket(
                     }
                 };
 
-                agent.set_current_thread_id(thread_id.clone());
+                agent.set_current_thread_id(effective.clone());
 
                 // Persist user message
                 if let Some(ref backend) = state.session_backend {
@@ -625,7 +684,7 @@ async fn handle_socket(
                     &mut sender,
                     &content,
                     &session_key,
-                    thread_id.as_deref(),
+                    effective.as_deref(),
                 )
                 .await;
             }
@@ -808,6 +867,60 @@ async fn process_chat_message(
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    // ── classify_hydration ──────────────────────────────────────────
+    // Pure branch-decision helper used by hydrate_thread_if_changed.
+
+    #[test]
+    fn classify_hydration_first_thread_seeds() {
+        assert_eq!(classify_hydration(None, "tid_1"), HydrationAction::Seed);
+    }
+
+    #[test]
+    fn classify_hydration_same_thread_skips() {
+        assert_eq!(
+            classify_hydration(Some("tid_1"), "tid_1"),
+            HydrationAction::Skip
+        );
+    }
+
+    #[test]
+    fn classify_hydration_thread_switch_replaces() {
+        assert_eq!(
+            classify_hydration(Some("tid_1"), "tid_2"),
+            HydrationAction::Replace
+        );
+    }
+
+    // ── effective_thread_id ─────────────────────────────────────────
+    // v1 forgiving no-threadId policy resolver.
+
+    #[test]
+    fn effective_thread_id_prefers_inbound_when_present() {
+        assert_eq!(
+            effective_thread_id(Some("tid_inbound"), Some("tid_hydrated"), "sid_x"),
+            Some("tid_inbound".to_string()),
+            "inbound threadId must win even when a different thread is hydrated"
+        );
+    }
+
+    #[test]
+    fn effective_thread_id_falls_back_to_hydrated_on_missing_inbound() {
+        assert_eq!(
+            effective_thread_id(None, Some("tid_hydrated"), "sid_x"),
+            Some("tid_hydrated".to_string()),
+            "missing inbound threadId must continue the hydrated thread (v1 forgiving policy)"
+        );
+    }
+
+    #[test]
+    fn effective_thread_id_returns_none_when_neither_present() {
+        assert_eq!(
+            effective_thread_id(None, None, "sid_x"),
+            None,
+            "no inbound and no hydrated thread means legacy connection-scoped flow"
+        );
+    }
 
     #[test]
     fn extract_ws_token_from_authorization_header() {
