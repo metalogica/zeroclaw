@@ -109,7 +109,7 @@ gh auth status
 ```
 
 ```bash
-export TAG=0.6.9-alpha-p10.5;
+export TAG=0.6.9-alpha-p10.5b; # needed to break cache
 export GITHUB_TOKEN=$(gh auth token);
 export PRAXIS_VERSION=0.9.0;
 
