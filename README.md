@@ -109,9 +109,9 @@ gh auth status
 ```
 
 ```bash
-export TAG=0.6.9-alpha-p10.5
-export GITHUB_TOKEN=$(gh auth token)
-export PRAXIS_VERSION=0.9.0
+export TAG=0.6.9-alpha-p10.5;
+export GITHUB_TOKEN=$(gh auth token);
+export PRAXIS_VERSION=0.9.0;
 
 # ARM builds for lcoal testing on MAC
 IMAGE=catonmat/zeroclaw && \
