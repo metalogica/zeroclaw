@@ -1257,13 +1257,29 @@ impl Agent {
                     let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
                 }
 
-                // If we didn't stream, send the full response as a single chunk
-                if !got_stream && !final_text.is_empty() {
-                    let _ = event_tx
-                        .send(TurnEvent::Chunk {
-                            delta: final_text.clone(),
-                        })
-                        .await;
+                // If we didn't stream, send the full response as a single chunk.
+                // Mirror the streamed path's reasoning emit (see line ~1158): when the
+                // non-stream response carries reasoning_content (e.g. OpenRouter thinking
+                // models routed through chat() because no stream impl exists),
+                // surface it as a TurnEvent::Thinking before the text chunk so WS clients
+                // can render it as inner-thought content.
+                if !got_stream {
+                    if let Some(reasoning) = response.reasoning_content.as_deref() {
+                        if !reasoning.is_empty() {
+                            let _ = event_tx
+                                .send(TurnEvent::Thinking {
+                                    delta: reasoning.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                    if !final_text.is_empty() {
+                        let _ = event_tx
+                            .send(TurnEvent::Chunk {
+                                delta: final_text.clone(),
+                            })
+                            .await;
+                    }
                 }
 
                 self.history
@@ -2130,6 +2146,92 @@ mod tests {
         assert!(
             has_tool_result,
             "Should have emitted a ToolResult event for 'echo'"
+        );
+    }
+
+    /// Mock provider that returns an empty stream (forcing the agent to use
+    /// the non-streaming fallback) and a `chat` response carrying both text
+    /// and `reasoning_content`. Used to verify that the fallback path emits
+    /// `TurnEvent::Thinking` for the reasoning before the text chunk.
+    struct NonStreamReasoningProvider;
+
+    #[async_trait]
+    impl Provider for NonStreamReasoningProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            Ok("answer".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<crate::providers::ChatResponse> {
+            Ok(crate::providers::ChatResponse {
+                text: Some("answer".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: Some("inner thought".into()),
+            })
+        }
+
+        // Default stream_chat returns an empty stream, which is what we want:
+        // the agent must fall back to chat() and emit Thinking from the
+        // non-stream response's reasoning_content.
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_emits_thinking_from_non_stream_reasoning_content() {
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(Box::new(NonStreamReasoningProvider))
+            .tools(vec![])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let response = agent
+            .turn_streamed("hello", event_tx)
+            .await
+            .expect("turn_streamed should succeed");
+        assert_eq!(response, "answer");
+
+        let mut events = Vec::new();
+        while let Ok(ev) = event_rx.try_recv() {
+            events.push(ev);
+        }
+
+        let thinking_idx = events
+            .iter()
+            .position(|e| matches!(e, TurnEvent::Thinking { delta } if delta == "inner thought"))
+            .expect("Thinking event with reasoning_content should be emitted");
+        let chunk_idx = events
+            .iter()
+            .position(|e| matches!(e, TurnEvent::Chunk { delta } if delta == "answer"))
+            .expect("Chunk event with response text should be emitted");
+
+        assert!(
+            thinking_idx < chunk_idx,
+            "Thinking must precede Chunk in the event stream (got thinking_idx={thinking_idx}, chunk_idx={chunk_idx})"
         );
     }
 
