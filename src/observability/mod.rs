@@ -1,3 +1,4 @@
+pub mod active;
 pub mod dora;
 pub mod log;
 pub mod multi;
@@ -19,6 +20,7 @@ pub use noop::NoopObserver;
 pub use otel::OtelObserver;
 #[cfg(feature = "observability-prometheus")]
 pub use prometheus::PrometheusObserver;
+pub use active::{current_span, scope_span};
 pub use traits::{AttrValue, NoopSpan, Observer, ObserverEvent, Span, Trigger};
 #[allow(unused_imports)]
 pub use verbose::VerboseObserver;

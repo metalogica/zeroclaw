@@ -115,7 +115,7 @@ use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::traits::{ObserverEvent, ObserverMetric};
-use crate::observability::{self, Observer, runtime_trace};
+use crate::observability::{self, AttrValue, Observer, Span, Trigger, runtime_trace, scope_span};
 use crate::providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
@@ -2993,6 +2993,19 @@ async fn process_channel_message(
     tracing::info!(elapsed_before_llm_ms, "⏱ Starting LLM call");
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
+            // One trace per activation. Mint from the base observer (the notify
+            // decorator inherits the no-op span); children parent via `scope_span`.
+            let activation_span: Arc<dyn Span> = ctx
+                .observer
+                .start_activation(
+                    Trigger::Channel,
+                    msg.thread_ts.as_deref().or(Some(msg.id.as_str())),
+                )
+                .into();
+            activation_span.set_attr("channel", AttrValue::Str(msg.channel.clone()));
+            activation_span.set_attr("provider", AttrValue::Str(route.provider.clone()));
+            activation_span.set_attr("model", AttrValue::Str(route.model.clone()));
+
             let loop_result = tokio::select! {
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
                 result = tokio::time::timeout(
@@ -3003,7 +3016,7 @@ async fn process_channel_message(
                             .or_else(|| Some(msg.id.clone())),
                         crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
-                        run_tool_call_loop(
+                        scope_span(activation_span.clone(), run_tool_call_loop(
                         active_provider.as_ref(),
                         &mut history,
                         ctx.tools_registry.as_ref(),
@@ -3034,7 +3047,7 @@ async fn process_channel_message(
                         ctx.max_tool_result_chars,
                         ctx.context_token_budget,
                         None, // shared_budget
-                    ),
+                    )),
                     ),
                     ),
                 ) => LlmExecutionResult::Completed(result),

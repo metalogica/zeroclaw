@@ -4,7 +4,10 @@ use crate::cost::types::BudgetCheck;
 use crate::i18n::ToolDescriptions;
 use crate::memory::{self, Memory, MemoryCategory, decay};
 use crate::multimodal;
-use crate::observability::{self, Observer, ObserverEvent, runtime_trace};
+use crate::observability::{
+    self, AttrValue, Observer, ObserverEvent, Span, Trigger, current_span, runtime_trace,
+    scope_span,
+};
 use crate::providers::traits::StreamEvent;
 use crate::providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
@@ -2538,6 +2541,20 @@ pub(crate) async fn run_tool_call_loop(
         );
         let mut streamed_live_deltas = false;
 
+        // Open an `llm.call` span under the ambient activation span (if any). It
+        // ends when `llm_span` is dropped, just after the provider responds.
+        let llm_span = current_span().map(|s| s.child("llm.call"));
+        if let Some(sp) = &llm_span {
+            sp.set_attr(
+                "gen_ai.system",
+                AttrValue::Str(active_provider_name.to_string()),
+            );
+            sp.set_attr(
+                "gen_ai.request.model",
+                AttrValue::Str(active_model.to_string()),
+            );
+        }
+
         let chat_result = if should_consume_provider_stream {
             match consume_provider_streaming_response(
                 active_provider,
@@ -2650,6 +2667,11 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
         };
+
+        if let Some(sp) = &llm_span {
+            sp.set_status(chat_result.is_ok());
+        }
+        drop(llm_span);
 
         let (
             response_text,
@@ -3660,6 +3682,12 @@ pub async fn run(
         model: model_name.to_string(),
     });
 
+    // One trace per activation: mint the root span and make it the ambient parent for the
+    // tool loop(s) below (each `run_tool_call_loop` call is wrapped in `scope_span`).
+    let activation_span: Arc<dyn Span> = observer.start_activation(Trigger::Cli, None).into();
+    activation_span.set_attr("provider", AttrValue::Str(provider_name.to_string()));
+    activation_span.set_attr("model", AttrValue::Str(model_name.to_string()));
+
     // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
     let hardware_rag: Option<crate::rag::HardwareRag> = config
         .peripherals
@@ -3965,31 +3993,34 @@ pub async fn run(
             match TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(
                     cost_tracking_context.clone(),
-                    run_tool_call_loop(
-                        provider.as_ref(),
-                        &mut history,
-                        &tools_registry,
-                        observer.as_ref(),
-                        &provider_name,
-                        &model_name,
-                        effective_temperature,
-                        false,
-                        approval_manager.as_ref(),
-                        channel_name,
-                        None,
-                        &config.multimodal,
-                        config.agent.max_tool_iterations,
-                        None,
-                        None,
-                        None,
-                        &excluded_tools,
-                        &config.agent.tool_call_dedup_exempt,
-                        activated_handle.as_ref(),
-                        Some(model_switch_callback.clone()),
-                        &config.pacing,
-                        config.agent.max_tool_result_chars,
-                        config.agent.max_context_tokens,
-                        None, // shared_budget
+                    scope_span(
+                        activation_span.clone(),
+                        run_tool_call_loop(
+                            provider.as_ref(),
+                            &mut history,
+                            &tools_registry,
+                            observer.as_ref(),
+                            &provider_name,
+                            &model_name,
+                            effective_temperature,
+                            false,
+                            approval_manager.as_ref(),
+                            channel_name,
+                            None,
+                            &config.multimodal,
+                            config.agent.max_tool_iterations,
+                            None,
+                            None,
+                            None,
+                            &excluded_tools,
+                            &config.agent.tool_call_dedup_exempt,
+                            activated_handle.as_ref(),
+                            Some(model_switch_callback.clone()),
+                            &config.pacing,
+                            config.agent.max_tool_result_chars,
+                            config.agent.max_context_tokens,
+                            None, // shared_budget
+                        ),
                     ),
                 )
                 .await
@@ -4275,31 +4306,34 @@ pub async fn run(
                 match TOOL_LOOP_COST_TRACKING_CONTEXT
                     .scope(
                         cost_tracking_context.clone(),
-                        run_tool_call_loop(
-                            provider.as_ref(),
-                            &mut history,
-                            &tools_registry,
-                            observer.as_ref(),
-                            &provider_name,
-                            &model_name,
-                            turn_temperature,
-                            true,
-                            approval_manager.as_ref(),
-                            channel_name,
-                            None,
-                            &config.multimodal,
-                            config.agent.max_tool_iterations,
-                            Some(cancel_token.clone()),
-                            Some(delta_tx.clone()),
-                            None,
-                            &excluded_tools,
-                            &config.agent.tool_call_dedup_exempt,
-                            activated_handle.as_ref(),
-                            Some(model_switch_callback.clone()),
-                            &config.pacing,
-                            config.agent.max_tool_result_chars,
-                            config.agent.max_context_tokens,
-                            None, // shared_budget
+                        scope_span(
+                            activation_span.clone(),
+                            run_tool_call_loop(
+                                provider.as_ref(),
+                                &mut history,
+                                &tools_registry,
+                                observer.as_ref(),
+                                &provider_name,
+                                &model_name,
+                                turn_temperature,
+                                true,
+                                approval_manager.as_ref(),
+                                channel_name,
+                                None,
+                                &config.multimodal,
+                                config.agent.max_tool_iterations,
+                                Some(cancel_token.clone()),
+                                Some(delta_tx.clone()),
+                                None,
+                                &excluded_tools,
+                                &config.agent.tool_call_dedup_exempt,
+                                activated_handle.as_ref(),
+                                Some(model_switch_callback.clone()),
+                                &config.pacing,
+                                config.agent.max_tool_result_chars,
+                                config.agent.max_context_tokens,
+                                None, // shared_budget
+                            ),
                         ),
                     )
                     .await
@@ -4787,24 +4821,32 @@ pub async fn process_message(
         excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
     }
 
-    agent_turn(
-        provider.as_ref(),
-        &mut history,
-        &tools_registry,
-        observer.as_ref(),
-        provider_name,
-        &model_name,
-        effective_temperature,
-        true,
-        "daemon",
-        None,
-        &config.multimodal,
-        config.agent.max_tool_iterations,
-        Some(&approval_manager),
-        &excluded_tools,
-        &config.agent.tool_call_dedup_exempt,
-        activated_handle_pm.as_ref(),
-        None,
+    let activation_span: Arc<dyn Span> =
+        observer.start_activation(Trigger::Channel, session_id).into();
+    activation_span.set_attr("provider", AttrValue::Str(provider_name.to_string()));
+    activation_span.set_attr("model", AttrValue::Str(model_name.to_string()));
+
+    scope_span(
+        activation_span.clone(),
+        agent_turn(
+            provider.as_ref(),
+            &mut history,
+            &tools_registry,
+            observer.as_ref(),
+            provider_name,
+            &model_name,
+            effective_temperature,
+            true,
+            "daemon",
+            None,
+            &config.multimodal,
+            config.agent.max_tool_iterations,
+            Some(&approval_manager),
+            &excluded_tools,
+            &config.agent.tool_call_dedup_exempt,
+            activated_handle_pm.as_ref(),
+            None,
+        ),
     )
     .await
 }

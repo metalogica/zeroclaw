@@ -8,8 +8,10 @@ use anyhow::Result;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+use std::sync::Arc;
+
 use crate::approval::ApprovalManager;
-use crate::observability::{Observer, ObserverEvent};
+use crate::observability::{AttrValue, Observer, ObserverEvent, Span, current_span, scope_span};
 use crate::tools::Tool;
 use crate::util::truncate_with_ellipsis;
 
@@ -71,19 +73,39 @@ pub(crate) async fn execute_one_tool(
         });
     };
 
+    // Open a `tool.call` span and make it the ambient parent while the tool runs, so any
+    // nested agent work (e.g. the delegate tool's sub-loop) parents beneath it.
+    let tool_span: Option<Arc<dyn Span>> = current_span().map(|s| Arc::from(s.child("tool.call")));
+    if let Some(ts) = &tool_span {
+        ts.set_attr("tool.name", AttrValue::Str(call_name.to_string()));
+    }
+
     let tool_future = tool.execute(call_arguments);
-    let tool_result = if let Some(token) = cancellation_token {
-        tokio::select! {
-            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-            result = tool_future => result,
+    let exec = async move {
+        if let Some(token) = cancellation_token {
+            tokio::select! {
+                () = token.cancelled() => None,
+                result = tool_future => Some(result),
+            }
+        } else {
+            Some(tool_future.await)
         }
-    } else {
-        tool_future.await
+    };
+    let tool_result = match &tool_span {
+        Some(ts) => scope_span(ts.clone(), exec).await,
+        None => exec.await,
+    };
+    let tool_result = match tool_result {
+        Some(r) => r,
+        None => return Err(ToolLoopCancelled.into()),
     };
 
     match tool_result {
         Ok(r) => {
             let duration = start.elapsed();
+            if let Some(ts) = &tool_span {
+                ts.set_status(r.success);
+            }
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 duration,
@@ -108,6 +130,9 @@ pub(crate) async fn execute_one_tool(
         }
         Err(e) => {
             let duration = start.elapsed();
+            if let Some(ts) = &tool_span {
+                ts.set_status(false);
+            }
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 duration,
