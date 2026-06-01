@@ -144,6 +144,84 @@ pub enum ObserverMetric {
     RecoveryTime(Duration),
 }
 
+/// What triggered an agent activation.
+///
+/// Recorded as the root span's `trigger` attribute. Kept coarse on purpose — the
+/// concrete channel name (e.g. `"telegram"`, `"discord"`) is carried separately as a
+/// `channel` attribute rather than expanding this enum per channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// Web chat over the WebSocket gateway (`/ws/chat`).
+    WebChat,
+    /// Inbound webhook (`/webhook`).
+    Webhook,
+    /// A native channel listener (Telegram / SMS / Discord / …). See the `channel` attr.
+    Channel,
+    /// Autonomous self-scheduled (cron) activation.
+    SelfSchedule,
+    /// Local CLI invocation.
+    Cli,
+}
+
+impl Trigger {
+    /// Stable lowercase string used as the span `trigger` attribute value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Trigger::WebChat => "web_chat",
+            Trigger::Webhook => "webhook",
+            Trigger::Channel => "channel",
+            Trigger::SelfSchedule => "self_schedule",
+            Trigger::Cli => "cli",
+        }
+    }
+}
+
+/// A span attribute value. Non-generic on purpose so [`Span`] stays object-safe.
+#[derive(Debug, Clone)]
+pub enum AttrValue {
+    Str(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+/// A span in the activation trace tree.
+///
+/// The **root** span (returned by [`Observer::start_activation`]) owns the trace; every
+/// LLM / tool / hand span for the activation is opened — directly or transitively — as a
+/// descendant via [`child`](Span::child). A span opens when created and ends when the
+/// handle is dropped, giving true start→end timing.
+///
+/// The trait is **recursive**: any span can open children, so a nested sub-agent's spans
+/// parent beneath the parent's `delegate` span to arbitrary depth.
+///
+/// Implementations must be `Send + Sync` so a `&dyn Span` can be threaded across `.await`
+/// points and shared between concurrently-executing tool calls.
+pub trait Span: Send + Sync {
+    /// Open a child span beneath this one. The child ends when its handle is dropped.
+    fn child(&self, name: &str) -> Box<dyn Span>;
+
+    /// Set (or overwrite) an attribute on this span.
+    fn set_attr(&self, key: &str, value: AttrValue);
+
+    /// Mark the span's terminal status (`true` = ok, `false` = error).
+    fn set_status(&self, ok: bool);
+}
+
+/// A [`Span`] that records nothing.
+///
+/// Returned by the default [`Observer::start_activation`], so observers that do not
+/// implement tracing (log, prometheus, noop, …) stay zero-behavior with no code change.
+pub struct NoopSpan;
+
+impl Span for NoopSpan {
+    fn child(&self, _name: &str) -> Box<dyn Span> {
+        Box::new(NoopSpan)
+    }
+    fn set_attr(&self, _key: &str, _value: AttrValue) {}
+    fn set_status(&self, _ok: bool) {}
+}
+
 /// Core observability trait for recording agent runtime telemetry.
 ///
 /// Implement this trait to integrate with any monitoring backend (structured
@@ -185,6 +263,22 @@ pub trait Observer: Send + Sync + 'static {
     /// Enables callers to access concrete observer types when needed
     /// (e.g., retrieving a Prometheus registry handle for custom metrics).
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Begin a new agent activation and return its **root span**.
+    ///
+    /// One activation = one trace. The returned span owns the trace; all LLM / tool / hand
+    /// spans for the activation are opened as its descendants. The span ends when the
+    /// returned handle is dropped — which the runtime arranges to coincide with
+    /// terminal-reply dispatch, **not** inbound ACK.
+    ///
+    /// `thread_id` groups activations into a conversation; it is never the trace identity.
+    /// Autonomous ([`Trigger::SelfSchedule`]) activations pass a synthetic group key.
+    ///
+    /// The default returns a [`NoopSpan`], so non-tracing observers are unaffected; only
+    /// backends that emit traces (OpenTelemetry) override this.
+    fn start_activation(&self, _trigger: Trigger, _thread_id: Option<&str>) -> Box<dyn Span> {
+        Box::new(NoopSpan)
+    }
 }
 
 #[cfg(test)]

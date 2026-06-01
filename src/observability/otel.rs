@@ -1,12 +1,13 @@
-use super::traits::{Observer, ObserverEvent, ObserverMetric};
+use super::traits::{
+    AttrValue, Observer, ObserverEvent, ObserverMetric, Span as TraceSpan, Trigger,
+};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
-use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
-use opentelemetry::{KeyValue, global};
+use opentelemetry::trace::{Status, TraceContextExt, Tracer};
+use opentelemetry::{Context, KeyValue, Value, global};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::any::Any;
-use std::time::SystemTime;
 
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
 pub struct OtelObserver {
@@ -196,8 +197,8 @@ impl OtelObserver {
 
 impl Observer for OtelObserver {
     fn record_event(&self, event: &ObserverEvent) {
-        let tracer = global::tracer("zeroclaw");
-
+        // Spans are built by `OtelSpan` (see `start_activation`); `record_event`
+        // is metrics-only so events and the connected trace stay decoupled.
         match event {
             ObserverEvent::AgentStart { provider, model } => {
                 self.agent_starts.add(
@@ -230,62 +231,16 @@ impl Observer for OtelObserver {
                 ];
                 self.llm_calls.add(1, &attrs);
                 self.llm_duration.record(secs, &attrs);
-
-                // Create a completed span for visibility in trace backends.
-                let start_time = SystemTime::now()
-                    .checked_sub(*duration)
-                    .unwrap_or(SystemTime::now());
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("llm.call")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("provider", provider.clone()),
-                            KeyValue::new("model", model.clone()),
-                            KeyValue::new("success", *success),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
-                if *success {
-                    span.set_status(Status::Ok);
-                } else {
-                    span.set_status(Status::error(""));
-                }
-                span.end();
             }
             ObserverEvent::AgentEnd {
                 provider,
                 model,
                 duration,
-                tokens_used,
-                cost_usd,
+                tokens_used: _,
+                cost_usd: _,
             } => {
-                let secs = duration.as_secs_f64();
-                let start_time = SystemTime::now()
-                    .checked_sub(*duration)
-                    .unwrap_or(SystemTime::now());
-
-                // Create a completed span with correct timing
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("agent.invocation")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("provider", provider.clone()),
-                            KeyValue::new("model", model.clone()),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
-                if let Some(t) = tokens_used {
-                    span.set_attribute(KeyValue::new("tokens_used", *t as i64));
-                }
-                if let Some(c) = cost_usd {
-                    span.set_attribute(KeyValue::new("cost_usd", *c));
-                }
-                span.end();
-
                 self.agent_duration.record(
-                    secs,
+                    duration.as_secs_f64(),
                     &[
                         KeyValue::new("provider", provider.clone()),
                         KeyValue::new("model", model.clone()),
@@ -299,37 +254,13 @@ impl Observer for OtelObserver {
                 duration,
                 success,
             } => {
-                let secs = duration.as_secs_f64();
-                let start_time = SystemTime::now()
-                    .checked_sub(*duration)
-                    .unwrap_or(SystemTime::now());
-
-                let status = if *success {
-                    Status::Ok
-                } else {
-                    Status::error("")
-                };
-
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("tool.call")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("tool.name", tool.clone()),
-                            KeyValue::new("tool.success", *success),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
-                span.set_status(status);
-                span.end();
-
                 let attrs = [
                     KeyValue::new("tool", tool.clone()),
                     KeyValue::new("success", success.to_string()),
                 ];
                 self.tool_calls.add(1, &attrs);
                 self.tool_duration
-                    .record(secs, &[KeyValue::new("tool", tool.clone())]);
+                    .record(duration.as_secs_f64(), &[KeyValue::new("tool", tool.clone())]);
             }
             ObserverEvent::ChannelMessage { channel, direction } => {
                 self.channel_messages.add(
@@ -343,19 +274,10 @@ impl Observer for OtelObserver {
             ObserverEvent::HeartbeatTick => {
                 self.heartbeat_ticks.add(1, &[]);
             }
-            ObserverEvent::Error { component, message } => {
-                // Create an error span for visibility in trace backends
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("error")
-                        .with_kind(SpanKind::Internal)
-                        .with_attributes(vec![
-                            KeyValue::new("component", component.clone()),
-                            KeyValue::new("error.message", message.clone()),
-                        ]),
-                );
-                span.set_status(Status::error(message.clone()));
-                span.end();
-
+            ObserverEvent::Error {
+                component,
+                message: _,
+            } => {
                 self.errors
                     .add(1, &[KeyValue::new("component", component.clone())]);
             }
@@ -366,25 +288,6 @@ impl Observer for OtelObserver {
                 findings_count,
             } => {
                 let secs = *duration_ms as f64 / 1000.0;
-                let duration = std::time::Duration::from_millis(*duration_ms);
-                let start_time = SystemTime::now()
-                    .checked_sub(duration)
-                    .unwrap_or(SystemTime::now());
-
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("hand.run")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("hand.name", hand_name.clone()),
-                            KeyValue::new("hand.success", true),
-                            KeyValue::new("hand.findings", *findings_count as i64),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
-                span.set_status(Status::Ok);
-                span.end();
-
                 let attrs = [
                     KeyValue::new("hand", hand_name.clone()),
                     KeyValue::new("success", "true"),
@@ -399,29 +302,10 @@ impl Observer for OtelObserver {
             }
             ObserverEvent::HandFailed {
                 hand_name,
-                error,
+                error: _,
                 duration_ms,
             } => {
                 let secs = *duration_ms as f64 / 1000.0;
-                let duration = std::time::Duration::from_millis(*duration_ms);
-                let start_time = SystemTime::now()
-                    .checked_sub(duration)
-                    .unwrap_or(SystemTime::now());
-
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("hand.run")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("hand.name", hand_name.clone()),
-                            KeyValue::new("hand.success", false),
-                            KeyValue::new("error.message", error.clone()),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
-                span.set_status(Status::error(error.clone()));
-                span.end();
-
                 let attrs = [
                     KeyValue::new("hand", hand_name.clone()),
                     KeyValue::new("success", "false"),
@@ -497,6 +381,82 @@ impl Observer for OtelObserver {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn start_activation(&self, trigger: Trigger, thread_id: Option<&str>) -> Box<dyn TraceSpan> {
+        Box::new(OtelSpan::root(trigger, thread_id))
+    }
+}
+
+/// Convert a backend-neutral [`AttrValue`] into an OTel attribute value.
+fn attr_to_value(v: AttrValue) -> Value {
+    match v {
+        AttrValue::Str(s) => Value::String(s.into()),
+        AttrValue::Int(i) => Value::I64(i),
+        AttrValue::Float(f) => Value::F64(f),
+        AttrValue::Bool(b) => Value::Bool(b),
+    }
+}
+
+/// An OTel-backed [`Span`](TraceSpan) node in the activation trace.
+///
+/// Holds an OTel [`Context`] with this node's span active. The root is created with an
+/// empty parent context (a fresh `trace_id`); children are created with the parent's
+/// context so they inherit its `trace_id` and link as descendants. The span opens on
+/// construction and ends on `Drop`, giving true start→end timing.
+pub struct OtelSpan {
+    cx: Context,
+}
+
+impl OtelSpan {
+    /// Open the root activation span (`agent.activation`) on a fresh trace.
+    fn root(trigger: Trigger, thread_id: Option<&str>) -> Self {
+        let tracer = global::tracer("zeroclaw");
+        // Empty parent context ⇒ a brand-new trace_id (one trace per activation).
+        let span = tracer.start_with_context("agent.activation", &Context::new());
+        let this = Self {
+            cx: Context::new().with_span(span),
+        };
+        this.set_attr("trigger", AttrValue::Str(trigger.as_str().to_string()));
+        if let Some(tid) = thread_id {
+            this.set_attr("thread_id", AttrValue::Str(tid.to_string()));
+        }
+        this
+    }
+
+    /// Concrete child constructor (used by [`TraceSpan::child`] and by tests).
+    fn child_span(&self, name: &str) -> Self {
+        let tracer = global::tracer("zeroclaw");
+        let span = tracer.start_with_context(name.to_string(), &self.cx);
+        Self {
+            cx: self.cx.with_span(span),
+        }
+    }
+}
+
+impl TraceSpan for OtelSpan {
+    fn child(&self, name: &str) -> Box<dyn TraceSpan> {
+        Box::new(self.child_span(name))
+    }
+
+    fn set_attr(&self, key: &str, value: AttrValue) {
+        self.cx
+            .span()
+            .set_attribute(KeyValue::new(key.to_string(), attr_to_value(value)));
+    }
+
+    fn set_status(&self, ok: bool) {
+        self.cx.span().set_status(if ok {
+            Status::Ok
+        } else {
+            Status::error("")
+        });
+    }
+}
+
+impl Drop for OtelSpan {
+    fn drop(&mut self) {
+        self.cx.span().end();
     }
 }
 
@@ -689,5 +649,63 @@ mod tests {
             result.is_ok(),
             "observer creation must succeed even with unreachable endpoint"
         );
+    }
+
+    // ── Connected-trace invariants (the point of this feature) ────────
+
+    #[test]
+    fn activation_children_share_trace_id() {
+        // Constructing the observer sets the global tracer provider.
+        let _obs = test_observer();
+        let root = OtelSpan::root(Trigger::Cli, Some("thread-1"));
+        let child = root.child_span("llm.call");
+        let grandchild = child.child_span("tool.call");
+
+        let root_tid = root.cx.span().span_context().trace_id();
+        // Every descendant shares the activation's trace_id.
+        assert_eq!(root_tid, child.cx.span().span_context().trace_id());
+        assert_eq!(root_tid, grandchild.cx.span().span_context().trace_id());
+
+        // …but each is a distinct span (real parent→child links).
+        assert_ne!(
+            root.cx.span().span_context().span_id(),
+            child.cx.span().span_context().span_id()
+        );
+        assert_ne!(
+            child.cx.span().span_context().span_id(),
+            grandchild.cx.span().span_context().span_id()
+        );
+    }
+
+    #[test]
+    fn separate_activations_get_separate_traces() {
+        let _obs = test_observer();
+        let a = OtelSpan::root(Trigger::WebChat, Some("thread-1"));
+        let b = OtelSpan::root(Trigger::WebChat, Some("thread-1"));
+        // Same thread_id, but two activations ⇒ two distinct traces (never merged).
+        assert_ne!(
+            a.cx.span().span_context().trace_id(),
+            b.cx.span().span_context().trace_id()
+        );
+    }
+
+    #[test]
+    fn start_activation_through_trait_records_without_panic() {
+        let obs = test_observer();
+        let root = obs.start_activation(Trigger::Webhook, None);
+        let child = root.child("llm.call");
+        child.set_attr("gen_ai.system", AttrValue::Str("openrouter".into()));
+        child.set_status(true);
+        root.set_status(true);
+        // Drop ends spans even with an unreachable exporter endpoint.
+    }
+
+    #[test]
+    fn default_noop_span_is_inert() {
+        // The default Observer::start_activation returns a NoopSpan that does nothing.
+        let span = super::super::traits::NoopSpan;
+        let child = TraceSpan::child(&span, "llm.call");
+        child.set_attr("k", AttrValue::Int(1));
+        child.set_status(false);
     }
 }
