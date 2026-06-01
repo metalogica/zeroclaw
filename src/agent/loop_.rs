@@ -2670,6 +2670,24 @@ pub(crate) async fn run_tool_call_loop(
 
         if let Some(sp) = &llm_span {
             sp.set_status(chat_result.is_ok());
+            if let Ok(resp) = &chat_result {
+                // Capture OpenRouter inner thoughts (truncated; large-payload
+                // by-reference store is deferred per spec §6).
+                if let Some(reasoning) = resp.reasoning_content.as_deref() {
+                    sp.set_attr(
+                        "gen_ai.reasoning",
+                        AttrValue::Str(truncate_with_ellipsis(reasoning, 16_000)),
+                    );
+                }
+                if let Some(usage) = resp.usage.as_ref() {
+                    if let Some(it) = usage.input_tokens {
+                        sp.set_attr("gen_ai.usage.input_tokens", AttrValue::Int(it as i64));
+                    }
+                    if let Some(ot) = usage.output_tokens {
+                        sp.set_attr("gen_ai.usage.output_tokens", AttrValue::Int(ot as i64));
+                    }
+                }
+            }
         }
         drop(llm_span);
 

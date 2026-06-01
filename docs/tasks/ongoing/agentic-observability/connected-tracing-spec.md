@@ -290,10 +290,25 @@ through `run_tool_call_loop`. Both engines are now instrumented:
 lib suite green (6151 passed; the only intermittent failures are a pre-existing parallel
 `setup_workspace` collision in `agent::personality::tests`, unrelated — passes single-threaded).
 
-**Remaining (Phase 3 / polish):** enrichment (OpenRouter reasoning, Composio `log_…` id +
-toolkit), large-payload by-reference store, and manual Laminar end-to-end verification.
-Trigger fidelity note: `run()` tags `Trigger::Cli` even when invoked by cron (`run_agent_job`
-→ `agent::run`); refine to `SelfSchedule` + synthetic key if cron traces need distinguishing.
+**Enrichment — done & committed (completes SPEC 1's content acceptance criteria, §1/§7).**
+- `llm.call` now carries **OpenRouter reasoning** (`gen_ai.reasoning`, truncated to 16k chars)
+  + token usage, in both engines.
+- `tool.call` carries Composio **action** + **toolkit** (`composio.action`, `composio.toolkit`)
+  parsed from the call args, in both engines.
+
+**Documented gaps (not silently dropped):**
+- **Composio `log_…` id** — *unavailable*: the v3 execute API (`composio.rs`) does not return
+  an execution/log id and none is captured. Would require Composio-side plumbing or an audit
+  API call; deliberately not faked.
+- **praxis spans** — N/A (praxis not in the codebase).
+- **Large-payload by-reference store** (§6) — reasoning is truncated at 16k chars as an interim
+  bound; the by-reference store remains deferred.
+- **Trigger fidelity** — `run()` tags `Trigger::Cli` even when cron invokes it via `agent::run`;
+  refine to `SelfSchedule` + synthetic key if cron traces need distinguishing.
+
+**SPEC 1 status: code-complete.** Structure (Phases 1–2) + content enrichment all landed; full
+lib suite green (6151 passed). The one remaining gate — **manual end-to-end verification in a
+live Laminar** — depends on SPEC 2 (self-hosted Laminar) and is the SPEC 1↔SPEC 2 handoff.
 
 ## Open Questions
 

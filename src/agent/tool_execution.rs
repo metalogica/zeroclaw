@@ -78,6 +78,16 @@ pub(crate) async fn execute_one_tool(
     let tool_span: Option<Arc<dyn Span>> = current_span().map(|s| Arc::from(s.child("tool.call")));
     if let Some(ts) = &tool_span {
         ts.set_attr("tool.name", AttrValue::Str(call_name.to_string()));
+        // Composio is a single tool; differentiate by toolkit/action from the args.
+        // (The Composio `log_…` id is not returned by the v3 execute API — unavailable.)
+        if call_name == "composio" {
+            if let Some(action) = call_arguments.get("action_name").and_then(|v| v.as_str()) {
+                ts.set_attr("composio.action", AttrValue::Str(action.to_string()));
+            }
+            if let Some(app) = call_arguments.get("app").and_then(|v| v.as_str()) {
+                ts.set_attr("composio.toolkit", AttrValue::Str(app.to_string()));
+            }
+        }
     }
 
     let tool_future = tool.execute(call_arguments);
