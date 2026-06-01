@@ -275,18 +275,25 @@ Owners wired & connecting: `run()` (CLI + cron), `process_message()` (channel we
 `process_channel_message()` (native channels). `llm.call` opens around the provider call in
 `run_tool_call_loop`; `tool.call` scoped around `tool.execute`. Full lib suite green.
 
-**Two-engine finding (affects remaining owners).** `Agent::turn` / `Agent::turn_streamed`
-(`agent.rs:853, 1033`) are a **separate execution engine** that calls `provider.chat()`
-directly (`:952, :1222`) and does **not** route through `run_tool_call_loop`. The **WS**
-path (`ws.rs` → `process_chat_message` → `turn_streamed`) and the shallow **`/webhook`**
-(`run_gateway_chat_simple` → `chat_with_history`) therefore are **not** covered by the
-`run_tool_call_loop` instrumentation. Completing them is a distinct sub-task:
-- mint + `scope_span` at `process_chat_message` (per-message) and `handle_webhook`;
-- add `llm.call` (and tool spans) around the `provider.chat()` calls in `Agent::turn*`.
+**Two-engine finding (resolved).** `Agent::turn` / `Agent::turn_streamed` (`agent.rs`) are a
+**separate execution engine** that calls `provider.chat()` directly and does **not** route
+through `run_tool_call_loop`. Both engines are now instrumented:
+- `run_tool_call_loop` engine: `llm.call` around the provider call; `tool.call` scoped in
+  `execute_one_tool`.
+- `Agent::turn*` engine: `llm.call` around `provider.chat()` in `turn` and `turn_streamed`;
+  `tool.call` scoped in `execute_tool_call` (single chokepoint for both). Delegate nesting is
+  automatic via the scoped `tool.call` in both engines.
 
-**Remaining Phase 2 work:** instrument the `Agent::turn*` engine; wire WS (per-message) +
-`/webhook` owners; final import cleanup (drop any unused `Span` imports — trait-object
-method calls don't need the trait in scope).
+**Phase 2 — complete & committed.** All **5 owners** wired and minting:
+`run()` (CLI + cron), `process_message()` (channel webhooks), `process_channel_message()`
+(native channels), `handle_socket` (WS, **per message**), `handle_webhook` (`/webhook`). Full
+lib suite green (6151 passed; the only intermittent failures are a pre-existing parallel
+`setup_workspace` collision in `agent::personality::tests`, unrelated — passes single-threaded).
+
+**Remaining (Phase 3 / polish):** enrichment (OpenRouter reasoning, Composio `log_…` id +
+toolkit), large-payload by-reference store, and manual Laminar end-to-end verification.
+Trigger fidelity note: `run()` tags `Trigger::Cli` even when invoked by cron (`run_agent_job`
+→ `agent::run`); refine to `SelfSchedule` + synthetic key if cron traces need distinguishing.
 
 ## Open Questions
 

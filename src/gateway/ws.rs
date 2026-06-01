@@ -18,6 +18,8 @@
 //! - `token` — bearer auth token (alternative to Authorization header)
 
 use super::AppState;
+use crate::observability::{Span, Trigger, scope_span};
+use std::sync::Arc;
 use axum::{
     extract::{
         Query, State, WebSocketUpgrade,
@@ -678,13 +680,21 @@ async fn handle_socket(
                     let _ = backend.append(&turn_key, &user_msg);
                 }
 
-                process_chat_message(
-                    &state,
-                    &mut agent,
-                    &mut sender,
-                    &content,
-                    &session_key,
-                    effective.as_deref(),
+                // One trace per WS message (the user message is the primitive).
+                let activation_span: Arc<dyn Span> = state
+                    .observer
+                    .start_activation(Trigger::WebChat, effective.as_deref())
+                    .into();
+                scope_span(
+                    activation_span,
+                    process_chat_message(
+                        &state,
+                        &mut agent,
+                        &mut sender,
+                        &content,
+                        &session_key,
+                        effective.as_deref(),
+                    ),
                 )
                 .await;
             }

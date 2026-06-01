@@ -6,7 +6,7 @@ use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
 use crate::i18n::ToolDescriptions;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::observability::{self, Observer, ObserverEvent};
+use crate::observability::{self, AttrValue, Observer, ObserverEvent, Span, current_span, scope_span};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
@@ -713,8 +713,15 @@ impl Agent {
             }
         }
 
+        // Open a tool.call span and make it the ambient parent while the tool runs, so any
+        // nested agent work (e.g. the delegate tool's sub-loop) parents beneath it.
+        let tool_span: Option<Arc<dyn Span>> = current_span().map(|s| Arc::from(s.child("tool.call")));
+        if let Some(ts) = &tool_span {
+            ts.set_attr("tool.name", AttrValue::Str(tool_name.clone()));
+        }
+
         // First try to find tool in static registry, then in activated MCP tools.
-        let (result, success) =
+        let exec = async {
             if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
                 match tool.execute(tool_args.clone()).await {
                     Ok(r) => {
@@ -768,7 +775,15 @@ impl Agent {
                 }
             } else {
                 (format!("Unknown tool: {}", tool_name), false)
-            };
+            }
+        };
+        let (result, success) = match &tool_span {
+            Some(ts) => scope_span(ts.clone(), exec).await,
+            None => exec.await,
+        };
+        if let Some(ts) = &tool_span {
+            ts.set_status(success);
+        }
 
         let duration = start.elapsed();
 
@@ -947,6 +962,13 @@ impl Agent {
                 });
             }
 
+            let llm_span = current_span().map(|s| s.child("llm.call"));
+            if let Some(sp) = &llm_span {
+                sp.set_attr(
+                    "gen_ai.request.model",
+                    AttrValue::Str(effective_model.clone()),
+                );
+            }
             let response = match self
                 .provider
                 .chat(
@@ -964,8 +986,17 @@ impl Agent {
                 .await
             {
                 Ok(resp) => resp,
-                Err(err) => return Err(err),
+                Err(err) => {
+                    if let Some(sp) = &llm_span {
+                        sp.set_status(false);
+                    }
+                    return Err(err);
+                }
             };
+            if let Some(sp) = &llm_span {
+                sp.set_status(true);
+            }
+            drop(llm_span);
 
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
             if calls.is_empty() {
@@ -1127,6 +1158,14 @@ impl Agent {
                 });
             }
 
+            let llm_span = current_span().map(|s| s.child("llm.call"));
+            if let Some(sp) = &llm_span {
+                sp.set_attr(
+                    "gen_ai.request.model",
+                    AttrValue::Str(effective_model.clone()),
+                );
+            }
+
             // ── Streaming LLM call ────────────────────────────────────
             // Try streaming first; if the provider returns content we
             // forward deltas.  Otherwise fall back to non-streaming chat.
@@ -1237,6 +1276,11 @@ impl Agent {
                     Err(err) => return Err(err),
                 }
             };
+
+            if let Some(sp) = &llm_span {
+                sp.set_status(true);
+            }
+            drop(llm_span);
 
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
             if calls.is_empty() {

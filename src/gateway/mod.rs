@@ -1311,10 +1311,21 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
     let prepared =
         crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config).await?;
 
-    state
+    let llm_span = crate::observability::current_span().map(|s| s.child("llm.call"));
+    if let Some(sp) = &llm_span {
+        sp.set_attr(
+            "gen_ai.request.model",
+            crate::observability::AttrValue::Str(state.model.clone()),
+        );
+    }
+    let result = state
         .provider
         .chat_with_history(&prepared.messages, &state.model, state.temperature)
-        .await
+        .await;
+    if let Some(sp) = &llm_span {
+        sp.set_status(result.is_ok());
+    }
+    result
 }
 
 /// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
@@ -1463,7 +1474,13 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_simple(&state, message).await {
+    let activation_span: Arc<dyn crate::observability::Span> = state
+        .observer
+        .start_activation(crate::observability::Trigger::Webhook, None)
+        .into();
+    match crate::observability::scope_span(activation_span, run_gateway_chat_simple(&state, message))
+        .await
+    {
         Ok(response) => {
             let duration = started_at.elapsed();
             state
