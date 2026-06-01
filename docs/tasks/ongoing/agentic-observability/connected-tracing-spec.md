@@ -253,6 +253,41 @@ Production `run_tool_call_loop` call sites that receive `parent: &dyn Span`: `lo
 (`agent_turn`), `:3968` + `:4278` (`run`), `channels/mod.rs:3006`, and `delegate.rs:1156`
 (parent = the `delegate` `tool.call` span — nesting). All `:5825+` sites are `#[cfg(test)]`.
 
+## Implementation status (updated 2026-06-01)
+
+**Phase 1 — done & committed.** Recursive `Span` interface + `OtelSpan`; `record_event`
+reduced to metrics-only. Trace-id invariants tested. Behavior-neutral.
+
+**Phase 2 core — done & committed.** Two revisions emerged during execution and were
+accepted:
+
+- **Q1 revised → ambient task-local.** Threading `&dyn Span` through the 24-param
+  `run_tool_call_loop` meant editing ~27 test call sites. Instead a `tokio::task_local`
+  holds the current `Arc<dyn Span>` (in `observability/active.rs`), mirroring the existing
+  `TOOL_LOOP_COST_TRACKING_CONTEXT`. Owners set it via `scope_span`; deep code reads
+  `current_span()`. Zero signature/test churn; `Send`-safe (not OTel `ContextGuard`).
+- **Delegate nesting is now automatic.** Because `execute_one_tool` scopes the ambient span
+  to the `tool.call` span around `tool.execute`, a delegated sub-agent's `run_tool_call_loop`
+  reads it and nests with **no `Tool`-trait change and no `delegate.rs` change** — the
+  `execute_with_span` mechanism is unnecessary and dropped.
+
+Owners wired & connecting: `run()` (CLI + cron), `process_message()` (channel webhooks),
+`process_channel_message()` (native channels). `llm.call` opens around the provider call in
+`run_tool_call_loop`; `tool.call` scoped around `tool.execute`. Full lib suite green.
+
+**Two-engine finding (affects remaining owners).** `Agent::turn` / `Agent::turn_streamed`
+(`agent.rs:853, 1033`) are a **separate execution engine** that calls `provider.chat()`
+directly (`:952, :1222`) and does **not** route through `run_tool_call_loop`. The **WS**
+path (`ws.rs` → `process_chat_message` → `turn_streamed`) and the shallow **`/webhook`**
+(`run_gateway_chat_simple` → `chat_with_history`) therefore are **not** covered by the
+`run_tool_call_loop` instrumentation. Completing them is a distinct sub-task:
+- mint + `scope_span` at `process_chat_message` (per-message) and `handle_webhook`;
+- add `llm.call` (and tool spans) around the `provider.chat()` calls in `Agent::turn*`.
+
+**Remaining Phase 2 work:** instrument the `Agent::turn*` engine; wire WS (per-message) +
+`/webhook` owners; final import cleanup (drop any unused `Span` imports — trait-object
+method calls don't need the trait in scope).
+
 ## Open Questions
 
 - **OTLP protocol/port for Laminar:** exporter is HTTP/proto on `/v1/traces` (`otel.rs:42`) —
