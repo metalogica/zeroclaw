@@ -1358,6 +1358,21 @@ impl Agent {
             }
 
             // ── Tool calls ─────────────────────────────────────────────
+            // Surface reasoning_content (e.g. OpenRouter thinking models) before
+            // the tool-call events fire, mirroring the no-tool-call branch at
+            // line ~1330. Streamed reasoning was already emitted chunk-by-chunk
+            // earlier (line ~1158); on that path response.reasoning_content is
+            // None (line ~1216 synthesizes it as None), so no double-emit risk.
+            if let Some(reasoning) = response.reasoning_content.as_deref() {
+                if !reasoning.is_empty() {
+                    let _ = event_tx
+                        .send(TurnEvent::Thinking {
+                            delta: reasoning.to_string(),
+                        })
+                        .await;
+                }
+            }
+
             if !text.is_empty() {
                 self.history
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
@@ -2298,6 +2313,114 @@ mod tests {
         assert!(
             thinking_idx < chunk_idx,
             "Thinking must precede Chunk in the event stream (got thinking_idx={thinking_idx}, chunk_idx={chunk_idx})"
+        );
+    }
+
+    /// Mock provider whose first `chat()` returns a reasoning-bearing
+    /// tool-call response, and whose second `chat()` (after the tool result
+    /// is fed back) returns a plain final answer. Drives the tool-call
+    /// branch of `turn_streamed` so we can assert that reasoning_content
+    /// surfaces as a `TurnEvent::Thinking` before the tool call fires.
+    struct ToolCallReasoningProvider {
+        call_count: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl Provider for ToolCallReasoningProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<crate::providers::ChatResponse> {
+            let mut count = self.call_count.lock();
+            *count += 1;
+            if *count == 1 {
+                Ok(crate::providers::ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: vec![crate::providers::ToolCall {
+                        id: "tc_tcr_1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                    }],
+                    usage: None,
+                    reasoning_content: Some("thinking before tool".into()),
+                })
+            } else {
+                Ok(crate::providers::ChatResponse {
+                    text: Some("final answer".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_emits_thinking_from_tool_call_response_reasoning() {
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(Box::new(ToolCallReasoningProvider {
+                call_count: Arc::new(Mutex::new(0)),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let response = agent
+            .turn_streamed("call the echo tool", event_tx)
+            .await
+            .expect("turn_streamed should succeed");
+        assert_eq!(response, "final answer");
+
+        let mut events = Vec::new();
+        while let Ok(ev) = event_rx.try_recv() {
+            events.push(ev);
+        }
+
+        let thinking_idx = events
+            .iter()
+            .position(
+                |e| matches!(e, TurnEvent::Thinking { delta } if delta == "thinking before tool"),
+            )
+            .expect("Thinking event with reasoning_content should be emitted on tool-call path");
+        let tool_call_idx = events
+            .iter()
+            .position(|e| matches!(e, TurnEvent::ToolCall { name, .. } if name == "echo"))
+            .expect("ToolCall event for 'echo' should be emitted");
+
+        assert!(
+            thinking_idx < tool_call_idx,
+            "Thinking must precede ToolCall in the event stream (got thinking_idx={thinking_idx}, tool_call_idx={tool_call_idx})"
         );
     }
 
