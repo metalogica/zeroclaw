@@ -4,10 +4,21 @@ use super::traits::{
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::trace::{Status, TraceContextExt, Tracer};
 use opentelemetry::{Context, KeyValue, Value, global};
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::any::Any;
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+/// Process-wide OTLP providers, built once and shared by every component's
+/// `OtelObserver`. Multiple subsystems (daemon, gateway, channels, scheduler,
+/// heartbeat, …) each construct an observer, but they all run in one process
+/// with one `[observability]` config — so they share a single TracerProvider +
+/// OTLP exporter rather than spinning up N exporters and re-installing the
+/// OpenTelemetry globals N times. First caller wins (installs globals + logs);
+/// components initialize sequentially at startup, so the slot is uncontended.
+static OTEL_PROVIDERS: OnceLock<(SdkTracerProvider, SdkMeterProvider)> = OnceLock::new();
 
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
 pub struct OtelObserver {
@@ -33,56 +44,112 @@ pub struct OtelObserver {
     hand_findings: Counter<u64>,
 }
 
+/// Parse an `OTEL_EXPORTER_OTLP_HEADERS`-style string into a header map.
+///
+/// Format: comma-separated `key=value` pairs (`k1=v1,k2=v2`). Keys and values
+/// are trimmed. Pairs missing a `=` or with an empty key are skipped so a
+/// malformed entry never blocks observer initialization. Header values may
+/// contain `=` (e.g. base64) — only the first `=` is treated as the separator.
+fn parse_otlp_headers(raw: &str) -> HashMap<String, String> {
+    raw.split(',')
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            Some((key.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
 impl OtelObserver {
     /// Create a new OTel observer exporting to the given OTLP endpoint.
     ///
     /// Uses HTTP/protobuf transport (port 4318 by default).
     /// Falls back to `http://localhost:4318` if no endpoint is provided.
-    pub fn new(endpoint: Option<&str>, service_name: Option<&str>) -> Result<Self, String> {
+    ///
+    /// `headers` is the OTel-standard `OTEL_EXPORTER_OTLP_HEADERS` string
+    /// (`key=value,key=value`), applied to both the trace and metric exporters.
+    /// Pass `None` to export without headers. Used for collectors that gate
+    /// ingest on an auth header (e.g. `authorization=Bearer <token>`).
+    pub fn new(
+        endpoint: Option<&str>,
+        service_name: Option<&str>,
+        headers: Option<&str>,
+    ) -> Result<Self, String> {
         let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
         let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
         let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
         let service_name = service_name.unwrap_or("zeroclaw");
+        let header_map = headers.map(parse_otlp_headers).unwrap_or_default();
 
-        // ── Trace exporter ──────────────────────────────────────
-        let span_exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_endpoint(&traces_endpoint)
-            .build()
-            .map_err(|e| format!("Failed to create OTLP span exporter: {e}"))?;
+        // ── Trace + metric providers (built once per process) ───
+        // Reuse the shared providers if another component already initialized
+        // them; otherwise build the OTLP exporters, install the globals, and
+        // publish to the shared slot. Instruments below always bind to the
+        // global meter, so every observer records into the same pipeline.
+        let (tracer_provider, meter_provider_clone) = match OTEL_PROVIDERS.get() {
+            Some(providers) => providers.clone(),
+            None => {
+                // ── Trace exporter ──────────────────────────────
+                let mut span_builder = opentelemetry_otlp::SpanExporter::builder()
+                    .with_http()
+                    .with_endpoint(&traces_endpoint);
+                if !header_map.is_empty() {
+                    span_builder = span_builder.with_headers(header_map.clone());
+                }
+                let span_exporter = span_builder
+                    .build()
+                    .map_err(|e| format!("Failed to create OTLP span exporter: {e}"))?;
 
-        let tracer_provider = SdkTracerProvider::builder()
-            .with_batch_exporter(span_exporter)
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name(service_name.to_string())
-                    .build(),
-            )
-            .build();
+                let tracer_provider = SdkTracerProvider::builder()
+                    .with_batch_exporter(span_exporter)
+                    .with_resource(
+                        opentelemetry_sdk::Resource::builder()
+                            .with_service_name(service_name.to_string())
+                            .build(),
+                    )
+                    .build();
 
-        global::set_tracer_provider(tracer_provider.clone());
+                // ── Metric exporter ─────────────────────────────
+                let mut metric_builder = opentelemetry_otlp::MetricExporter::builder()
+                    .with_http()
+                    .with_endpoint(&metrics_endpoint);
+                if !header_map.is_empty() {
+                    metric_builder = metric_builder.with_headers(header_map.clone());
+                }
+                let metric_exporter = metric_builder
+                    .build()
+                    .map_err(|e| format!("Failed to create OTLP metric exporter: {e}"))?;
 
-        // ── Metric exporter ─────────────────────────────────────
-        let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
-            .with_http()
-            .with_endpoint(&metrics_endpoint)
-            .build()
-            .map_err(|e| format!("Failed to create OTLP metric exporter: {e}"))?;
+                let metric_reader =
+                    opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
 
-        let metric_reader =
-            opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
+                let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+                    .with_reader(metric_reader)
+                    .with_resource(
+                        opentelemetry_sdk::Resource::builder()
+                            .with_service_name(service_name.to_string())
+                            .build(),
+                    )
+                    .build();
 
-        let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-            .with_reader(metric_reader)
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name(service_name.to_string())
-                    .build(),
-            )
-            .build();
+                global::set_tracer_provider(tracer_provider.clone());
+                global::set_meter_provider(meter_provider.clone());
+                tracing::info!(
+                    endpoint = %base_endpoint,
+                    service_name,
+                    "OpenTelemetry OTLP exporter initialized"
+                );
 
-        let meter_provider_clone = meter_provider.clone();
-        global::set_meter_provider(meter_provider);
+                let pair = (tracer_provider, meter_provider);
+                // Publish for later components; if a concurrent caller won the
+                // race, keep the winner's providers for consistency.
+                let _ = OTEL_PROVIDERS.set(pair.clone());
+                OTEL_PROVIDERS.get().cloned().unwrap_or(pair)
+            }
+        };
 
         // ── Create metric instruments ────────────────────────────
         let meter = global::meter("zeroclaw");
@@ -259,8 +326,10 @@ impl Observer for OtelObserver {
                     KeyValue::new("success", success.to_string()),
                 ];
                 self.tool_calls.add(1, &attrs);
-                self.tool_duration
-                    .record(duration.as_secs_f64(), &[KeyValue::new("tool", tool.clone())]);
+                self.tool_duration.record(
+                    duration.as_secs_f64(),
+                    &[KeyValue::new("tool", tool.clone())],
+                );
             }
             ObserverEvent::ChannelMessage { channel, direction } => {
                 self.channel_messages.add(
@@ -446,11 +515,9 @@ impl TraceSpan for OtelSpan {
     }
 
     fn set_status(&self, ok: bool) {
-        self.cx.span().set_status(if ok {
-            Status::Ok
-        } else {
-            Status::error("")
-        });
+        self.cx
+            .span()
+            .set_status(if ok { Status::Ok } else { Status::error("") });
     }
 }
 
@@ -474,7 +541,7 @@ mod tests {
     fn test_observer() -> OtelObserver {
         // Create with a dummy endpoint — exports will silently fail
         // but the observer itself works fine for recording
-        OtelObserver::new(Some("http://127.0.0.1:19999"), Some("zeroclaw-test"))
+        OtelObserver::new(Some("http://127.0.0.1:19999"), Some("zeroclaw-test"), None)
             .expect("observer creation should not fail with valid endpoint format")
     }
 
@@ -642,9 +709,46 @@ mod tests {
     }
 
     #[test]
+    fn parse_otlp_headers_handles_pairs_whitespace_and_malformed() {
+        let map = parse_otlp_headers(" authorization=Bearer abc123 , x-tenant = acme ");
+        assert_eq!(
+            map.get("authorization").map(String::as_str),
+            Some("Bearer abc123")
+        );
+        assert_eq!(map.get("x-tenant").map(String::as_str), Some("acme"));
+
+        // A value containing '=' (e.g. base64) keeps everything after the first '='.
+        let b64 = parse_otlp_headers("authorization=Basic dXNlcjpwYXNz==");
+        assert_eq!(
+            b64.get("authorization").map(String::as_str),
+            Some("Basic dXNlcjpwYXNz==")
+        );
+
+        // Malformed entries (no '=', empty key) are skipped, not fatal.
+        let partial = parse_otlp_headers("garbage,=novalue,good=1");
+        assert_eq!(partial.len(), 1);
+        assert_eq!(partial.get("good").map(String::as_str), Some("1"));
+
+        assert!(parse_otlp_headers("").is_empty());
+    }
+
+    #[test]
+    fn otel_observer_creation_with_headers_succeeds() {
+        let result = OtelObserver::new(
+            Some("http://127.0.0.1:12345"),
+            Some("zeroclaw-test"),
+            Some("authorization=Bearer test-token"),
+        );
+        assert!(
+            result.is_ok(),
+            "observer creation must succeed with auth headers set"
+        );
+    }
+
+    #[test]
     fn otel_observer_creation_with_valid_endpoint_succeeds() {
         // Even though endpoint is unreachable, creation should succeed
-        let result = OtelObserver::new(Some("http://127.0.0.1:12345"), Some("zeroclaw-test"));
+        let result = OtelObserver::new(Some("http://127.0.0.1:12345"), Some("zeroclaw-test"), None);
         assert!(
             result.is_ok(),
             "observer creation must succeed even with unreachable endpoint"

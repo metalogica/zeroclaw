@@ -15,12 +15,12 @@ pub mod verbose;
 pub use self::log::LogObserver;
 #[allow(unused_imports)]
 pub use self::multi::MultiObserver;
+pub use active::{current_span, scope_span};
 pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
 #[cfg(feature = "observability-prometheus")]
 pub use prometheus::PrometheusObserver;
-pub use active::{current_span, scope_span};
 pub use traits::{AttrValue, NoopSpan, Observer, ObserverEvent, Span, Trigger};
 #[allow(unused_imports)]
 pub use verbose::VerboseObserver;
@@ -50,14 +50,18 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
             match OtelObserver::new(
                 config.otel_endpoint.as_deref(),
                 config.otel_service_name.as_deref(),
+                config.otel_headers.as_deref(),
             ) {
                 Ok(obs) => {
-                    tracing::info!(
+                    // Per-component detail at debug; the once-per-process
+                    // info-level "OTLP exporter initialized" is logged by
+                    // OtelObserver when it actually builds the shared exporter.
+                    tracing::debug!(
                         endpoint = config
                             .otel_endpoint
                             .as_deref()
                             .unwrap_or("http://localhost:4318"),
-                        "OpenTelemetry observer initialized"
+                        "OpenTelemetry observer constructed"
                     );
                     Box::new(obs)
                 }

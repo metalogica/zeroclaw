@@ -5371,6 +5371,15 @@ pub struct ObservabilityConfig {
     #[serde(default)]
     pub otel_service_name: Option<String>,
 
+    /// OTLP export headers, in the OTel-standard `OTEL_EXPORTER_OTLP_HEADERS`
+    /// format: comma-separated `key=value` pairs, e.g.
+    /// `authorization=Bearer <token>`. Applied to both the trace and metric
+    /// exporters. Only used when backend = "otel"; `None` exports without
+    /// headers (unchanged behavior). Required by collectors that gate ingest
+    /// on an auth header (e.g. Laminar's project Bearer).
+    #[serde(default)]
+    pub otel_headers: Option<String>,
+
     /// Runtime trace storage mode: "none" | "rolling" | "full".
     /// Controls whether model replies and tool-call diagnostics are persisted.
     #[serde(default = "default_runtime_trace_mode")]
@@ -5391,6 +5400,7 @@ impl Default for ObservabilityConfig {
             backend: "none".into(),
             otel_endpoint: None,
             otel_service_name: None,
+            otel_headers: None,
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),
