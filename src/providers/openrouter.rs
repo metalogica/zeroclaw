@@ -821,6 +821,21 @@ impl Provider for OpenRouterProvider {
         true
     }
 
+    /// OpenRouter streams chat completions as SSE; stream_chat below
+    /// parses delta.reasoning + delta.content + delta.tool_calls.
+    /// Wrappers like ReliableProvider check this flag before invoking
+    /// stream_chat — without it, they skip OpenRouter and the agent
+    /// silently falls back to the non-streaming chat() path.
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    /// stream_chat emits StreamEvent::ToolCall for accumulated tool-call
+    /// deltas, so ReliableProvider's tool-aware streaming path can use it.
+    fn supports_streaming_tool_events(&self) -> bool {
+        true
+    }
+
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
