@@ -1,11 +1,13 @@
 use crate::multimodal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
+    Provider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
+    StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use base64::Engine;
+use futures_util::{StreamExt, stream};
 use regex::Regex;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -157,6 +159,11 @@ struct NativeChatRequest {
     modalities: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<String>,
+    /// When `true`, OpenRouter responds with an SSE stream of chat
+    /// completion deltas (incremental reasoning + content + tool-call
+    /// chunks). Set by `stream_chat` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -756,6 +763,7 @@ impl Provider for OpenRouterProvider {
             max_tokens: self.max_tokens,
             modalities: self.modalities.clone(),
             user: self.pod_user_id.clone(),
+    stream: None,
         };
 
         let response = self
@@ -867,6 +875,7 @@ impl Provider for OpenRouterProvider {
             max_tokens: self.max_tokens,
             modalities: self.modalities.clone(),
             user: self.pod_user_id.clone(),
+    stream: None,
         };
 
         let response = self
@@ -919,6 +928,310 @@ impl Provider for OpenRouterProvider {
         result.usage = usage;
         Ok(result)
     }
+
+    /// Streaming chat with full tool-call + reasoning support.
+    ///
+    /// Connects to OpenRouter's SSE stream and emits:
+    /// - `StreamEvent::TextDelta(StreamChunk::reasoning(...))` for each
+    ///   `delta.reasoning` chunk (typically arrives during the model's
+    ///   thinking phase, before content)
+    /// - `StreamEvent::TextDelta(StreamChunk::delta(...))` for each
+    ///   `delta.content` chunk (the answer text)
+    /// - `StreamEvent::ToolCall(...)` once per accumulated tool call,
+    ///   after the stream completes (tool-call deltas are aggregated by
+    ///   `index` until the stream finishes)
+    /// - `StreamEvent::Final` when the stream ends cleanly
+    ///
+    /// On HTTP / parse error, terminates the stream with `Err(StreamError)`.
+    fn stream_chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        _options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        let Some(credential) = self.credential.clone() else {
+            let err = StreamError::Provider(
+                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.".into()
+            );
+            return stream::iter(vec![Err(err)]).boxed();
+        };
+
+        let tools = Self::convert_tools(request.tools);
+        let messages = Self::convert_messages(request.messages);
+        let body = NativeChatRequest {
+            model: model.to_string(),
+            messages,
+            temperature,
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
+            max_tokens: self.max_tokens,
+            modalities: self.modalities.clone(),
+            user: self.pod_user_id.clone(),
+            stream: Some(true),
+        };
+
+        let client = self.http_client();
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+
+        tokio::spawn(async move {
+            let response = match client
+                .post("https://openrouter.ai/api/v1/chat/completions")
+                .header("Authorization", format!("Bearer {credential}"))
+                .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
+                .header("X-Title", "ZeroClaw")
+                .header("Accept", "text/event-stream")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+            };
+
+            if let Err(e) = response.error_for_status_ref() {
+                let _ = tx.send(Err(StreamError::Http(e))).await;
+                return;
+            }
+
+            let mut bytes_stream = response.bytes_stream();
+            let mut buffer = String::new();
+            let mut tool_accs: Vec<OrToolCallAccumulator> = Vec::new();
+            // Accumulate UTF-8 bytes safely across HTTP chunk boundaries
+            // (e.g. multibyte glyphs split across two TCP frames).
+            let mut utf8_buf: Vec<u8> = Vec::new();
+
+            while let Some(item) = bytes_stream.next().await {
+                let bytes = match item {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = tx.send(Err(StreamError::Http(e))).await;
+                        return;
+                    }
+                };
+
+                utf8_buf.extend_from_slice(&bytes);
+                let text = match std::str::from_utf8(&utf8_buf) {
+                    Ok(s) => {
+                        let owned = s.to_string();
+                        utf8_buf.clear();
+                        owned
+                    }
+                    Err(e) => {
+                        let valid_up_to = e.valid_up_to();
+                        if valid_up_to == 0 && utf8_buf.len() < 4 {
+                            continue;
+                        }
+                        let valid =
+                            String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
+                        utf8_buf.drain(..valid_up_to);
+                        valid
+                    }
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                buffer.push_str(&text);
+
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer[..pos].to_string();
+                    buffer.drain(..=pos);
+
+                    let chunk = match parse_or_sse_chunk(&line) {
+                        Ok(Some(c)) => c,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    };
+
+                    for choice in &chunk.choices {
+                        if let Some(reasoning) = choice
+                            .delta
+                            .reasoning
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                        {
+                            let event = StreamEvent::TextDelta(StreamChunk::reasoning(
+                                reasoning.to_string(),
+                            ));
+                            if tx.send(Ok(event)).await.is_err() {
+                                return;
+                            }
+                        }
+                        if let Some(content) = choice
+                            .delta
+                            .content
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                        {
+                            let event = StreamEvent::TextDelta(StreamChunk::delta(
+                                content.to_string(),
+                            ));
+                            if tx.send(Ok(event)).await.is_err() {
+                                return;
+                            }
+                        }
+                        if let Some(tcs) = choice.delta.tool_calls.as_ref() {
+                            for tc_delta in tcs {
+                                let idx = tc_delta.index.unwrap_or(tool_accs.len());
+                                while tool_accs.len() <= idx {
+                                    tool_accs.push(OrToolCallAccumulator::default());
+                                }
+                                tool_accs[idx].apply_delta(tc_delta);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Flush any accumulated tool calls before signaling end-of-stream.
+            for acc in tool_accs.drain(..) {
+                if let Some(tc) = acc.into_provider_tool_call() {
+                    if tx.send(Ok(StreamEvent::ToolCall(tc))).await.is_err() {
+                        return;
+                    }
+                }
+            }
+
+            let _ = tx.send(Ok(StreamEvent::Final)).await;
+        });
+
+        stream::unfold(rx, |mut rx| async {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        })
+        .boxed()
+    }
+}
+
+// ── SSE streaming types ──────────────────────────────────────────────
+// Used by `stream_chat` to parse OpenRouter's chat-completion SSE.
+// OpenRouter's wire format differs from older OpenAI-compatible providers
+// in one important place: the reasoning delta field is named `reasoning`
+// (not `reasoning_content`). The alias accepts both so a legacy proxy
+// that still emits the old key continues to work.
+
+#[derive(Debug, Deserialize)]
+struct OrSseChunkResponse {
+    #[serde(default)]
+    choices: Vec<OrSseChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrSseChoice {
+    #[serde(default)]
+    delta: OrSseDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OrSseDelta {
+    #[serde(default)]
+    content: Option<String>,
+    /// OpenRouter uses `reasoning` for streaming reasoning deltas; older
+    /// responses (and some OpenAI-compatible proxies) use `reasoning_content`.
+    #[serde(default, alias = "reasoning_content")]
+    reasoning: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OrSseToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrSseToolCallDelta {
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<OrSseFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrSseFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// Accumulates tool-call deltas across SSE messages until finish.
+#[derive(Debug, Default)]
+struct OrToolCallAccumulator {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl OrToolCallAccumulator {
+    fn apply_delta(&mut self, delta: &OrSseToolCallDelta) {
+        if let Some(id) = delta.id.as_ref().filter(|v| !v.is_empty()) {
+            self.id = Some(id.clone());
+        }
+        if let Some(name) = delta
+            .function
+            .as_ref()
+            .and_then(|f| f.name.as_ref())
+            .filter(|v| !v.is_empty())
+        {
+            self.name = Some(name.clone());
+        }
+        if let Some(args) = delta
+            .function
+            .as_ref()
+            .and_then(|f| f.arguments.as_ref())
+            .filter(|v| !v.is_empty())
+        {
+            self.arguments.push_str(args);
+        }
+    }
+
+    fn into_provider_tool_call(self) -> Option<ProviderToolCall> {
+        let name = self.name?;
+        let arguments = if self.arguments.trim().is_empty() {
+            "{}".to_string()
+        } else {
+            self.arguments
+        };
+        let normalized = if serde_json::from_str::<serde_json::Value>(&arguments).is_ok() {
+            arguments
+        } else {
+            tracing::warn!(
+                function = %name,
+                arguments = %arguments,
+                "Invalid JSON in OpenRouter streamed tool-call arguments, using empty object"
+            );
+            "{}".to_string()
+        };
+        Some(ProviderToolCall {
+            id: self.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            name,
+            arguments: normalized,
+        })
+    }
+}
+
+/// Parse one SSE line into an `OrSseChunkResponse`. Returns Ok(None) for
+/// comments (`:` heartbeats), empty lines, non-`data:` lines, and `[DONE]`.
+fn parse_or_sse_chunk(line: &str) -> StreamResult<Option<OrSseChunkResponse>> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with(':') {
+        return Ok(None);
+    }
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(None);
+    };
+    let data = data.trim();
+    if data == "[DONE]" {
+        return Ok(None);
+    }
+    serde_json::from_str(data)
+        .map(Some)
+        .map_err(StreamError::Json)
 }
 
 /// Check if a tool name is valid for OpenAI-compatible APIs.
@@ -1682,6 +1995,7 @@ mod tests {
             max_tokens: None,
             modalities: Some(vec!["image".into(), "text".into()]),
             user: None,
+    stream: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""modalities":["image","text"]"#));
@@ -1698,6 +2012,7 @@ mod tests {
             max_tokens: None,
             modalities: None,
             user: None,
+    stream: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("modalities"));
@@ -1742,6 +2057,7 @@ mod tests {
             max_tokens: None,
             modalities: None,
             user: Some("kd7a2a1aqrrxyhqjbdz449f3kh84mev6".into()),
+    stream: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""user":"kd7a2a1aqrrxyhqjbdz449f3kh84mev6""#));
@@ -2141,5 +2457,107 @@ mod tests {
             &None,
         );
         assert_eq!(result, "just text");
+    }
+
+    // ── SSE streaming tests ──────────────────────────────────────────
+
+    #[test]
+    fn parse_or_sse_chunk_skips_comments_and_done() {
+        // Heartbeat comment line ": OPENROUTER PROCESSING"
+        assert!(
+            parse_or_sse_chunk(": OPENROUTER PROCESSING")
+                .unwrap()
+                .is_none()
+        );
+        // Empty line
+        assert!(parse_or_sse_chunk("").unwrap().is_none());
+        assert!(parse_or_sse_chunk("   ").unwrap().is_none());
+        // [DONE] sentinel
+        assert!(parse_or_sse_chunk("data: [DONE]").unwrap().is_none());
+        // Non-data line
+        assert!(parse_or_sse_chunk("event: status").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_or_sse_chunk_extracts_reasoning_delta() {
+        // Matches the actual OpenRouter SSE shape verified via direct
+        // probe against deepseek-r1: delta.reasoning field, not
+        // delta.reasoning_content.
+        let line = r#"data: {"choices":[{"delta":{"content":"","role":"assistant","reasoning":"First, the","reasoning_details":[{"type":"reasoning.text","text":"First, the"}]}}]}"#;
+        let chunk = parse_or_sse_chunk(line).unwrap().expect("data: line should parse");
+        let choice = chunk.choices.first().expect("choice present");
+        assert_eq!(choice.delta.reasoning.as_deref(), Some("First, the"));
+        assert_eq!(choice.delta.content.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn parse_or_sse_chunk_extracts_content_delta() {
+        let line = r#"data: {"choices":[{"delta":{"content":"17 * 23 = 391","role":"assistant"}}]}"#;
+        let chunk = parse_or_sse_chunk(line).unwrap().expect("data: line should parse");
+        let choice = chunk.choices.first().expect("choice present");
+        assert_eq!(choice.delta.content.as_deref(), Some("17 * 23 = 391"));
+        assert!(choice.delta.reasoning.is_none());
+    }
+
+    #[test]
+    fn parse_or_sse_chunk_accepts_legacy_reasoning_content_alias() {
+        // Older OpenAI-compatible proxies (and pre-rename OpenRouter) used
+        // `reasoning_content`. The alias keeps that path working.
+        let line = r#"data: {"choices":[{"delta":{"reasoning_content":"older format"}}]}"#;
+        let chunk = parse_or_sse_chunk(line).unwrap().expect("data: line should parse");
+        let choice = chunk.choices.first().expect("choice present");
+        assert_eq!(choice.delta.reasoning.as_deref(), Some("older format"));
+    }
+
+    #[test]
+    fn or_tool_call_accumulator_aggregates_function_deltas() {
+        // Tool-call deltas arrive split across multiple SSE messages.
+        // The accumulator merges them into a single ProviderToolCall.
+        let mut acc = OrToolCallAccumulator::default();
+        acc.apply_delta(&OrSseToolCallDelta {
+            index: Some(0),
+            id: Some("call_abc".into()),
+            function: Some(OrSseFunctionDelta {
+                name: Some("calculator".into()),
+                arguments: Some("{\"a\":".into()),
+            }),
+        });
+        acc.apply_delta(&OrSseToolCallDelta {
+            index: Some(0),
+            id: None,
+            function: Some(OrSseFunctionDelta {
+                name: None,
+                arguments: Some("17,".into()),
+            }),
+        });
+        acc.apply_delta(&OrSseToolCallDelta {
+            index: Some(0),
+            id: None,
+            function: Some(OrSseFunctionDelta {
+                name: None,
+                arguments: Some("\"b\":23}".into()),
+            }),
+        });
+        let tc = acc
+            .into_provider_tool_call()
+            .expect("complete tool call should materialize");
+        assert_eq!(tc.id, "call_abc");
+        assert_eq!(tc.name, "calculator");
+        assert_eq!(tc.arguments, r#"{"a":17,"b":23}"#);
+    }
+
+    #[test]
+    fn or_tool_call_accumulator_falls_back_to_empty_args_when_invalid_json() {
+        let mut acc = OrToolCallAccumulator::default();
+        acc.apply_delta(&OrSseToolCallDelta {
+            index: Some(0),
+            id: Some("call_bad".into()),
+            function: Some(OrSseFunctionDelta {
+                name: Some("noop".into()),
+                arguments: Some("not valid json".into()),
+            }),
+        });
+        let tc = acc.into_provider_tool_call().expect("tool call materialized");
+        assert_eq!(tc.arguments, "{}");
     }
 }
