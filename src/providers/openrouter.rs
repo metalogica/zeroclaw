@@ -170,7 +170,11 @@ struct NativeMessage {
     tool_calls: Option<Vec<NativeToolCall>>,
     /// Raw reasoning content from thinking models; pass-through for providers
     /// that require it in assistant tool-call history messages.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// Accepts the field as either `reasoning_content` (legacy / older OpenRouter
+    /// responses) or `reasoning` (current OpenRouter responses) on deserialization.
+    /// Serializes as `reasoning_content` (alias does not affect Serialize).
+    #[serde(skip_serializing_if = "Option::is_none", alias = "reasoning")]
     reasoning_content: Option<String>,
 }
 
@@ -227,8 +231,11 @@ struct NativeChoice {
 struct NativeResponseMessage {
     #[serde(default)]
     content: Option<String>,
-    /// Reasoning/thinking models may return output in `reasoning_content`.
-    #[serde(default)]
+    /// Reasoning/thinking models may return output in `reasoning_content`
+    /// (legacy) or `reasoning` (current OpenRouter). The alias accepts both
+    /// so the agent's downstream Thinking-event emit stays populated as
+    /// OpenRouter's response schema evolves.
+    #[serde(default, alias = "reasoning")]
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<NativeToolCall>>,
@@ -1458,6 +1465,28 @@ mod tests {
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let message = &resp.choices[0].message;
         assert_eq!(message.reasoning_content.as_deref(), Some("deep thought"));
+    }
+
+    #[test]
+    fn native_response_deserializes_reasoning_alias() {
+        // Current OpenRouter responses use the `reasoning` key, not
+        // `reasoning_content`. Without the serde alias, this field silently
+        // deserializes to None and the downstream Thinking event never fires.
+        let json = r#"{
+            "choices":[{
+                "message":{
+                    "role":"assistant",
+                    "content":"17 * 23 = 391",
+                    "reasoning":"Let me compute step by step: 17 * 23 = 17*20 + 17*3 = 340 + 51 = 391."
+                }
+            }]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let message = &resp.choices[0].message;
+        assert_eq!(
+            message.reasoning_content.as_deref(),
+            Some("Let me compute step by step: 17 * 23 = 17*20 + 17*3 = 340 + 51 = 391.")
+        );
     }
 
     #[test]
