@@ -37,6 +37,15 @@ build:
 build-debug:
     cargo build
 
+# Fast dev loop: compile (debug+lld, incremental) and hot-swap the binary into
+# the running claw container — no ~20-min image rebuild. First run is a cold
+# debug build; subsequent runs are incremental (well under a minute).
+#   just claw-hotswap                          # swap into clawcraft-claw
+#   CLAW_CONTAINER=foo just claw-hotswap       # different container
+#   ZEROCLAW_FEATURES=observability-otel just claw-hotswap   # fewer features = faster
+claw-hotswap:
+    dev/hotswap/hotswap.sh
+
 # Clean build artifacts
 clean:
     cargo clean
