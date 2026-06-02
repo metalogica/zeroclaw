@@ -195,6 +195,21 @@ impl crate::observability::Observer for BroadcastObserver {
         self.inner.record_metric(metric);
     }
 
+    /// Delegate trace-root creation to the wrapped observer.
+    ///
+    /// Without this override the trait default returns a `NoopSpan`, which
+    /// silently downgrades every activation opened through the gateway's
+    /// observer (WS `web_chat`, the webhook endpoint) to a no-op — so the
+    /// inner OpenTelemetry observer never emits an `agent.activation` span for
+    /// gateway-originated turns even though channels/CLI do. Forward to inner.
+    fn start_activation(
+        &self,
+        trigger: crate::observability::Trigger,
+        thread_id: Option<&str>,
+    ) -> Box<dyn crate::observability::Span> {
+        self.inner.start_activation(trigger, thread_id)
+    }
+
     fn flush(&self) {
         self.inner.flush();
     }
@@ -205,5 +220,59 @@ impl crate::observability::Observer for BroadcastObserver {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observability::traits::ObserverMetric;
+    use crate::observability::{NoopSpan, Observer, ObserverEvent, Span, Trigger};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Observer that records whether `start_activation` was delegated to it.
+    struct ActivationProbe {
+        called: Arc<AtomicUsize>,
+    }
+
+    impl Observer for ActivationProbe {
+        fn record_event(&self, _event: &ObserverEvent) {}
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+        fn start_activation(&self, _trigger: Trigger, _thread_id: Option<&str>) -> Box<dyn Span> {
+            self.called.fetch_add(1, Ordering::SeqCst);
+            Box::new(NoopSpan)
+        }
+        fn flush(&self) {}
+        fn name(&self) -> &str {
+            "activation-probe"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Regression guard: the SSE decorator MUST forward `start_activation` to
+    /// the wrapped observer. Without the override the trait default returns a
+    /// `NoopSpan`, so every activation opened on the gateway's observer (WS
+    /// `web_chat`, the webhook endpoint) silently became a no-op and never
+    /// reached the inner OpenTelemetry observer.
+    #[test]
+    fn broadcast_observer_delegates_start_activation() {
+        let called = Arc::new(AtomicUsize::new(0));
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let buffer = Arc::new(EventBuffer::new(8));
+        let obs = BroadcastObserver::new(
+            Box::new(ActivationProbe {
+                called: called.clone(),
+            }),
+            tx,
+            buffer,
+        );
+        let _span = obs.start_activation(Trigger::WebChat, Some("thread-1"));
+        assert_eq!(
+            called.load(Ordering::SeqCst),
+            1,
+            "BroadcastObserver must delegate start_activation to its inner observer"
+        );
     }
 }

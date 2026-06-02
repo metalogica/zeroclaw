@@ -175,6 +175,13 @@ impl Observer for ChannelNotifyObserver {
     fn record_metric(&self, metric: &ObserverMetric) {
         self.inner.record_metric(metric);
     }
+    /// Delegate trace-root creation to the wrapped observer so this decorator is
+    /// transparent. Without it the trait default returns a `NoopSpan`; the
+    /// channel activation site historically worked around that by minting from
+    /// the base observer directly. Forwarding here removes that fragility.
+    fn start_activation(&self, trigger: Trigger, thread_id: Option<&str>) -> Box<dyn Span> {
+        self.inner.start_activation(trigger, thread_id)
+    }
     fn flush(&self) {
         self.inner.flush();
     }
@@ -5790,6 +5797,51 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    /// Observer that records whether `start_activation` was delegated to it.
+    struct ActivationProbe {
+        called: Arc<AtomicUsize>,
+    }
+
+    impl Observer for ActivationProbe {
+        fn record_event(&self, _event: &ObserverEvent) {}
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+        fn start_activation(&self, _trigger: Trigger, _thread_id: Option<&str>) -> Box<dyn Span> {
+            self.called.fetch_add(1, Ordering::SeqCst);
+            Box::new(crate::observability::NoopSpan)
+        }
+        fn flush(&self) {}
+        fn name(&self) -> &str {
+            "activation-probe"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Regression guard: the channel notify decorator MUST forward
+    /// `start_activation`. It historically returned the trait-default `NoopSpan`,
+    /// and the channel activation site worked around that by minting from the
+    /// base observer directly. Forwarding keeps the decorator transparent so the
+    /// workaround isn't load-bearing.
+    #[test]
+    fn channel_notify_observer_delegates_start_activation() {
+        let called = Arc::new(AtomicUsize::new(0));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let obs = ChannelNotifyObserver {
+            inner: Arc::new(ActivationProbe {
+                called: called.clone(),
+            }),
+            tx,
+            tools_used: AtomicBool::new(false),
+        };
+        let _span = obs.start_activation(Trigger::Channel, Some("thread-1"));
+        assert_eq!(
+            called.load(Ordering::SeqCst),
+            1,
+            "ChannelNotifyObserver must delegate start_activation to its inner observer"
+        );
+    }
 
     fn make_workspace() -> TempDir {
         let tmp = TempDir::new().unwrap();

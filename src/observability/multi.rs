@@ -1,4 +1,4 @@
-use super::traits::{Observer, ObserverEvent, ObserverMetric};
+use super::traits::{NoopSpan, Observer, ObserverEvent, ObserverMetric, Span, Trigger};
 use std::any::Any;
 
 /// Combine multiple observers — fan-out events to all backends
@@ -22,6 +22,21 @@ impl Observer for MultiObserver {
     fn record_metric(&self, metric: &ObserverMetric) {
         for obs in &self.observers {
             obs.record_metric(metric);
+        }
+    }
+
+    /// Delegate trace-root creation to the first observer.
+    ///
+    /// A span is a single object, so true fan-out across multiple tracing
+    /// backends isn't possible here; the first observer wins (place the
+    /// tracing-capable backend first). Without this override the trait default
+    /// returns a `NoopSpan`, silently dropping traces for any path that holds a
+    /// `MultiObserver` — the same decorator-bypass class as the gateway/channel
+    /// wrappers.
+    fn start_activation(&self, trigger: Trigger, thread_id: Option<&str>) -> Box<dyn Span> {
+        match self.observers.first() {
+            Some(obs) => obs.start_activation(trigger, thread_id),
+            None => Box::new(NoopSpan),
         }
     }
 
@@ -159,5 +174,44 @@ mod tests {
         m.flush();
         assert_eq!(fc1.load(Ordering::SeqCst), 1);
         assert_eq!(fc2.load(Ordering::SeqCst), 1);
+    }
+
+    /// Observer that records whether `start_activation` was delegated to it.
+    struct ActivationProbe {
+        called: Arc<AtomicUsize>,
+    }
+
+    impl Observer for ActivationProbe {
+        fn record_event(&self, _event: &ObserverEvent) {}
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+        fn start_activation(&self, _trigger: Trigger, _thread_id: Option<&str>) -> Box<dyn Span> {
+            self.called.fetch_add(1, Ordering::SeqCst);
+            Box::new(NoopSpan)
+        }
+        fn flush(&self) {}
+        fn name(&self) -> &str {
+            "activation-probe"
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Regression guard: a decorator that wraps an inner observer MUST forward
+    /// `start_activation`. Without the override the trait default returns a
+    /// `NoopSpan` and the inner tracing backend is never reached — exactly the
+    /// bug that made gateway/web_chat activations silently disappear.
+    #[test]
+    fn multi_delegates_start_activation_to_first_observer() {
+        let called = Arc::new(AtomicUsize::new(0));
+        let m = MultiObserver::new(vec![Box::new(ActivationProbe {
+            called: called.clone(),
+        })]);
+        let _span = m.start_activation(Trigger::WebChat, Some("thread-1"));
+        assert_eq!(
+            called.load(Ordering::SeqCst),
+            1,
+            "MultiObserver must delegate start_activation to its inner observer"
+        );
     }
 }
