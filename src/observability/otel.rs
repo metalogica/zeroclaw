@@ -25,6 +25,12 @@ pub struct OtelObserver {
     tracer_provider: SdkTracerProvider,
     meter_provider: SdkMeterProvider,
 
+    /// Configured `deployment.environment` (non-empty), surfaced on the root
+    /// activation span. Self-hosted Laminar discards OTLP *resource* attributes,
+    /// so the resource-level copy is invisible there — the span attribute is the
+    /// queryable one. `None` when unconfigured/empty.
+    environment: Option<String>,
+
     // Metrics instruments
     agent_starts: Counter<u64>,
     agent_duration: Histogram<f64>,
@@ -257,6 +263,7 @@ impl OtelObserver {
         Ok(Self {
             tracer_provider,
             meter_provider: meter_provider_clone,
+            environment: environment.filter(|e| !e.is_empty()).map(str::to_string),
             agent_starts,
             agent_duration,
             llm_calls,
@@ -468,7 +475,11 @@ impl Observer for OtelObserver {
     }
 
     fn start_activation(&self, trigger: Trigger, thread_id: Option<&str>) -> Box<dyn TraceSpan> {
-        Box::new(OtelSpan::root(trigger, thread_id))
+        Box::new(OtelSpan::root(
+            trigger,
+            thread_id,
+            self.environment.as_deref(),
+        ))
     }
 }
 
@@ -494,7 +505,11 @@ pub struct OtelSpan {
 
 impl OtelSpan {
     /// Open the root activation span (`agent.activation`) on a fresh trace.
-    fn root(trigger: Trigger, thread_id: Option<&str>) -> Self {
+    ///
+    /// `environment` (when non-empty) is set as the `deployment.environment` span
+    /// attribute in addition to the OTLP resource attribute — self-hosted Laminar
+    /// drops resource attributes, so the span copy is the one that stays queryable.
+    fn root(trigger: Trigger, thread_id: Option<&str>, environment: Option<&str>) -> Self {
         let tracer = global::tracer("zeroclaw");
         // Empty parent context ⇒ a brand-new trace_id (one trace per activation).
         let span = tracer.start_with_context("agent.activation", &Context::new());
@@ -504,6 +519,9 @@ impl OtelSpan {
         this.set_attr("trigger", AttrValue::Str(trigger.as_str().to_string()));
         if let Some(tid) = thread_id {
             this.set_attr("thread_id", AttrValue::Str(tid.to_string()));
+        }
+        if let Some(env) = environment.filter(|e| !e.is_empty()) {
+            this.set_attr("deployment.environment", AttrValue::Str(env.to_string()));
         }
         this
     }
@@ -815,7 +833,7 @@ mod tests {
     fn activation_children_share_trace_id() {
         // Constructing the observer sets the global tracer provider.
         let _obs = test_observer();
-        let root = OtelSpan::root(Trigger::Cli, Some("thread-1"));
+        let root = OtelSpan::root(Trigger::Cli, Some("thread-1"), None);
         let child = root.child_span("llm.call");
         let grandchild = child.child_span("tool.call");
 
@@ -836,10 +854,21 @@ mod tests {
     }
 
     #[test]
+    fn root_with_environment_sets_span_attr_without_panic() {
+        // OTel spans don't expose their attributes for read-back, so we can only
+        // assert the env branch executes cleanly (set_attr on the live span).
+        let _obs = test_observer();
+        let root = OtelSpan::root(Trigger::WebChat, Some("thread-1"), Some("dev"));
+        // Empty env must be treated as unset (no attribute written, no panic).
+        let _empty = OtelSpan::root(Trigger::WebChat, None, Some(""));
+        root.set_status(true);
+    }
+
+    #[test]
     fn separate_activations_get_separate_traces() {
         let _obs = test_observer();
-        let a = OtelSpan::root(Trigger::WebChat, Some("thread-1"));
-        let b = OtelSpan::root(Trigger::WebChat, Some("thread-1"));
+        let a = OtelSpan::root(Trigger::WebChat, Some("thread-1"), None);
+        let b = OtelSpan::root(Trigger::WebChat, Some("thread-1"), None);
         // Same thread_id, but two activations ⇒ two distinct traces (never merged).
         assert_ne!(
             a.cx.span().span_context().trace_id(),

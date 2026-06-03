@@ -4529,6 +4529,13 @@ pub async fn run(
         cost_usd: None,
     });
 
+    // Flush before the CLI process exits. The OTLP batch span processor only
+    // exports on its ~5s tick, so a sub-second one-shot (`zeroclaw agent -m …`)
+    // would otherwise terminate before its activation/llm/tool spans ship —
+    // silently dropping the trace. The daemon path lives long enough to flush
+    // on its own tick; this makes the short-lived CLI run parity-correct.
+    observer.flush();
+
     Ok(final_output)
 }
 
