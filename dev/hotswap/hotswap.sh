@@ -36,9 +36,15 @@ if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
     exit 1
 fi
 
-# 1. Builder image (cached after first build).
-bold "▶ ensuring hot-swap builder image…"
-docker build -f "$REPO/dev/hotswap/Dockerfile.builder" -t "$BUILDER_IMG" "$REPO/dev/hotswap" >/dev/null
+# 1. Builder image. Built once; skipped on every subsequent run unless the
+#    Dockerfile changed or REBUILD_BUILDER=1 forces it. Re-running `docker build`
+#    each invocation costs context transfer + layer eval for nothing.
+if [ "${REBUILD_BUILDER:-0}" = "1" ] || ! docker image inspect "$BUILDER_IMG" >/dev/null 2>&1; then
+    bold "▶ building hot-swap builder image…"
+    docker build -f "$REPO/dev/hotswap/Dockerfile.builder" -t "$BUILDER_IMG" "$REPO/dev/hotswap" >/dev/null
+else
+    bold "▶ hot-swap builder image present (REBUILD_BUILDER=1 to force rebuild)"
+fi
 
 # 2. Compile (debug, incremental) inside the linux builder. Deps + target live
 #    on named volumes so rebuilds are incremental across invocations. Source is
@@ -59,8 +65,9 @@ time docker run --rm \
 # 3. Self-verify the build actually carries your source change. This closes the
 #    'is the fix even in this binary?' gap that burned earlier rebuild rounds —
 #    grep the freshly built binary for the in-flight probe marker.
-if grep -aqc 'ws-activation-probe' "$BIN_OUT"; then
-    bold "✓ built binary contains 'ws-activation-probe' ($(grep -ac ws-activation-probe "$BIN_OUT") hits) — your change is in this build"
+probe_hits="$(grep -ac 'ws-activation-probe' "$BIN_OUT" || true)"
+if [ "${probe_hits:-0}" -gt 0 ]; then
+    bold "✓ built binary contains 'ws-activation-probe' ($probe_hits hits) — your change is in this build"
 else
     echo "ℹ built binary has no 'ws-activation-probe' marker (expected once the temporary probes are removed)"
 fi

@@ -18,16 +18,18 @@ FROM rust:1.94-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         clang \
-        lld \
+        mold \
     && rm -rf /var/lib/apt/lists/*
 
-# clang + lld: linking the ~300k-line binary dominates an incremental rebuild;
-# lld is dramatically faster than the default bfd linker.
+# clang + mold: linking the ~300k-line binary dominates an incremental rebuild.
+# mold is the fastest linker available (typically 2-4x faster than lld, which
+# itself crushes the default bfd) — on a link-bound incremental loop this is the
+# single biggest compile-time lever.
 # debuginfo=0: a debug build spends a large fraction generating DWARF we never
 # use for span/behavior testing — dropping it is the biggest single compile-time
 # win short of splitting the monolith crate. (Backtraces still have symbol names;
 # you just lose line numbers — fine for this dev hot-swap loop.)
-ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld -C debuginfo=0"
+ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=mold -C debuginfo=0"
 ENV CARGO_INCREMENTAL=1
 
 WORKDIR /app
