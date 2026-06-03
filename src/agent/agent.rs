@@ -943,7 +943,7 @@ impl Agent {
 
         let effective_model = self.classify_model(user_message);
 
-        for _ in 0..self.config.max_tool_iterations {
+        for iteration in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
 
             // Response cache: check before LLM call (only for deterministic, text-only prompts)
@@ -992,6 +992,17 @@ impl Agent {
                     "gen_ai.request.model",
                     AttrValue::Str(effective_model.clone()),
                 );
+                // Root input (Laminar replay): scrubbed+truncated final user
+                // message, once per activation (first llm.call only).
+                if iteration == 0 {
+                    sp.set_attr(
+                        "gen_ai.prompt",
+                        AttrValue::Str(crate::util::truncate_with_ellipsis(
+                            &crate::agent::loop_::scrub_credentials(user_message),
+                            16_000,
+                        )),
+                    );
+                }
             }
             let response = match self
                 .provider
@@ -1023,6 +1034,16 @@ impl Agent {
                     sp.set_attr(
                         "gen_ai.reasoning",
                         AttrValue::Str(crate::util::truncate_with_ellipsis(reasoning, 16_000)),
+                    );
+                }
+                // Root output (Laminar replay): scrubbed+truncated response text.
+                if let Some(text) = response.text.as_deref() {
+                    sp.set_attr(
+                        "gen_ai.completion",
+                        AttrValue::Str(crate::util::truncate_with_ellipsis(
+                            &crate::agent::loop_::scrub_credentials(text),
+                            16_000,
+                        )),
                     );
                 }
             }
@@ -1145,7 +1166,7 @@ impl Agent {
         let effective_model = self.classify_model(user_message);
 
         // ── Turn loop ──────────────────────────────────────────────────
-        for _ in 0..self.config.max_tool_iterations {
+        for iteration in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
 
             // Response cache check (same as turn)
@@ -1194,6 +1215,17 @@ impl Agent {
                     "gen_ai.request.model",
                     AttrValue::Str(effective_model.clone()),
                 );
+                // Root input (Laminar replay): scrubbed+truncated final user
+                // message, once per activation (first llm.call only).
+                if iteration == 0 {
+                    sp.set_attr(
+                        "gen_ai.prompt",
+                        AttrValue::Str(crate::util::truncate_with_ellipsis(
+                            &crate::agent::loop_::scrub_credentials(user_message),
+                            16_000,
+                        )),
+                    );
+                }
             }
 
             // ── Streaming LLM call ────────────────────────────────────
@@ -1321,6 +1353,16 @@ impl Agent {
                     sp.set_attr(
                         "gen_ai.reasoning",
                         AttrValue::Str(crate::util::truncate_with_ellipsis(reasoning, 16_000)),
+                    );
+                }
+                // Root output (Laminar replay): scrubbed+truncated response text.
+                if let Some(text) = response.text.as_deref() {
+                    sp.set_attr(
+                        "gen_ai.completion",
+                        AttrValue::Str(crate::util::truncate_with_ellipsis(
+                            &crate::agent::loop_::scrub_credentials(text),
+                            16_000,
+                        )),
                     );
                 }
             }

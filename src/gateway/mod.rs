@@ -1317,6 +1317,14 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
             "gen_ai.request.model",
             crate::observability::AttrValue::Str(state.model.clone()),
         );
+        // Root input (Laminar replay): scrubbed+truncated user message.
+        sp.set_attr(
+            "gen_ai.prompt",
+            crate::observability::AttrValue::Str(crate::util::truncate_with_ellipsis(
+                &crate::agent::loop_::scrub_credentials(message),
+                16_000,
+            )),
+        );
     }
     let result = state
         .provider
@@ -1324,6 +1332,16 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
         .await;
     if let Some(sp) = &llm_span {
         sp.set_status(result.is_ok());
+        // Root output (Laminar replay): scrubbed+truncated response text.
+        if let Ok(text) = &result {
+            sp.set_attr(
+                "gen_ai.completion",
+                crate::observability::AttrValue::Str(crate::util::truncate_with_ellipsis(
+                    &crate::agent::loop_::scrub_credentials(text),
+                    16_000,
+                )),
+            );
+        }
     }
     result
 }
@@ -1485,6 +1503,9 @@ async fn handle_webhook(
         "channel",
         crate::observability::AttrValue::Str("webhook".into()),
     );
+    if let Some(uid) = crate::observability::pod_user_id() {
+        activation_span.set_attr("user.id", crate::observability::AttrValue::Str(uid));
+    }
     match crate::observability::scope_span(
         activation_span,
         run_gateway_chat_simple(&state, message),

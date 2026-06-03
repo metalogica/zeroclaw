@@ -2564,6 +2564,25 @@ pub(crate) async fn run_tool_call_loop(
                 "gen_ai.request.model",
                 AttrValue::Str(active_model.to_string()),
             );
+            // Root input (Laminar replay): scrubbed+truncated final user message,
+            // once per activation (first llm.call only — later iterations carry
+            // tool results, not the user's question).
+            if iteration == 0 {
+                if let Some(prompt) = prepared_messages
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "user")
+                {
+                    sp.set_attr(
+                        "gen_ai.prompt",
+                        AttrValue::Str(truncate_with_ellipsis(
+                            &scrub_credentials(&prompt.content),
+                            16_000,
+                        )),
+                    );
+                }
+            }
         }
 
         let chat_result = if should_consume_provider_stream {
@@ -2693,6 +2712,13 @@ pub(crate) async fn run_tool_call_loop(
                     sp.set_attr(
                         "gen_ai.reasoning",
                         AttrValue::Str(truncate_with_ellipsis(reasoning, 16_000)),
+                    );
+                }
+                // Root output (Laminar replay): scrubbed+truncated response text.
+                if let Some(text) = resp.text.as_deref() {
+                    sp.set_attr(
+                        "gen_ai.completion",
+                        AttrValue::Str(truncate_with_ellipsis(&scrub_credentials(text), 16_000)),
                     );
                 }
                 if let Some(usage) = resp.usage.as_ref() {
@@ -4867,6 +4893,9 @@ pub async fn process_message(
         .into();
     activation_span.set_attr("provider", AttrValue::Str(provider_name.to_string()));
     activation_span.set_attr("model", AttrValue::Str(model_name.to_string()));
+    if let Some(uid) = observability::pod_user_id() {
+        activation_span.set_attr("user.id", AttrValue::Str(uid));
+    }
 
     scope_span(
         activation_span.clone(),

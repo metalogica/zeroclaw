@@ -293,6 +293,13 @@ lib suite green (6151 passed; the only intermittent failures are a pre-existing 
 **Enrichment — done & committed (completes SPEC 1's content acceptance criteria, §1/§7).**
 - `llm.call` now carries **OpenRouter reasoning** (`gen_ai.reasoning`, truncated to 16k chars)
   + token usage, in both engines.
+- `llm.call` now carries **prompt + completion content** (`gen_ai.prompt`, `gen_ai.completion`)
+  — the headline Laminar replay Root input/output columns (W2, bead zc-0e0i). **Content fields
+  legalized under §7.1:** both are `scrub_credentials`-scrubbed then truncated to 16k chars,
+  set as span attributes only (never resource). `gen_ai.prompt` = final user message, set once
+  per activation (first `llm.call`); `gen_ai.completion` = response text, set at each span drop.
+  Wired in both engines (`loop_.rs`, `agent.rs` turn/turn_streamed) and the gateway simple-chat
+  path (`gateway/mod.rs`).
 - `tool.call` carries Composio **action** + **toolkit** (`composio.action`, `composio.toolkit`)
   parsed from the call args, in both engines.
 
