@@ -87,6 +87,29 @@ fn build_otlp_resource(
     builder.build()
 }
 
+/// Terminally shut down the process-wide OTLP providers, if they were built.
+///
+/// Ends and drains the batch span/metric processors and **blocks** until export
+/// completes (or the SDK's internal timeout). Unlike [`OtelObserver::flush`],
+/// which `force_flush`es but only ships spans that have already ended, this is
+/// the right call on process exit: a short-lived one-shot (`zeroclaw agent -m …`)
+/// would otherwise terminate before the batch processor's periodic tick, and a
+/// bare `force_flush` does not reliably drain on a tearing-down runtime.
+///
+/// No-op when no OTel backend was ever initialized (the shared slot is empty).
+/// **Terminal** — the providers are unusable afterward, so only call when the
+/// process is actually exiting (never from the daemon/gateway/cron mid-life).
+pub fn shutdown_shared_providers() {
+    if let Some((tracer_provider, meter_provider)) = OTEL_PROVIDERS.get() {
+        if let Err(e) = tracer_provider.shutdown() {
+            tracing::warn!("OTel trace shutdown failed: {e}");
+        }
+        if let Err(e) = meter_provider.shutdown() {
+            tracing::warn!("OTel metric shutdown failed: {e}");
+        }
+    }
+}
+
 impl OtelObserver {
     /// Create a new OTel observer exporting to the given OTLP endpoint.
     ///

@@ -1093,7 +1093,7 @@ async fn main() -> Result<()> {
         } => {
             let final_temperature = temperature.unwrap_or(config.default_temperature);
 
-            Box::pin(agent::run(
+            let result = Box::pin(agent::run(
                 config,
                 message,
                 provider,
@@ -1105,7 +1105,17 @@ async fn main() -> Result<()> {
                 None,
             ))
             .await
-            .map(|_| ())
+            .map(|_| ());
+
+            // Terminal drain: this one-shot/interactive CLI is about to exit, so
+            // the OTLP batch processor would otherwise drop spans it hasn't yet
+            // ticked out (a sub-second `agent -m …` exports nothing otherwise).
+            // `agent::run` has returned, so the activation span is already dropped
+            // (ended) and eligible for export. Safe here — unlike the daemon/cron
+            // (which also call agent::run), nothing emits telemetry after this.
+            observability::shutdown_telemetry();
+
+            result
         }
 
         Commands::Acp {

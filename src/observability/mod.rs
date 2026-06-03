@@ -29,6 +29,22 @@ pub use verbose::VerboseObserver;
 
 use crate::config::ObservabilityConfig;
 
+/// Terminally flush and shut down process-wide telemetry exporters on exit.
+///
+/// Intended for short-lived CLI commands (e.g. `zeroclaw agent -m …`) that
+/// finish before the OTLP batch processor's periodic tick would export their
+/// spans — without this, a sub-second run drops its whole trace. Ends, drains,
+/// and blocks via the backend shutdown. No-op unless an OTel backend was
+/// initialized.
+///
+/// MUST only be called when the process is actually exiting. Long-lived paths
+/// (daemon, gateway, cron — which also invoke `agent::run`) must NOT call this:
+/// it permanently stops the shared exporter for the rest of the process.
+pub fn shutdown_telemetry() {
+    #[cfg(feature = "observability-otel")]
+    otel::shutdown_shared_providers();
+}
+
 /// Factory: create the right observer from config
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     match config.backend.as_str() {

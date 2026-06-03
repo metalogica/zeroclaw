@@ -4555,12 +4555,14 @@ pub async fn run(
         cost_usd: None,
     });
 
-    // Flush before the CLI process exits. The OTLP batch span processor only
-    // exports on its ~5s tick, so a sub-second one-shot (`zeroclaw agent -m …`)
-    // would otherwise terminate before its activation/llm/tool spans ship —
-    // silently dropping the trace. The daemon path lives long enough to flush
-    // on its own tick; this makes the short-lived CLI run parity-correct.
-    observer.flush();
+    // NOTE: telemetry export is NOT flushed here. `run` is shared by the
+    // long-lived daemon/cron (which keep the OTLP provider alive and export on
+    // the batch tick) and the short-lived CLI. Forcing a flush here is both
+    // ineffective for the CLI (the activation span is still in scope, so the
+    // root hasn't ended and isn't in the export batch) and wrong to make
+    // terminal for the daemon. The CLI `agent` command instead calls
+    // `observability::shutdown_telemetry()` at its process-terminal call site,
+    // after this function returns and the activation span has dropped.
 
     Ok(final_output)
 }
