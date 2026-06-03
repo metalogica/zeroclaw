@@ -796,6 +796,17 @@ impl Agent {
         };
         if let Some(ts) = &tool_span {
             ts.set_status(success);
+            // Scrub before set — this engine returns the raw tool output (unlike
+            // tool_execution.rs, which scrubs upstream), so redact here.
+            let body = crate::util::truncate_with_ellipsis(
+                &crate::agent::loop_::scrub_credentials(&result),
+                16_000,
+            );
+            if success {
+                ts.set_attr("tool.output", AttrValue::Str(body));
+            } else {
+                ts.set_attr("tool.error", AttrValue::Str(body));
+            }
         }
 
         let duration = start.elapsed();

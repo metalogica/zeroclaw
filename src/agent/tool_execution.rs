@@ -122,18 +122,32 @@ pub(crate) async fn execute_one_tool(
                 success: r.success,
             });
             if r.success {
+                let output = scrub_credentials(&r.output);
+                if let Some(ts) = &tool_span {
+                    ts.set_attr(
+                        "tool.output",
+                        AttrValue::Str(truncate_with_ellipsis(&output, 16_000)),
+                    );
+                }
                 Ok(ToolExecutionOutcome {
-                    output: scrub_credentials(&r.output),
+                    output,
                     success: true,
                     error_reason: None,
                     duration,
                 })
             } else {
                 let reason = r.error.unwrap_or(r.output);
+                let scrubbed = scrub_credentials(&reason);
+                if let Some(ts) = &tool_span {
+                    ts.set_attr(
+                        "tool.error",
+                        AttrValue::Str(truncate_with_ellipsis(&scrubbed, 16_000)),
+                    );
+                }
                 Ok(ToolExecutionOutcome {
                     output: format!("Error: {reason}"),
                     success: false,
-                    error_reason: Some(scrub_credentials(&reason)),
+                    error_reason: Some(scrubbed),
                     duration,
                 })
             }
@@ -149,10 +163,17 @@ pub(crate) async fn execute_one_tool(
                 success: false,
             });
             let reason = format!("Error executing {call_name}: {e}");
+            let scrubbed = scrub_credentials(&reason);
+            if let Some(ts) = &tool_span {
+                ts.set_attr(
+                    "tool.error",
+                    AttrValue::Str(truncate_with_ellipsis(&scrubbed, 16_000)),
+                );
+            }
             Ok(ToolExecutionOutcome {
-                output: reason.clone(),
+                output: reason,
                 success: false,
-                error_reason: Some(scrub_credentials(&reason)),
+                error_reason: Some(scrubbed),
                 duration,
             })
         }
