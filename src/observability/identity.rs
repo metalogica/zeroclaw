@@ -8,6 +8,7 @@
 //! PII; see `otel::build_otlp_resource`). It also rides as the `user` field on
 //! OpenRouter chat completions (see `providers::openrouter`).
 
+use super::{AttrValue, Span};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -33,6 +34,37 @@ pub fn pod_user_id() -> Option<String> {
         .ok()
         .as_deref()
         .and_then(validate_pod_user_id)
+}
+
+/// Tag a root activation span with the pod-owner user id for per-user
+/// attribution. Sets BOTH attribution keys under one guard, so the five owner
+/// call sites stay one-liners and the dual-key contract cannot drift:
+///
+/// - `user.id` — vendor-neutral OTel semconv key (lands in the raw span
+///   attributes; what generic OTLP consumers read).
+/// - `lmnr.association.properties.user_id` — Laminar's association-property
+///   key, which self-hosted Laminar projects into its typed, indexed `user_id`
+///   column (the column that drives the UI's per-user filter). The OTel key
+///   alone never populates it. This mirrors the `deployment.environment`
+///   dual-emit precedent — self-hosted Laminar keys on its own conventions.
+///
+/// No-op when `CLAW_USER_ID` is unset/invalid, so absence yields neither key
+/// (never synthesized). Call only on user-facing roots — never CLI/cron.
+pub fn tag_user_id(span: &dyn Span) {
+    if let Some(uid) = pod_user_id() {
+        set_user_id_attrs(span, &uid);
+    }
+}
+
+/// Set both user-id attribution keys on `span`. Split out from [`tag_user_id`]
+/// so the dual-key contract is unit-testable without manipulating the
+/// process-global `CLAW_USER_ID` env var.
+fn set_user_id_attrs(span: &dyn Span, uid: &str) {
+    span.set_attr("user.id", AttrValue::Str(uid.to_string()));
+    span.set_attr(
+        "lmnr.association.properties.user_id",
+        AttrValue::Str(uid.to_string()),
+    );
 }
 
 #[cfg(test)]
@@ -73,5 +105,37 @@ mod tests {
     fn validate_pod_user_id_rejects_surrounding_whitespace() {
         assert!(validate_pod_user_id(" kd76fb7wr1pba28mavncxb8pnd84r3mn").is_none());
         assert!(validate_pod_user_id("kd76fb7wr1pba28mavncxb8pnd84r3mn\n").is_none());
+    }
+
+    /// Records every `set_attr` string call so a test can assert the dual-key
+    /// contract without a live OTel span or env manipulation.
+    struct RecordingSpan(std::sync::Mutex<Vec<(String, String)>>);
+
+    impl Span for RecordingSpan {
+        fn child(&self, _name: &str) -> Box<dyn Span> {
+            Box::new(crate::observability::NoopSpan)
+        }
+        fn set_attr(&self, key: &str, value: AttrValue) {
+            if let AttrValue::Str(s) = value {
+                self.0.lock().unwrap().push((key.to_string(), s));
+            }
+        }
+        fn set_status(&self, _ok: bool) {}
+    }
+
+    #[test]
+    fn set_user_id_attrs_sets_both_otel_and_laminar_keys() {
+        let id = "kd76fb7wr1pba28mavncxb8pnd84r3mn";
+        let span = RecordingSpan(std::sync::Mutex::new(Vec::new()));
+        set_user_id_attrs(&span, id);
+        let attrs = span.0.lock().unwrap();
+        // OTel semconv key — what generic OTLP consumers read.
+        assert!(attrs.iter().any(|(k, v)| k == "user.id" && v == id));
+        // Laminar association-property key — drives the typed `user_id` column.
+        assert!(
+            attrs
+                .iter()
+                .any(|(k, v)| k == "lmnr.association.properties.user_id" && v == id)
+        );
     }
 }

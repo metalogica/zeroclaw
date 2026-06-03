@@ -1503,9 +1503,7 @@ async fn handle_webhook(
         "channel",
         crate::observability::AttrValue::Str("webhook".into()),
     );
-    if let Some(uid) = crate::observability::pod_user_id() {
-        activation_span.set_attr("user.id", crate::observability::AttrValue::Str(uid));
-    }
+    crate::observability::tag_user_id(activation_span.as_ref());
     // Laminar replay Root input: scrubbed+truncated user message on the
     // activation root. Laminar derives root_span_input from `lmnr.span.input`
     // (its manual-override path); a bare `gen_ai.prompt` string is never read.

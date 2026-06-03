@@ -3012,9 +3012,7 @@ async fn process_channel_message(
             activation_span.set_attr("channel", AttrValue::Str(msg.channel.clone()));
             activation_span.set_attr("provider", AttrValue::Str(route.provider.clone()));
             activation_span.set_attr("model", AttrValue::Str(route.model.clone()));
-            if let Some(uid) = observability::pod_user_id() {
-                activation_span.set_attr("user.id", AttrValue::Str(uid));
-            }
+            observability::tag_user_id(activation_span.as_ref());
 
             let loop_result = tokio::select! {
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,

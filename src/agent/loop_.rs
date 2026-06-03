@@ -4895,9 +4895,7 @@ pub async fn process_message(
         .into();
     activation_span.set_attr("provider", AttrValue::Str(provider_name.to_string()));
     activation_span.set_attr("model", AttrValue::Str(model_name.to_string()));
-    if let Some(uid) = observability::pod_user_id() {
-        activation_span.set_attr("user.id", AttrValue::Str(uid));
-    }
+    observability::tag_user_id(activation_span.as_ref());
     // Laminar replay Root input: scrubbed+truncated user message on the
     // activation root. Laminar derives root_span_input from `lmnr.span.input`
     // (its manual-override path); a bare `gen_ai.prompt` string is never read.

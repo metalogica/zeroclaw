@@ -17,7 +17,7 @@ pub use self::log::LogObserver;
 #[allow(unused_imports)]
 pub use self::multi::MultiObserver;
 pub use active::{current_span, scope_span};
-pub use identity::pod_user_id;
+pub use identity::{pod_user_id, tag_user_id};
 pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
