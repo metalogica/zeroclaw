@@ -953,6 +953,9 @@ impl Agent {
 
         let effective_model = self.classify_model(user_message);
 
+        // Message count fed to the previous `llm.call`, so each iteration can
+        // emit just the newly appended context (the delta) as that call's input.
+        let mut prev_msg_count: usize = 0;
         for iteration in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
 
@@ -1002,8 +1005,9 @@ impl Agent {
                     "gen_ai.request.model",
                     AttrValue::Str(effective_model.clone()),
                 );
-                // Root input (Laminar replay): scrubbed+truncated final user
-                // message, once per activation (first llm.call only).
+                // Input every llm.call. Iteration 0: the user's question. Later
+                // iterations: the delta — context appended since the previous
+                // call — so every call in a multi-call turn shows what prompted it.
                 if iteration == 0 {
                     // Scrub+truncate once; Laminar renders its message view +
                     // full-text search from `lmnr.span.input`, never `gen_ai.*`.
@@ -1013,8 +1017,16 @@ impl Agent {
                     );
                     sp.set_attr("gen_ai.prompt", AttrValue::Str(input.clone()));
                     sp.set_attr("lmnr.span.input", AttrValue::Str(input));
+                } else if let Some(input) =
+                    crate::agent::loop_::llm_call_input_delta(&messages, prev_msg_count)
+                {
+                    sp.set_attr("gen_ai.prompt", AttrValue::Str(input.clone()));
+                    sp.set_attr("lmnr.span.input", AttrValue::Str(input));
                 }
             }
+            // Track the message count fed to this call so the next iteration
+            // emits only the delta (correct even when tracing is disabled).
+            prev_msg_count = messages.len();
             let response = match self
                 .provider
                 .chat(
@@ -1047,14 +1059,15 @@ impl Agent {
                         AttrValue::Str(crate::util::truncate_with_ellipsis(reasoning, 16_000)),
                     );
                 }
-                // Root output (Laminar replay): scrubbed+truncated response text.
+                // Output every llm.call. Text responses use the assistant text;
+                // tool-call-only responses (most intermediate calls) fall back to
+                // a summary of the decided calls so the call's action is captured.
                 // Mirror onto `lmnr.span.output` so the llm.call renders in
                 // Laminar's message view (gen_ai.completion is never read there).
-                if let Some(text) = response.text.as_deref() {
-                    let output = crate::util::truncate_with_ellipsis(
-                        &crate::agent::loop_::scrub_credentials(text),
-                        16_000,
-                    );
+                if let Some(output) = crate::agent::loop_::llm_call_output_summary(
+                    response.text.as_deref(),
+                    &response.tool_calls,
+                ) {
                     sp.set_attr("gen_ai.completion", AttrValue::Str(output.clone()));
                     sp.set_attr("lmnr.span.output", AttrValue::Str(output));
                 }
@@ -1178,6 +1191,9 @@ impl Agent {
         let effective_model = self.classify_model(user_message);
 
         // ── Turn loop ──────────────────────────────────────────────────
+        // Message count fed to the previous `llm.call`, so each iteration can
+        // emit just the newly appended context (the delta) as that call's input.
+        let mut prev_msg_count: usize = 0;
         for iteration in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
 
@@ -1227,8 +1243,9 @@ impl Agent {
                     "gen_ai.request.model",
                     AttrValue::Str(effective_model.clone()),
                 );
-                // Root input (Laminar replay): scrubbed+truncated final user
-                // message, once per activation (first llm.call only).
+                // Input every llm.call. Iteration 0: the user's question. Later
+                // iterations: the delta — context appended since the previous
+                // call — so every call in a multi-call turn shows what prompted it.
                 if iteration == 0 {
                     // Scrub+truncate once; Laminar renders its message view +
                     // full-text search from `lmnr.span.input`, never `gen_ai.*`.
@@ -1238,8 +1255,16 @@ impl Agent {
                     );
                     sp.set_attr("gen_ai.prompt", AttrValue::Str(input.clone()));
                     sp.set_attr("lmnr.span.input", AttrValue::Str(input));
+                } else if let Some(input) =
+                    crate::agent::loop_::llm_call_input_delta(&messages, prev_msg_count)
+                {
+                    sp.set_attr("gen_ai.prompt", AttrValue::Str(input.clone()));
+                    sp.set_attr("lmnr.span.input", AttrValue::Str(input));
                 }
             }
+            // Track the message count fed to this call so the next iteration
+            // emits only the delta (correct even when tracing is disabled).
+            prev_msg_count = messages.len();
 
             // ── Streaming LLM call ────────────────────────────────────
             // Try streaming first; if the provider returns content we
@@ -1368,14 +1393,15 @@ impl Agent {
                         AttrValue::Str(crate::util::truncate_with_ellipsis(reasoning, 16_000)),
                     );
                 }
-                // Root output (Laminar replay): scrubbed+truncated response text.
+                // Output every llm.call. Text responses use the assistant text;
+                // tool-call-only responses (most intermediate calls) fall back to
+                // a summary of the decided calls so the call's action is captured.
                 // Mirror onto `lmnr.span.output` so the llm.call renders in
                 // Laminar's message view (gen_ai.completion is never read there).
-                if let Some(text) = response.text.as_deref() {
-                    let output = crate::util::truncate_with_ellipsis(
-                        &crate::agent::loop_::scrub_credentials(text),
-                        16_000,
-                    );
+                if let Some(output) = crate::agent::loop_::llm_call_output_summary(
+                    response.text.as_deref(),
+                    &response.tool_calls,
+                ) {
                     sp.set_attr("gen_ai.completion", AttrValue::Str(output.clone()));
                     sp.set_attr("lmnr.span.output", AttrValue::Str(output));
                 }

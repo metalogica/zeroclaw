@@ -259,6 +259,66 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
+/// Build the `llm.call` input value for an *intermediate* call (iteration > 0).
+///
+/// Returns the **delta** — the messages appended to the provider message list
+/// since the previous `llm.call` (`messages[prev_count..]`), serialized as
+/// `role: content` lines, scrubbed + truncated to 16k. This answers "what
+/// prompted THIS call" (typically tool results / freshly appended context)
+/// without re-emitting the whole growing history on every iteration — the delta
+/// is the payload cost knob. Returns `None` when there is no new context (so the
+/// caller leaves the attribute unset rather than writing an empty string).
+///
+/// Shared across all multi-call engines (`loop_`, `agent.turn`,
+/// `agent.turn_streamed`) so the representation cannot drift between them.
+pub(crate) fn llm_call_input_delta(
+    messages: &[crate::providers::ChatMessage],
+    prev_count: usize,
+) -> Option<String> {
+    let delta = messages.get(prev_count..)?;
+    if delta.is_empty() {
+        return None;
+    }
+    let joined = delta
+        .iter()
+        .map(|m| format!("{}: {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if joined.is_empty() {
+        return None;
+    }
+    Some(truncate_with_ellipsis(&scrub_credentials(&joined), 16_000))
+}
+
+/// Build the `llm.call` output value, covering tool-call-only responses.
+///
+/// If the response carried assistant `text`, that (scrubbed + truncated 16k) is
+/// the output. Otherwise — the common intermediate case where the model emitted
+/// *only* tool calls and no text — summarize the decided calls as `name(args)`
+/// lines so the call's action is still captured (reasoning stays in
+/// `gen_ai.reasoning`). Returns `None` only when there is neither text nor any
+/// tool call.
+///
+/// Shared across all multi-call engines so `gen_ai.completion` /
+/// `lmnr.span.output` stay consistent.
+pub(crate) fn llm_call_output_summary(
+    text: Option<&str>,
+    tool_calls: &[crate::providers::traits::ToolCall],
+) -> Option<String> {
+    if let Some(t) = text.filter(|t| !t.is_empty()) {
+        return Some(truncate_with_ellipsis(&scrub_credentials(t), 16_000));
+    }
+    if tool_calls.is_empty() {
+        return None;
+    }
+    let summary = tool_calls
+        .iter()
+        .map(|tc| format!("{}({})", tc.name, tc.arguments))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(truncate_with_ellipsis(&scrub_credentials(&summary), 16_000))
+}
+
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
@@ -2336,6 +2396,9 @@ pub(crate) async fn run_tool_call_loop(
         },
     );
 
+    // Message count fed to the previous `llm.call`, so each iteration can emit
+    // just the newly appended context (the delta) as that call's input.
+    let mut prev_msg_count: usize = 0;
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
@@ -2564,9 +2627,10 @@ pub(crate) async fn run_tool_call_loop(
                 "gen_ai.request.model",
                 AttrValue::Str(active_model.to_string()),
             );
-            // Root input (Laminar replay): scrubbed+truncated final user message,
-            // once per activation (first llm.call only — later iterations carry
-            // tool results, not the user's question).
+            // Input every llm.call. Iteration 0: the user's question (final user
+            // message). Later iterations: the delta — context appended since the
+            // previous call (tool results / new messages) — so every call in a
+            // multi-call turn shows what prompted it, not just the first.
             if iteration == 0 {
                 if let Some(prompt) = prepared_messages
                     .messages
@@ -2576,13 +2640,21 @@ pub(crate) async fn run_tool_call_loop(
                 {
                     // Scrub+truncate once; Laminar renders its message view +
                     // full-text search from `lmnr.span.input`, never `gen_ai.*`.
-                    let input =
-                        truncate_with_ellipsis(&scrub_credentials(&prompt.content), 16_000);
+                    let input = truncate_with_ellipsis(&scrub_credentials(&prompt.content), 16_000);
                     sp.set_attr("gen_ai.prompt", AttrValue::Str(input.clone()));
                     sp.set_attr("lmnr.span.input", AttrValue::Str(input));
                 }
+            } else if let Some(input) =
+                llm_call_input_delta(&prepared_messages.messages, prev_msg_count)
+            {
+                sp.set_attr("gen_ai.prompt", AttrValue::Str(input.clone()));
+                sp.set_attr("lmnr.span.input", AttrValue::Str(input));
             }
         }
+        // Track the message count fed to this call so the next iteration emits
+        // only the delta. Updated outside the span guard so it stays correct
+        // when tracing is disabled.
+        prev_msg_count = prepared_messages.messages.len();
 
         let chat_result = if should_consume_provider_stream {
             match consume_provider_streaming_response(
@@ -2713,11 +2785,14 @@ pub(crate) async fn run_tool_call_loop(
                         AttrValue::Str(truncate_with_ellipsis(reasoning, 16_000)),
                     );
                 }
-                // Root output (Laminar replay): scrubbed+truncated response text.
+                // Output every llm.call. Text responses use the assistant text;
+                // tool-call-only responses (most intermediate calls) fall back to
+                // a summary of the decided calls so the call's action is captured.
                 // Mirror onto `lmnr.span.output` so the llm.call renders in
                 // Laminar's message view (gen_ai.completion is never read there).
-                if let Some(text) = resp.text.as_deref() {
-                    let output = truncate_with_ellipsis(&scrub_credentials(text), 16_000);
+                if let Some(output) =
+                    llm_call_output_summary(resp.text.as_deref(), &resp.tool_calls)
+                {
                     sp.set_attr("gen_ai.completion", AttrValue::Str(output.clone()));
                     sp.set_attr("lmnr.span.output", AttrValue::Str(output));
                 }
