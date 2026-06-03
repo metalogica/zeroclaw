@@ -16,6 +16,10 @@
 #   CLAW_CONTAINER     running container to swap into   (default: clawcraft-claw)
 #   ZEROCLAW_FEATURES  cargo features to compile        (default: match the prod image)
 #   NO_RESTART=1       cp the binary but skip restart   (you restart yourself)
+#   NO_BAKE=1          skip baking the binary into the image (fast inner loop).
+#                      With baking ON (the default) the swap also survives a
+#                      'compose up' recreate; with NO_BAKE=1 a recreate reverts
+#                      to the stale image binary.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -85,10 +89,58 @@ else
     bold "✓ hot-swap live in '$CONTAINER'."
 fi
 
+# 5. Bake the freshly built binary INTO the image the container was created from.
+#    The cp+restart above only patches the live container — a 'compose up' recreate
+#    rebuilds the container from the IMAGE and silently reverts to the stale baked
+#    binary. Baking the binary into that image tag closes the gap. Default-on:
+#    correctness beats the ~1s cached overlay build; NO_BAKE=1 opts out.
+#
+#    NOTE (prod, out of scope here): this fixes the LOCAL dev image only. The
+#    prod/GKE image (…/clawcraft-images/clawcraft-claw-runtime:latest) is a
+#    separately published artifact and still needs a real upstream build+publish
+#    of a post-21:23 (single-exporting-observer-fix) zeroclaw. TODO: do that build.
+TAG="$(docker inspect -f '{{.Config.Image}}' "$CONTAINER")"
+if [ "${NO_BAKE:-0}" = "1" ]; then
+    bold "▶ bake skipped (NO_BAKE=1) — a 'compose up' recreate will revert '$TAG' to its baked-in binary"
+else
+    bold "▶ baking binary into image '$TAG' (survives 'compose up' recreate)…"
+
+    # Avoid stacking a fresh layer on an already-baked image every run: FROM the
+    # ORIGINAL base, pinned under a stable local tag the first time we bake. On
+    # re-runs we build FROM that pinned tag, so a single bake layer replaces the
+    # last one instead of accreting. (We pin via a tag, not a bare image ID —
+    # BuildKit parses `FROM <sha256-id>` as a registry ref and tries to pull it.)
+    #
+    # To re-pin after pulling a fresh upstream image (e.g. a real post-fix build):
+    #   docker rmi "$BASE_TAG"; docker tag catonmat/zeroclaw:<tag> "$TAG"; rerun.
+    BASE_TAG="${TAG%:*}:hotswap-base"
+    if docker image inspect "$BASE_TAG" >/dev/null 2>&1; then
+        bold "  re-bake — FROM pinned base '$BASE_TAG' (no layer accretion)"
+    else
+        docker tag "$TAG" "$BASE_TAG"
+        bold "  first bake — pinned original base as '$BASE_TAG' (future runs FROM it)"
+    fi
+
+    # The image runs as nonroot 65534, so we switch to root for the chmod and back.
+    cat > "$OUT_DIR/Dockerfile.bake" <<DOCKERFILE
+FROM $BASE_TAG
+USER 0
+COPY zeroclaw /usr/local/bin/zeroclaw
+RUN chmod 0755 /usr/local/bin/zeroclaw
+USER 65534:65534
+DOCKERFILE
+
+    docker build -f "$OUT_DIR/Dockerfile.bake" -t "$TAG" "$OUT_DIR" >/dev/null
+    bold "✓ baked into '$TAG' — a later 'compose up' recreate now carries your binary"
+fi
+
 cat <<EOF
 
   Next:
     • drive a WS turn, then:  docker logs --since 2m $CONTAINER 2>&1 | grep ws-activation-probe
-    • the swap persists across 'docker restart' but NOT 'compose up --force-recreate'
-      (that recreates from the image) — rerun this script after a recreate.
+    • the swap persists across 'docker restart' AND (with baking on, the default)
+      a 'compose up' recreate — the binary is baked into '$TAG'.
+      With NO_BAKE=1 it survives only 'docker restart'; a recreate reverts.
+    • verify a recreate kept your binary (distinguishing marker of the good build):
+        docker exec $CONTAINER sh -c 'grep -ac lmnr.span.input /usr/local/bin/zeroclaw'   # > 0
 EOF
