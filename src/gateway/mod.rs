@@ -1317,13 +1317,20 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
             "gen_ai.request.model",
             crate::observability::AttrValue::Str(state.model.clone()),
         );
-        // Root input (Laminar replay): scrubbed+truncated user message.
+        // Root input (Laminar replay): scrubbed+truncated user message. Scrub
+        // once; Laminar renders its message view from `lmnr.span.input`, never
+        // `gen_ai.*`.
+        let input = crate::util::truncate_with_ellipsis(
+            &crate::agent::loop_::scrub_credentials(message),
+            16_000,
+        );
         sp.set_attr(
             "gen_ai.prompt",
-            crate::observability::AttrValue::Str(crate::util::truncate_with_ellipsis(
-                &crate::agent::loop_::scrub_credentials(message),
-                16_000,
-            )),
+            crate::observability::AttrValue::Str(input.clone()),
+        );
+        sp.set_attr(
+            "lmnr.span.input",
+            crate::observability::AttrValue::Str(input),
         );
     }
     let result = state
@@ -1333,13 +1340,20 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
     if let Some(sp) = &llm_span {
         sp.set_status(result.is_ok());
         // Root output (Laminar replay): scrubbed+truncated response text.
+        // Mirror onto `lmnr.span.output` so the llm.call renders in Laminar's
+        // message view (gen_ai.completion is never read there).
         if let Ok(text) = &result {
+            let output = crate::util::truncate_with_ellipsis(
+                &crate::agent::loop_::scrub_credentials(text),
+                16_000,
+            );
             sp.set_attr(
                 "gen_ai.completion",
-                crate::observability::AttrValue::Str(crate::util::truncate_with_ellipsis(
-                    &crate::agent::loop_::scrub_credentials(text),
-                    16_000,
-                )),
+                crate::observability::AttrValue::Str(output.clone()),
+            );
+            sp.set_attr(
+                "lmnr.span.output",
+                crate::observability::AttrValue::Str(output),
             );
         }
     }

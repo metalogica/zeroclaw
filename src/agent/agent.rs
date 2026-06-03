@@ -995,13 +995,14 @@ impl Agent {
                 // Root input (Laminar replay): scrubbed+truncated final user
                 // message, once per activation (first llm.call only).
                 if iteration == 0 {
-                    sp.set_attr(
-                        "gen_ai.prompt",
-                        AttrValue::Str(crate::util::truncate_with_ellipsis(
-                            &crate::agent::loop_::scrub_credentials(user_message),
-                            16_000,
-                        )),
+                    // Scrub+truncate once; Laminar renders its message view +
+                    // full-text search from `lmnr.span.input`, never `gen_ai.*`.
+                    let input = crate::util::truncate_with_ellipsis(
+                        &crate::agent::loop_::scrub_credentials(user_message),
+                        16_000,
                     );
+                    sp.set_attr("gen_ai.prompt", AttrValue::Str(input.clone()));
+                    sp.set_attr("lmnr.span.input", AttrValue::Str(input));
                 }
             }
             let response = match self
@@ -1037,14 +1038,15 @@ impl Agent {
                     );
                 }
                 // Root output (Laminar replay): scrubbed+truncated response text.
+                // Mirror onto `lmnr.span.output` so the llm.call renders in
+                // Laminar's message view (gen_ai.completion is never read there).
                 if let Some(text) = response.text.as_deref() {
-                    sp.set_attr(
-                        "gen_ai.completion",
-                        AttrValue::Str(crate::util::truncate_with_ellipsis(
-                            &crate::agent::loop_::scrub_credentials(text),
-                            16_000,
-                        )),
+                    let output = crate::util::truncate_with_ellipsis(
+                        &crate::agent::loop_::scrub_credentials(text),
+                        16_000,
                     );
+                    sp.set_attr("gen_ai.completion", AttrValue::Str(output.clone()));
+                    sp.set_attr("lmnr.span.output", AttrValue::Str(output));
                 }
             }
             drop(llm_span);
@@ -1218,13 +1220,14 @@ impl Agent {
                 // Root input (Laminar replay): scrubbed+truncated final user
                 // message, once per activation (first llm.call only).
                 if iteration == 0 {
-                    sp.set_attr(
-                        "gen_ai.prompt",
-                        AttrValue::Str(crate::util::truncate_with_ellipsis(
-                            &crate::agent::loop_::scrub_credentials(user_message),
-                            16_000,
-                        )),
+                    // Scrub+truncate once; Laminar renders its message view +
+                    // full-text search from `lmnr.span.input`, never `gen_ai.*`.
+                    let input = crate::util::truncate_with_ellipsis(
+                        &crate::agent::loop_::scrub_credentials(user_message),
+                        16_000,
                     );
+                    sp.set_attr("gen_ai.prompt", AttrValue::Str(input.clone()));
+                    sp.set_attr("lmnr.span.input", AttrValue::Str(input));
                 }
             }
 
@@ -1356,14 +1359,15 @@ impl Agent {
                     );
                 }
                 // Root output (Laminar replay): scrubbed+truncated response text.
+                // Mirror onto `lmnr.span.output` so the llm.call renders in
+                // Laminar's message view (gen_ai.completion is never read there).
                 if let Some(text) = response.text.as_deref() {
-                    sp.set_attr(
-                        "gen_ai.completion",
-                        AttrValue::Str(crate::util::truncate_with_ellipsis(
-                            &crate::agent::loop_::scrub_credentials(text),
-                            16_000,
-                        )),
+                    let output = crate::util::truncate_with_ellipsis(
+                        &crate::agent::loop_::scrub_credentials(text),
+                        16_000,
                     );
+                    sp.set_attr("gen_ai.completion", AttrValue::Str(output.clone()));
+                    sp.set_attr("lmnr.span.output", AttrValue::Str(output));
                 }
             }
             drop(llm_span);

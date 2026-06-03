@@ -2574,13 +2574,12 @@ pub(crate) async fn run_tool_call_loop(
                     .rev()
                     .find(|m| m.role == "user")
                 {
-                    sp.set_attr(
-                        "gen_ai.prompt",
-                        AttrValue::Str(truncate_with_ellipsis(
-                            &scrub_credentials(&prompt.content),
-                            16_000,
-                        )),
-                    );
+                    // Scrub+truncate once; Laminar renders its message view +
+                    // full-text search from `lmnr.span.input`, never `gen_ai.*`.
+                    let input =
+                        truncate_with_ellipsis(&scrub_credentials(&prompt.content), 16_000);
+                    sp.set_attr("gen_ai.prompt", AttrValue::Str(input.clone()));
+                    sp.set_attr("lmnr.span.input", AttrValue::Str(input));
                 }
             }
         }
@@ -2715,11 +2714,12 @@ pub(crate) async fn run_tool_call_loop(
                     );
                 }
                 // Root output (Laminar replay): scrubbed+truncated response text.
+                // Mirror onto `lmnr.span.output` so the llm.call renders in
+                // Laminar's message view (gen_ai.completion is never read there).
                 if let Some(text) = resp.text.as_deref() {
-                    sp.set_attr(
-                        "gen_ai.completion",
-                        AttrValue::Str(truncate_with_ellipsis(&scrub_credentials(text), 16_000)),
-                    );
+                    let output = truncate_with_ellipsis(&scrub_credentials(text), 16_000);
+                    sp.set_attr("gen_ai.completion", AttrValue::Str(output.clone()));
+                    sp.set_attr("lmnr.span.output", AttrValue::Str(output));
                 }
                 if let Some(usage) = resp.usage.as_ref() {
                     if let Some(it) = usage.input_tokens {
