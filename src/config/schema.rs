@@ -5380,6 +5380,13 @@ pub struct ObservabilityConfig {
     #[serde(default)]
     pub otel_headers: Option<String>,
 
+    /// Deployment environment reported as the `deployment.environment` OTLP
+    /// resource attribute (e.g. "dev", "staging", "prod"). Only used when
+    /// backend = "otel". `None` omits the attribute (unchanged behavior). This
+    /// is a resource-level tag only — never carries credentials or PII.
+    #[serde(default)]
+    pub otel_deployment_environment: Option<String>,
+
     /// Runtime trace storage mode: "none" | "rolling" | "full".
     /// Controls whether model replies and tool-call diagnostics are persisted.
     #[serde(default = "default_runtime_trace_mode")]
@@ -5401,6 +5408,7 @@ impl Default for ObservabilityConfig {
             otel_endpoint: None,
             otel_service_name: None,
             otel_headers: None,
+            otel_deployment_environment: None,
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),

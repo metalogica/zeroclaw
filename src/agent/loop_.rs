@@ -2005,6 +2005,11 @@ struct StreamedChatOutcome {
     response_text: String,
     tool_calls: Vec<ToolCall>,
     forwarded_live_deltas: bool,
+    /// Accumulated reasoning/thinking deltas. Streaming chunks carry reasoning
+    /// with an empty `delta`, so it would otherwise be dropped by the
+    /// text-accumulation path; captured here so the synthetic `ChatResponse`
+    /// can surface it on the `llm.call` span (`gen_ai.reasoning`).
+    reasoning: String,
 }
 
 async fn consume_provider_streaming_response(
@@ -2063,6 +2068,12 @@ async fn consume_provider_streaming_response(
                 // do not affect the agent's tool dispatch loop.
             }
             StreamEvent::TextDelta(chunk) => {
+                if let Some(reasoning) = chunk.reasoning.as_deref() {
+                    if !reasoning.is_empty() {
+                        outcome.reasoning.push_str(reasoning);
+                    }
+                }
+
                 if chunk.delta.is_empty() {
                     continue;
                 }
@@ -2569,11 +2580,16 @@ pub(crate) async fn run_tool_call_loop(
             {
                 Ok(streamed) => {
                     streamed_live_deltas = streamed.forwarded_live_deltas;
+                    let reasoning_content = if streamed.reasoning.is_empty() {
+                        None
+                    } else {
+                        Some(streamed.reasoning)
+                    };
                     Ok(crate::providers::ChatResponse {
                         text: Some(streamed.response_text),
                         tool_calls: streamed.tool_calls,
                         usage: None,
-                        reasoning_content: None,
+                        reasoning_content,
                     })
                 }
                 Err(stream_err) => {
@@ -4839,8 +4855,9 @@ pub async fn process_message(
         excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
     }
 
-    let activation_span: Arc<dyn Span> =
-        observer.start_activation(Trigger::Channel, session_id).into();
+    let activation_span: Arc<dyn Span> = observer
+        .start_activation(Trigger::Channel, session_id)
+        .into();
     activation_span.set_attr("provider", AttrValue::Str(provider_name.to_string()));
     activation_span.set_attr("model", AttrValue::Str(model_name.to_string()));
 
@@ -5485,6 +5502,12 @@ mod tests {
     enum NativeStreamTurn {
         ToolCall(ToolCall),
         Text(String),
+        /// A reasoning delta (empty text `delta`) followed by a content delta,
+        /// mirroring how OpenRouter interleaves thinking + answer on the stream.
+        TextWithReasoning {
+            reasoning: String,
+            text: String,
+        },
     }
 
     struct StreamingNativeToolEventProvider {
@@ -5580,8 +5603,45 @@ mod tests {
                     Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
                     Ok(StreamEvent::Final),
                 ])),
+                NativeStreamTurn::TextWithReasoning { reasoning, text } => {
+                    Box::pin(futures_util::stream::iter(vec![
+                        Ok(StreamEvent::TextDelta(StreamChunk::reasoning(reasoning))),
+                        Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
+                        Ok(StreamEvent::Final),
+                    ]))
+                }
             }
         }
+    }
+
+    /// W1a regression: streaming reasoning deltas (which arrive with an empty
+    /// text `delta`) must be accumulated and surfaced on the synthetic
+    /// `ChatResponse` so the `llm.call` span can record `gen_ai.reasoning`.
+    /// Before the fix the reasoning chunk was dropped by the `delta.is_empty()`
+    /// early-continue and never reached a span.
+    #[tokio::test]
+    async fn streaming_outcome_captures_reasoning_deltas() {
+        let provider = StreamingNativeToolEventProvider::with_turns(vec![
+            NativeStreamTurn::TextWithReasoning {
+                reasoning: "weighing the options".to_string(),
+                text: "final answer".to_string(),
+            },
+        ]);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[],
+            None,
+            "test-model",
+            0.0,
+            None,
+            None,
+        )
+        .await
+        .expect("streaming consumption should succeed");
+
+        assert_eq!(outcome.reasoning, "weighing the options");
+        assert_eq!(outcome.response_text, "final answer");
     }
 
     struct RouteAwareStreamingProvider {

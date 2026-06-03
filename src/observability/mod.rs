@@ -51,6 +51,7 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
                 config.otel_endpoint.as_deref(),
                 config.otel_service_name.as_deref(),
                 config.otel_headers.as_deref(),
+                config.otel_deployment_environment.as_deref(),
             ) {
                 Ok(obs) => {
                     // Per-component detail at debug; the once-per-process

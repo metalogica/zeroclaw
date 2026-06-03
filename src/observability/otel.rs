@@ -63,6 +63,24 @@ fn parse_otlp_headers(raw: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// Build the OTLP `Resource` shared by the trace and metric providers.
+///
+/// Carries `service.name` always and `deployment.environment` when configured.
+/// Kept deliberately minimal — resource attributes are process-global and must
+/// never carry credentials or PII (`user.id` and request content ride on spans,
+/// not the resource).
+fn build_otlp_resource(
+    service_name: &str,
+    environment: Option<&str>,
+) -> opentelemetry_sdk::Resource {
+    let mut builder =
+        opentelemetry_sdk::Resource::builder().with_service_name(service_name.to_string());
+    if let Some(env) = environment.filter(|e| !e.is_empty()) {
+        builder = builder.with_attribute(KeyValue::new("deployment.environment", env.to_string()));
+    }
+    builder.build()
+}
+
 impl OtelObserver {
     /// Create a new OTel observer exporting to the given OTLP endpoint.
     ///
@@ -73,10 +91,14 @@ impl OtelObserver {
     /// (`key=value,key=value`), applied to both the trace and metric exporters.
     /// Pass `None` to export without headers. Used for collectors that gate
     /// ingest on an auth header (e.g. `authorization=Bearer <token>`).
+    ///
+    /// `environment` is reported as the `deployment.environment` resource
+    /// attribute (e.g. "dev", "prod"); `None` omits it (unchanged behavior).
     pub fn new(
         endpoint: Option<&str>,
         service_name: Option<&str>,
         headers: Option<&str>,
+        environment: Option<&str>,
     ) -> Result<Self, String> {
         let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
         let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
@@ -105,11 +127,7 @@ impl OtelObserver {
 
                 let tracer_provider = SdkTracerProvider::builder()
                     .with_batch_exporter(span_exporter)
-                    .with_resource(
-                        opentelemetry_sdk::Resource::builder()
-                            .with_service_name(service_name.to_string())
-                            .build(),
-                    )
+                    .with_resource(build_otlp_resource(service_name, environment))
                     .build();
 
                 // ── Metric exporter ─────────────────────────────
@@ -128,11 +146,7 @@ impl OtelObserver {
 
                 let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
                     .with_reader(metric_reader)
-                    .with_resource(
-                        opentelemetry_sdk::Resource::builder()
-                            .with_service_name(service_name.to_string())
-                            .build(),
-                    )
+                    .with_resource(build_otlp_resource(service_name, environment))
                     .build();
 
                 global::set_tracer_provider(tracer_provider.clone());
@@ -140,6 +154,7 @@ impl OtelObserver {
                 tracing::info!(
                     endpoint = %base_endpoint,
                     service_name,
+                    environment = environment.unwrap_or("<unset>"),
                     "OpenTelemetry OTLP exporter initialized"
                 );
 
@@ -530,7 +545,35 @@ impl Drop for OtelSpan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::Key;
     use std::time::Duration;
+
+    #[test]
+    fn resource_includes_deployment_environment_when_set() {
+        let resource = build_otlp_resource("zeroclaw-test", Some("prod"));
+        assert_eq!(
+            resource.get(&Key::from_static_str("deployment.environment")),
+            Some(Value::from("prod")),
+            "deployment.environment must be present when configured"
+        );
+        assert_eq!(
+            resource.get(&Key::from_static_str("service.name")),
+            Some(Value::from("zeroclaw-test")),
+            "service.name must always be present"
+        );
+    }
+
+    #[test]
+    fn resource_omits_deployment_environment_when_unset_or_empty() {
+        for env in [None, Some("")] {
+            let resource = build_otlp_resource("zeroclaw-test", env);
+            assert_eq!(
+                resource.get(&Key::from_static_str("deployment.environment")),
+                None,
+                "deployment.environment must be omitted for {env:?} (resource stays minimal)"
+            );
+        }
+    }
 
     // Note: OtelObserver::new() requires an OTLP endpoint.
     // In tests we verify the struct creation fails gracefully
@@ -541,8 +584,13 @@ mod tests {
     fn test_observer() -> OtelObserver {
         // Create with a dummy endpoint — exports will silently fail
         // but the observer itself works fine for recording
-        OtelObserver::new(Some("http://127.0.0.1:19999"), Some("zeroclaw-test"), None)
-            .expect("observer creation should not fail with valid endpoint format")
+        OtelObserver::new(
+            Some("http://127.0.0.1:19999"),
+            Some("zeroclaw-test"),
+            None,
+            None,
+        )
+        .expect("observer creation should not fail with valid endpoint format")
     }
 
     #[test]
@@ -738,6 +786,7 @@ mod tests {
             Some("http://127.0.0.1:12345"),
             Some("zeroclaw-test"),
             Some("authorization=Bearer test-token"),
+            None,
         );
         assert!(
             result.is_ok(),
@@ -748,7 +797,12 @@ mod tests {
     #[test]
     fn otel_observer_creation_with_valid_endpoint_succeeds() {
         // Even though endpoint is unreachable, creation should succeed
-        let result = OtelObserver::new(Some("http://127.0.0.1:12345"), Some("zeroclaw-test"), None);
+        let result = OtelObserver::new(
+            Some("http://127.0.0.1:12345"),
+            Some("zeroclaw-test"),
+            None,
+            None,
+        );
         assert!(
             result.is_ok(),
             "observer creation must succeed even with unreachable endpoint"

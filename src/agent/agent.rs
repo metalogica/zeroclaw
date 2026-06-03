@@ -6,7 +6,9 @@ use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
 use crate::i18n::ToolDescriptions;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::observability::{self, AttrValue, Observer, ObserverEvent, Span, current_span, scope_span};
+use crate::observability::{
+    self, AttrValue, Observer, ObserverEvent, Span, current_span, scope_span,
+};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
@@ -715,7 +717,8 @@ impl Agent {
 
         // Open a tool.call span and make it the ambient parent while the tool runs, so any
         // nested agent work (e.g. the delegate tool's sub-loop) parents beneath it.
-        let tool_span: Option<Arc<dyn Span>> = current_span().map(|s| Arc::from(s.child("tool.call")));
+        let tool_span: Option<Arc<dyn Span>> =
+            current_span().map(|s| Arc::from(s.child("tool.call")));
         if let Some(ts) = &tool_span {
             ts.set_attr("tool.name", AttrValue::Str(tool_name.clone()));
             // Composio is a single tool; differentiate by toolkit/action from the args.
@@ -1203,6 +1206,7 @@ impl Agent {
             );
 
             let mut streamed_text = String::new();
+            let mut streamed_reasoning = String::new();
             let mut streamed_tool_calls: Vec<crate::providers::traits::ToolCall> = Vec::new();
             let mut got_stream = false;
 
@@ -1212,6 +1216,7 @@ impl Agent {
                         crate::providers::traits::StreamEvent::TextDelta(chunk) => {
                             if let Some(reasoning) = chunk.reasoning {
                                 if !reasoning.is_empty() {
+                                    streamed_reasoning.push_str(&reasoning);
                                     let _ = event_tx
                                         .send(TurnEvent::Thinking { delta: reasoning })
                                         .await;
@@ -1263,12 +1268,18 @@ impl Agent {
             // If streaming produced text, use it as the response and
             // check for tool calls via the dispatcher.
             let response = if got_stream {
-                // Build a synthetic ChatResponse from streamed text
+                // Build a synthetic ChatResponse from streamed text. Reasoning
+                // deltas accumulated above are surfaced here so the `llm.call`
+                // span captures `gen_ai.reasoning` on the streaming path too.
                 crate::providers::ChatResponse {
                     text: Some(streamed_text),
                     tool_calls: streamed_tool_calls,
                     usage: None,
-                    reasoning_content: None,
+                    reasoning_content: if streamed_reasoning.is_empty() {
+                        None
+                    } else {
+                        Some(streamed_reasoning)
+                    },
                 }
             } else {
                 // Fall back to non-streaming chat
