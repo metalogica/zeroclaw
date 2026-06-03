@@ -206,6 +206,15 @@ pub trait Span: Send + Sync {
 
     /// Mark the span's terminal status (`true` = ok, `false` = error).
     fn set_status(&self, ok: bool);
+
+    /// Record a span event (an OTel span event) with point-in-time attributes.
+    ///
+    /// Unlike [`set_attr`](Span::set_attr) (one current value per key), an event is a
+    /// timestamped record — the reliability layer emits one per retry attempt, provider
+    /// fallback, and exhausted-exception so they survive in the trace instead of
+    /// collapsing to the final attempt. Defaults to a no-op so non-tracing observers
+    /// (log, prometheus, noop) and [`NoopSpan`] stay zero-behavior with no code change.
+    fn add_event(&self, _name: &str, _attrs: &[(&str, AttrValue)]) {}
 }
 
 /// A [`Span`] that records nothing.
@@ -351,6 +360,55 @@ mod tests {
 
         assert!(matches!(cloned_event, ObserverEvent::ToolCall { .. }));
         assert!(matches!(cloned_metric, ObserverMetric::RequestLatency(_)));
+    }
+
+    #[test]
+    fn noop_span_add_event_is_silent() {
+        // The default trait method is a no-op; NoopSpan inherits it (no override)
+        // so non-tracing observers stay zero-behavior. Must not panic.
+        let span = NoopSpan;
+        span.add_event(
+            "retry-attempt",
+            &[
+                ("attempt", AttrValue::Int(1)),
+                ("retryable", AttrValue::Bool(true)),
+            ],
+        );
+    }
+
+    #[test]
+    fn span_add_event_can_be_overridden_and_records() {
+        // A recording Span proves the trait method is dispatchable and overridable
+        // through `&dyn Span` — mirrors how OtelSpan forwards events to its OTel span.
+        #[derive(Default)]
+        struct RecordingSpan {
+            events: Mutex<Vec<String>>,
+        }
+        impl Span for RecordingSpan {
+            fn child(&self, _name: &str) -> Box<dyn Span> {
+                Box::new(NoopSpan)
+            }
+            fn set_attr(&self, _key: &str, _value: AttrValue) {}
+            fn set_status(&self, _ok: bool) {}
+            fn add_event(&self, name: &str, attrs: &[(&str, AttrValue)]) {
+                self.events.lock().push(format!("{name}:{}", attrs.len()));
+            }
+        }
+
+        let recording = RecordingSpan::default();
+        let span: &dyn Span = &recording;
+        span.add_event(
+            "fallback-fired",
+            &[
+                ("from", AttrValue::Str("openrouter/gemini-3.1-pro".into())),
+                ("to", AttrValue::Str("openrouter/qwen3-max".into())),
+            ],
+        );
+        span.add_event("exception", &[("exception.escaped", AttrValue::Bool(true))]);
+        assert_eq!(
+            recording.events.lock().as_slice(),
+            ["fallback-fired:2", "exception:1"]
+        );
     }
 
     #[test]

@@ -209,55 +209,11 @@ static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     .unwrap()
 });
 
-static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
-});
-
-/// Scrub credentials from tool output to prevent accidental exfiltration.
-/// Replaces known credential patterns with a redacted placeholder while preserving
-/// a small prefix for context.
-pub(crate) fn scrub_credentials(input: &str) -> String {
-    SENSITIVE_KV_REGEX
-        .replace_all(input, |caps: &regex::Captures| {
-            let full_match = &caps[0];
-            let key = &caps[1];
-            let val = caps
-                .get(2)
-                .or(caps.get(3))
-                .or(caps.get(4))
-                .map(|m| m.as_str())
-                .unwrap_or("");
-
-            // Preserve first 4 chars for context, then redact.
-            // Use char_indices to find the byte offset of the 4th character
-            // so we never slice in the middle of a multi-byte UTF-8 sequence.
-            let prefix = if val.len() > 4 {
-                val.char_indices()
-                    .nth(4)
-                    .map(|(byte_idx, _)| &val[..byte_idx])
-                    .unwrap_or(val)
-            } else {
-                ""
-            };
-
-            if full_match.contains(':') {
-                if full_match.contains('"') {
-                    format!("\"{}\": \"{}*[REDACTED]\"", key, prefix)
-                } else {
-                    format!("{}: {}*[REDACTED]", key, prefix)
-                }
-            } else if full_match.contains('=') {
-                if full_match.contains('"') {
-                    format!("{}=\"{}*[REDACTED]\"", key, prefix)
-                } else {
-                    format!("{}={}*[REDACTED]", key, prefix)
-                }
-            } else {
-                format!("{}: {}*[REDACTED]", key, prefix)
-            }
-        })
-        .to_string()
-}
+/// Scrub credentials from free-text content before it reaches a span/event.
+/// Relocated to [`crate::util`] so the reliability layer (`providers/reliable.rs`)
+/// can share it without a `providers → agent` dependency; re-exported here so the
+/// agent layer's existing call sites and tests are unchanged.
+pub(crate) use crate::util::scrub_credentials;
 
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only

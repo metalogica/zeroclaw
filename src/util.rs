@@ -2,6 +2,10 @@
 //!
 //! This module contains reusable helper functions used across the codebase.
 
+use std::sync::LazyLock;
+
+use regex::Regex;
+
 /// Allowed serial device path prefixes — reject arbitrary paths for security.
 /// Used by hardware serial transport and peripherals.
 const SERIAL_ALLOWED_PATH_PREFIXES: &[&str] = &[
@@ -61,6 +65,60 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
         }
         None => s.to_string(),
     }
+}
+
+/// Matches `key: value` / `key=value` pairs whose key names a credential and whose
+/// value is long enough to plausibly be a secret (≥8 chars). Shared by every emitter
+/// that scrubs free-text content before it reaches a span/event (agent layer + the
+/// reliability layer's retry/exception events).
+static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
+});
+
+/// Scrub credentials from free-text content to prevent accidental exfiltration.
+/// Replaces known credential patterns with a redacted placeholder while preserving
+/// a small prefix for context.
+pub fn scrub_credentials(input: &str) -> String {
+    SENSITIVE_KV_REGEX
+        .replace_all(input, |caps: &regex::Captures| {
+            let full_match = &caps[0];
+            let key = &caps[1];
+            let val = caps
+                .get(2)
+                .or(caps.get(3))
+                .or(caps.get(4))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+
+            // Preserve first 4 chars for context, then redact.
+            // Use char_indices to find the byte offset of the 4th character
+            // so we never slice in the middle of a multi-byte UTF-8 sequence.
+            let prefix = if val.len() > 4 {
+                val.char_indices()
+                    .nth(4)
+                    .map(|(byte_idx, _)| &val[..byte_idx])
+                    .unwrap_or(val)
+            } else {
+                ""
+            };
+
+            if full_match.contains(':') {
+                if full_match.contains('"') {
+                    format!("\"{}\": \"{}*[REDACTED]\"", key, prefix)
+                } else {
+                    format!("{}: {}*[REDACTED]", key, prefix)
+                }
+            } else if full_match.contains('=') {
+                if full_match.contains('"') {
+                    format!("{}=\"{}*[REDACTED]\"", key, prefix)
+                } else {
+                    format!("{}={}*[REDACTED]", key, prefix)
+                }
+            } else {
+                format!("{}: {}*[REDACTED]", key, prefix)
+            }
+        })
+        .to_string()
 }
 
 /// Utility enum for handling optional values.

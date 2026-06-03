@@ -2,6 +2,8 @@ use super::Provider;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
+use crate::observability::{AttrValue, current_span};
+use crate::util::{scrub_credentials, truncate_with_ellipsis};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use std::cell::RefCell;
@@ -64,6 +66,25 @@ fn record_provider_fallback(
             actual_model: actual_model.to_string(),
         });
     });
+
+    // Span event: surface the provider/model switch in the trace (strategy A).
+    // `from`/`to` are config enums (provider/model names), not content — no scrub.
+    // No-op when no activation span is ambient (tests, non-OTel observers).
+    if let Some(span) = current_span() {
+        span.add_event(
+            "fallback-fired",
+            &[
+                (
+                    "from",
+                    AttrValue::Str(format!("{requested_provider}/{requested_model}")),
+                ),
+                (
+                    "to",
+                    AttrValue::Str(format!("{actual_provider}/{actual_model}")),
+                ),
+            ],
+        );
+    }
 }
 
 // ── Error Classification ─────────────────────────────────────────────────
@@ -351,6 +372,64 @@ fn push_failure(
     failures.push(format!(
         "provider={provider_name} model={model} attempt {attempt}/{max_attempts}: {reason}; error={error_detail}"
     ));
+
+    // Span event: make this failed attempt visible in the trace (strategy A —
+    // per-attempt, in-layer). Emits on the root activation span (the reliability
+    // layer's ambient span; `llm.call` is never scoped as ambient). The error
+    // string is free-text content → scrub_credentials (mandatory even in dev) +
+    // 16k truncate. No-op when no activation span is ambient (tests, non-OTel).
+    if let Some(span) = current_span() {
+        span.add_event(
+            "retry-attempt",
+            &[
+                ("attempt", AttrValue::Int(i64::from(attempt))),
+                ("max_attempts", AttrValue::Int(i64::from(max_attempts))),
+                ("provider", AttrValue::Str(provider_name.to_string())),
+                ("model", AttrValue::Str(model.to_string())),
+                (
+                    "retryable",
+                    AttrValue::Bool(!reason.contains("non_retryable")),
+                ),
+                ("reason", AttrValue::Str(reason.to_string())),
+                (
+                    "error",
+                    AttrValue::Str(truncate_with_ellipsis(
+                        &scrub_credentials(error_detail),
+                        16_000,
+                    )),
+                ),
+            ],
+        );
+    }
+}
+
+/// Build the terminal "all providers/models failed" error and emit an OTel
+/// `exception` span event recording the escaped failure (strategy A). `anyhow`
+/// erases concrete error types, so `exception.type` is the coarse stage label.
+/// The aggregated attempt log is free-text content → scrub_credentials + 16k
+/// truncate. No-op when no activation span is ambient (tests, non-OTel observers).
+fn all_failed(failures: &[String]) -> anyhow::Error {
+    let message = format!(
+        "All providers/models failed. Attempts:\n{}",
+        failures.join("\n")
+    );
+    if let Some(span) = current_span() {
+        span.add_event(
+            "exception",
+            &[
+                (
+                    "exception.type",
+                    AttrValue::Str("provider_exhausted".to_string()),
+                ),
+                (
+                    "exception.message",
+                    AttrValue::Str(truncate_with_ellipsis(&scrub_credentials(&message), 16_000)),
+                ),
+                ("exception.escaped", AttrValue::Bool(true)),
+            ],
+        );
+    }
+    anyhow::anyhow!(message)
 }
 
 // ── Resilient Provider Wrapper ────────────────────────────────────────────
@@ -589,10 +668,7 @@ impl Provider for ReliableProvider {
             }
         }
 
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(all_failed(&failures))
     }
 
     async fn chat_with_history(
@@ -745,10 +821,7 @@ impl Provider for ReliableProvider {
             }
         }
 
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(all_failed(&failures))
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -915,10 +988,7 @@ impl Provider for ReliableProvider {
             }
         }
 
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(all_failed(&failures))
     }
 
     async fn chat(
@@ -1080,10 +1150,7 @@ impl Provider for ReliableProvider {
             }
         }
 
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(all_failed(&failures))
     }
 
     fn supports_streaming(&self) -> bool {
