@@ -3103,6 +3103,12 @@ async fn process_channel_message(
                 }
             }
 
+            // Native OTel root status: trace OK only on a completed, successful
+            // turn; cancellation, timeout, and provider errors -> ERROR. Set here
+            // (inside the retry loop) because `activation_span` is minted per
+            // attempt and out of scope after the break.
+            activation_span
+                .set_status(matches!(loop_result, LlmExecutionResult::Completed(Ok(Ok(_)))));
             break loop_result;
         };
         let fb = take_last_provider_fallback();

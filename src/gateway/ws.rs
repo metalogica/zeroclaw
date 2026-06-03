@@ -819,8 +819,9 @@ async fn process_chat_message(
         Ok(response) => {
             // Laminar replay Root output: scrubbed+truncated final response on
             // the ambient activation root (Laminar reads root_span_output from
-            // `lmnr.span.output`).
+            // `lmnr.span.output`). Also set native OTel root status: OK.
             if let Some(sp) = crate::observability::current_span() {
+                sp.set_status(true);
                 sp.set_attr(
                     "lmnr.span.output",
                     crate::observability::AttrValue::Str(crate::util::truncate_with_ellipsis(
@@ -883,6 +884,10 @@ async fn process_chat_message(
             }));
         }
         Err(e) => {
+            // Native OTel root status: WS turn failed -> trace ERROR (ambient root).
+            if let Some(sp) = crate::observability::current_span() {
+                sp.set_status(false);
+            }
             // Set session state to error
             if let Some(ref backend) = state.session_backend {
                 let _ = backend.set_session_state(&storage_key, "error", Some(&turn_id));

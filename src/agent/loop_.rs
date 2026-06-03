@@ -4121,6 +4121,8 @@ pub async fn run(
 
                         continue;
                     }
+                    // Native OTel root status: fatal turn error -> trace ERROR.
+                    activation_span.set_status(false);
                     return Err(e);
                 }
             }
@@ -4564,6 +4566,9 @@ pub async fn run(
     // `observability::shutdown_telemetry()` at its process-terminal call site,
     // after this function returns and the activation span has dropped.
 
+    // Native OTel root status: clean session exit -> trace OK. (Rare `?`
+    // early-returns above, e.g. session-history load/save, leave it Unset.)
+    activation_span.set_status(true);
     Ok(final_output)
 }
 
@@ -4938,6 +4943,8 @@ pub async fn process_message(
             AttrValue::Str(truncate_with_ellipsis(&scrub_credentials(text), 16_000)),
         );
     }
+    // Native OTel root status: trace-level success/failure (queryable, ungated).
+    activation_span.set_status(result.is_ok());
     result
 }
 
