@@ -51,7 +51,7 @@ fi
 #    bind-mounted; CARGO_TARGET_DIR is redirected to the volume so the host tree
 #    stays clean. --locked keeps Cargo.lock authoritative.
 mkdir -p "$OUT_DIR"
-bold "▶ compiling zeroclaw (debug · lld · incremental) — features: $FEATURES"
+bold "▶ compiling zeroclaw (debug · mold · incremental) — features: $FEATURES"
 time docker run --rm \
     -v "$REPO":/app \
     -v zeroclaw-hotswap-registry:/usr/local/cargo/registry \
