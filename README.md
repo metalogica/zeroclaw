@@ -60,6 +60,8 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 Sovereign fork with a pre-shared token functionality to simplify and speed up container service load time when hosted in Kubernetes.
 
 #### Change Log
+* **alpha-p10.7**: Add dev hotswap; fix laminar spans.
+* **alpha-p10.6**: Add inner thoughts; add synthetic span for OTEL.
 * **alpha-p10.5**: Add Praxis 0.9.0; add TBD to dev repo; fix session context issue.
 * **alpha-p10.4**: Add Praxis 0.4.0.
 * **alpha-p10.3**: Add Praxis 0.3.0 and websocket thread-id for spec sync.
@@ -109,15 +111,20 @@ gh auth status
 ```
 
 ```bash
-export TAG=0.6.9-alpha-p10.5b; # needed to break cache
+# dev loop; make changes directly to this codebase and hot-swap the binary into the clawcraft container for sub 3min builds
+./dev/hotswap/hotswap.sh
+
+export TAG=0.6.9-alpha-p10.7;
+# export TAG=0.6.9-alpha-p10.5b; # needed to break cache
 export GITHUB_TOKEN=$(gh auth token);
 export PRAXIS_VERSION=0.9.0;
 
-# ARM builds for lcoal testing on MAC
+# ARM builds for lcoal testing on MAC; 15 minute build
 IMAGE=catonmat/zeroclaw && \
 docker build --target release \
   --secret id=npm_token,env=GITHUB_TOKEN \
   --build-arg PRAXIS_VERSION=$PRAXIS_VERSION \
+  --no-cache \
   -t $IMAGE:$TAG .
 
 # test docker image locally
@@ -134,7 +141,7 @@ docker run --rm --entrypoint praxis $IMAGE:$TAG praxis --version
 docker logs zeroclaw-test
 docker container rm zeroclaw-test --force
 
-# Intel/AMD builds for official builds
+# Intel/AMD builds for official builds; 30 minute build
 ## REMEMBER TO HAVE GOOGLE CLOUD AUTHENTICATED
 IMAGE="northamerica-northeast1-docker.pkg.dev/clawcraft-489901/clawcraft-images/clawcraft-claw-runtime" && \
 docker buildx build \
@@ -144,6 +151,7 @@ docker buildx build \
   --build-arg PRAXIS_VERSION=$PRAXIS_VERSION \
   --provenance=false \
   --sbom=false \
+  --no-cache \
   -t $IMAGE:$TAG \
   --push \
   .
