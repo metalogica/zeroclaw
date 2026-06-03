@@ -1476,10 +1476,20 @@ async fn handle_webhook(
 
     let activation_span: Arc<dyn crate::observability::Span> = state
         .observer
-        .start_activation(crate::observability::Trigger::Webhook, None)
+        .start_activation(
+            crate::observability::Trigger::Webhook,
+            session_id.as_deref(),
+        )
         .into();
-    match crate::observability::scope_span(activation_span, run_gateway_chat_simple(&state, message))
-        .await
+    activation_span.set_attr(
+        "channel",
+        crate::observability::AttrValue::Str("webhook".into()),
+    );
+    match crate::observability::scope_span(
+        activation_span,
+        run_gateway_chat_simple(&state, message),
+    )
+    .await
     {
         Ok(response) => {
             let duration = started_at.elapsed();
