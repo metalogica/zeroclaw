@@ -4898,8 +4898,18 @@ pub async fn process_message(
     if let Some(uid) = observability::pod_user_id() {
         activation_span.set_attr("user.id", AttrValue::Str(uid));
     }
+    // Laminar replay Root input: scrubbed+truncated user message on the
+    // activation root. Laminar derives root_span_input from `lmnr.span.input`
+    // (its manual-override path); a bare `gen_ai.prompt` string is never read.
+    activation_span.set_attr(
+        "lmnr.span.input",
+        AttrValue::Str(truncate_with_ellipsis(
+            &scrub_credentials(effective_msg_ref),
+            16_000,
+        )),
+    );
 
-    scope_span(
+    let result = scope_span(
         activation_span.clone(),
         agent_turn(
             provider.as_ref(),
@@ -4921,7 +4931,16 @@ pub async fn process_message(
             None,
         ),
     )
-    .await
+    .await;
+    // Laminar replay Root output: scrubbed+truncated final response on the
+    // activation root (Laminar reads root_span_output from `lmnr.span.output`).
+    if let Ok(text) = &result {
+        activation_span.set_attr(
+            "lmnr.span.output",
+            AttrValue::Str(truncate_with_ellipsis(&scrub_credentials(text), 16_000)),
+        );
+    }
+    result
 }
 
 #[cfg(test)]

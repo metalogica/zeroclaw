@@ -1506,13 +1506,33 @@ async fn handle_webhook(
     if let Some(uid) = crate::observability::pod_user_id() {
         activation_span.set_attr("user.id", crate::observability::AttrValue::Str(uid));
     }
+    // Laminar replay Root input: scrubbed+truncated user message on the
+    // activation root. Laminar derives root_span_input from `lmnr.span.input`
+    // (its manual-override path); a bare `gen_ai.prompt` string is never read.
+    activation_span.set_attr(
+        "lmnr.span.input",
+        crate::observability::AttrValue::Str(crate::util::truncate_with_ellipsis(
+            &crate::agent::loop_::scrub_credentials(message),
+            16_000,
+        )),
+    );
     match crate::observability::scope_span(
-        activation_span,
+        activation_span.clone(),
         run_gateway_chat_simple(&state, message),
     )
     .await
     {
         Ok(response) => {
+            // Laminar replay Root output: scrubbed+truncated final response on
+            // the activation root (Laminar reads root_span_output from
+            // `lmnr.span.output`).
+            activation_span.set_attr(
+                "lmnr.span.output",
+                crate::observability::AttrValue::Str(crate::util::truncate_with_ellipsis(
+                    &crate::agent::loop_::scrub_credentials(&response),
+                    16_000,
+                )),
+            );
             let duration = started_at.elapsed();
             state
                 .observer

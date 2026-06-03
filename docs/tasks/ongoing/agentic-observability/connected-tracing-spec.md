@@ -293,13 +293,24 @@ lib suite green (6151 passed; the only intermittent failures are a pre-existing 
 **Enrichment — done & committed (completes SPEC 1's content acceptance criteria, §1/§7).**
 - `llm.call` now carries **OpenRouter reasoning** (`gen_ai.reasoning`, truncated to 16k chars)
   + token usage, in both engines.
-- `llm.call` now carries **prompt + completion content** (`gen_ai.prompt`, `gen_ai.completion`)
-  — the headline Laminar replay Root input/output columns (W2, bead zc-0e0i). **Content fields
-  legalized under §7.1:** both are `scrub_credentials`-scrubbed then truncated to 16k chars,
-  set as span attributes only (never resource). `gen_ai.prompt` = final user message, set once
-  per activation (first `llm.call`); `gen_ai.completion` = response text, set at each span drop.
-  Wired in both engines (`loop_.rs`, `agent.rs` turn/turn_streamed) and the gateway simple-chat
-  path (`gateway/mod.rs`).
+- `llm.call` carries **prompt + completion content** (`gen_ai.prompt`, `gen_ai.completion`)
+  in valid OTel GenAI semantics (W2, bead zc-0e0i) — both `scrub_credentials`-scrubbed and
+  truncated to 16k chars, span attrs only. `gen_ai.prompt` = final user message, first
+  `llm.call` only; `gen_ai.completion` = response text, each span drop. Wired in both engines
+  (`loop_.rs`, `agent.rs` turn/turn_streamed) and the gateway simple-chat path (`gateway/mod.rs`).
+- **`agent.activation` root carries `lmnr.span.input` / `lmnr.span.output`** — the headline
+  Laminar replay **Root input/output** columns (W2 follow-up). Empirically required: Laminar's
+  `parse_and_enrich_attributes` derives `root_span_input`/`root_span_output` from the **root**
+  span via its `lmnr.span.input`/`lmnr.span.output` manual-override path, and only reads the
+  *indexed* `gen_ai.prompt.0.content` legacy form — **never a bare `gen_ai.prompt` string** on a
+  child `llm.call`, so the W2 `gen_ai.*` attrs alone left the columns empty. **Content fields
+  legalized under §7.1:** both `scrub_credentials`-scrubbed, truncated to 16k chars, span attrs
+  only (never resource). Input set at activation start (user message), output after the turn
+  completes (final response), before the root span drops. Wired at the single-turn activation
+  owners: channel (`loop_.rs process_message`), webhook (`gateway/mod.rs handle_webhook`), and
+  WS (`gateway/ws.rs process_chat_message`, covering both WS mint sites via the ambient root).
+  **Deferred:** the CLI/cron `run()` activation (`loop_.rs:3747`) is session-scoped (multi-turn
+  REPL) so a single input/output pair is ill-defined; left unset pending a per-turn model.
 - `tool.call` carries Composio **action** + **toolkit** (`composio.action`, `composio.toolkit`)
   parsed from the call args, in both engines.
 

@@ -747,6 +747,20 @@ async fn process_chat_message(
 ) {
     use crate::agent::TurnEvent;
 
+    // Laminar replay Root input: scrubbed+truncated user message on the ambient
+    // activation root (set by the caller's scope_span). Laminar derives
+    // root_span_input from `lmnr.span.input` (its manual-override path); a bare
+    // `gen_ai.prompt` string is never read. Covers both WS activation sites.
+    if let Some(sp) = crate::observability::current_span() {
+        sp.set_attr(
+            "lmnr.span.input",
+            crate::observability::AttrValue::Str(crate::util::truncate_with_ellipsis(
+                &crate::agent::loop_::scrub_credentials(content),
+                16_000,
+            )),
+        );
+    }
+
     // Derive the storage key once per turn. Thread-scoped when a thread id
     // is present, else the connection's session key — see [`pick_session_key`].
     let storage_key = pick_session_key(thread_id, session_key);
@@ -808,6 +822,19 @@ async fn process_chat_message(
 
     match result {
         Ok(response) => {
+            // Laminar replay Root output: scrubbed+truncated final response on
+            // the ambient activation root (Laminar reads root_span_output from
+            // `lmnr.span.output`).
+            if let Some(sp) = crate::observability::current_span() {
+                sp.set_attr(
+                    "lmnr.span.output",
+                    crate::observability::AttrValue::Str(crate::util::truncate_with_ellipsis(
+                        &crate::agent::loop_::scrub_credentials(&response),
+                        16_000,
+                    )),
+                );
+            }
+
             // Persist assistant response
             if let Some(ref backend) = state.session_backend {
                 let assistant_msg = crate::providers::ChatMessage::assistant(&response);
