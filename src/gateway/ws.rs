@@ -555,6 +555,10 @@ async fn handle_socket(
                         "channel",
                         crate::observability::AttrValue::Str("web".into()),
                     );
+                    if let Some(uid) = crate::observability::pod_user_id() {
+                        activation_span
+                            .set_attr("user.id", crate::observability::AttrValue::Str(uid));
+                    }
                     scope_span(
                         activation_span,
                         process_chat_message(
@@ -702,6 +706,9 @@ async fn handle_socket(
                     .into();
                 activation_span
                     .set_attr("channel", crate::observability::AttrValue::Str("web".into()));
+                if let Some(uid) = crate::observability::pod_user_id() {
+                    activation_span.set_attr("user.id", crate::observability::AttrValue::Str(uid));
+                }
                 scope_span(
                     activation_span,
                     process_chat_message(

@@ -8,12 +8,10 @@ use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use base64::Engine;
 use futures_util::{StreamExt, stream};
-use regex::Regex;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 
 pub struct OpenRouterProvider {
     credential: Option<String>,
@@ -34,29 +32,6 @@ pub struct OpenRouterProvider {
 
 const DEFAULT_OPENROUTER_TIMEOUT_SECS: u64 = 120;
 const OPENROUTER_CONNECT_TIMEOUT_SECS: u64 = 10;
-
-static USER_ID_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-z0-9]{32}$").expect("valid regex"));
-
-/// Pure validation: accept the value only if it's a bare 32-char lowercase
-/// alphanumeric identifier (Convex document id shape). Rejects anything with
-/// a `claw-` prefix, whitespace, wrong length, or wrong alphabet.
-fn validate_pod_user_id(value: &str) -> Option<String> {
-    if USER_ID_RE.is_match(value) {
-        Some(value.to_string())
-    } else {
-        None
-    }
-}
-
-/// Read `CLAW_USER_ID` from the environment (set by the clawcraft K8s
-/// deployment) and validate the shape. Returns `None` when unset or malformed.
-fn detect_pod_user_id() -> Option<String> {
-    std::env::var("CLAW_USER_ID")
-        .ok()
-        .as_deref()
-        .and_then(validate_pod_user_id)
-}
 
 #[derive(Debug, Serialize)]
 struct ChatRequest {
@@ -263,7 +238,7 @@ impl OpenRouterProvider {
             max_tokens: None,
             modalities: None,
             workspace_dir: None,
-            pod_user_id: detect_pod_user_id(),
+            pod_user_id: crate::observability::pod_user_id(),
         }
     }
 
@@ -1279,42 +1254,6 @@ mod tests {
             provider.credential.as_deref(),
             Some("openrouter-test-credential")
         );
-    }
-
-    #[test]
-    fn validate_pod_user_id_accepts_canonical_id() {
-        let id = "kd76fb7wr1pba28mavncxb8pnd84r3mn";
-        assert_eq!(validate_pod_user_id(id).as_deref(), Some(id));
-    }
-
-    #[test]
-    fn validate_pod_user_id_rejects_claw_prefix() {
-        // A bare-id contract: anything wrapped in `claw-` is rejected so we
-        // never accidentally pass the namespace shape upstream.
-        assert!(validate_pod_user_id("claw-kd76fb7wr1pba28mavncxb8pnd84r3mn").is_none());
-    }
-
-    #[test]
-    fn validate_pod_user_id_rejects_wrong_length() {
-        // 31 chars
-        assert!(validate_pod_user_id("kd76fb7wr1pba28mavncxb8pnd84r3m").is_none());
-        // 33 chars
-        assert!(validate_pod_user_id("kd76fb7wr1pba28mavncxb8pnd84r3mnx").is_none());
-        assert!(validate_pod_user_id("abc").is_none());
-        assert!(validate_pod_user_id("").is_none());
-    }
-
-    #[test]
-    fn validate_pod_user_id_rejects_non_lowercase_alphanumeric() {
-        assert!(validate_pod_user_id("KD76FB7WR1PBA28MAVNCXB8PND84R3MN").is_none());
-        assert!(validate_pod_user_id("kd76fb7wr1pba28mavncxb8pnd84r-mn").is_none());
-        assert!(validate_pod_user_id("kd76fb7wr1pba28mavncxb8pnd84r_mn").is_none());
-    }
-
-    #[test]
-    fn validate_pod_user_id_rejects_surrounding_whitespace() {
-        assert!(validate_pod_user_id(" kd76fb7wr1pba28mavncxb8pnd84r3mn").is_none());
-        assert!(validate_pod_user_id("kd76fb7wr1pba28mavncxb8pnd84r3mn\n").is_none());
     }
 
     #[test]
