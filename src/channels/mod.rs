@@ -2998,8 +2998,11 @@ async fn process_channel_message(
     #[allow(clippy::cast_possible_truncation)]
     let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
     tracing::info!(elapsed_before_llm_ms, "⏱ Starting LLM call");
-    let (llm_result, fallback_info) = scope_provider_fallback(async {
-        let llm_result = loop {
+    // `activation_span` is hoisted out of this loop so the root trace stays open
+    // through response delivery below — closing the trace at reply-generation would
+    // make the `delivery` child (emitted in the channel `send()`) un-parentable.
+    let (llm_result, fallback_info, activation_span) = scope_provider_fallback(async {
+        let (llm_result, activation_span) = loop {
             // One trace per activation. Mint from the base observer (the notify
             // decorator inherits the no-op span); children parent via `scope_span`.
             let activation_span: Arc<dyn Span> = ctx
@@ -3103,10 +3106,10 @@ async fn process_channel_message(
                 }
             }
 
-            break loop_result;
+            break (loop_result, activation_span);
         };
         let fb = take_last_provider_fallback();
-        (llm_result, fb)
+        (llm_result, fb, activation_span)
     })
     .await;
 
@@ -3337,31 +3340,36 @@ async fn process_channel_message(
                 started_at.elapsed().as_millis(),
                 truncate_with_ellipsis(&delivered_response, 80)
             );
-            if let Some(channel) = target_channel.as_ref() {
-                if let Some(ref draft_id) = draft_message_id {
-                    if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
+            // Scope the activation span over delivery so the channel `send()` opens
+            // its `delivery` child under this trace ("reply actually reached the user").
+            scope_span(activation_span.clone(), async {
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Some(ref draft_id) = draft_message_id {
+                        if let Err(e) = channel
+                            .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
+                            .await
+                        {
+                            tracing::warn!("Failed to finalize draft: {e}; sending as new message");
+                            let _ = channel
+                                .send(
+                                    &SendMessage::new(&delivered_response, &msg.reply_target)
+                                        .in_thread(msg.thread_ts.clone()),
+                                )
+                                .await;
+                        }
+                    } else if let Err(e) = channel
+                        .send(
+                            &SendMessage::new(&delivered_response, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone())
+                                .with_cancellation(cancellation_token.clone()),
+                        )
                         .await
                     {
-                        tracing::warn!("Failed to finalize draft: {e}; sending as new message");
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(&delivered_response, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
+                        eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                     }
-                } else if let Err(e) = channel
-                    .send(
-                        &SendMessage::new(&delivered_response, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone())
-                            .with_cancellation(cancellation_token.clone()),
-                    )
-                    .await
-                {
-                    eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
-            }
+            })
+            .await;
         }
         LlmExecutionResult::Completed(Ok(Err(e))) => {
             if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled()

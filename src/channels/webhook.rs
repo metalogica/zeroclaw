@@ -129,9 +129,44 @@ impl Channel for WebhookChannel {
             request = request.header("Authorization", auth);
         }
 
-        let resp = request.json(&payload).send().await?;
+        // Optional `delivery` child of the activation root (scoped in channels/mod.rs):
+        // distinguishes "agent generated a reply" from "reply actually reached the user".
+        // Non-secret attrs only — host, never the full URL / query / auth header / body.
+        // Recipient is intentionally omitted (PII; see AGENTS.md telemetry rules).
+        let delivery = crate::observability::current_span().map(|s| s.child("delivery"));
+        if let Some(ref span) = delivery {
+            use crate::observability::AttrValue;
+            span.set_attr("channel", AttrValue::Str("webhook".to_string()));
+            if let Some(host) = reqwest::Url::parse(send_url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+            {
+                span.set_attr("net.peer.name", AttrValue::Str(host));
+            }
+        }
+
+        let resp = match request.json(&payload).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Transport-level failure: never reached the user.
+                if let Some(ref span) = delivery {
+                    span.set_status(false);
+                }
+                return Err(e.into());
+            }
+        };
 
         let status = resp.status();
+        if let Some(ref span) = delivery {
+            use crate::observability::AttrValue;
+            span.set_attr(
+                "http.status_code",
+                AttrValue::Int(i64::from(status.as_u16())),
+            );
+            // status ERROR on non-2xx so "generated OK but delivery failed" is visible
+            // as a failed delivery child under an otherwise-OK turn.
+            span.set_status(status.is_success());
+        }
         if !status.is_success() {
             let body = resp
                 .text()

@@ -1570,6 +1570,11 @@ async fn handle_webhook(
                     cost_usd: None,
                 });
 
+            // Delivery for the synchronous gateway webhook is the axum response body
+            // returned here within the inbound POST — there is no separate outbound
+            // POST. The write happens before `activation_span` drops at function end,
+            // so delivery is inherently covered by the activation root; no separate
+            // `delivery` child is emitted here (cf. WebhookChannel::send).
             let body = serde_json::json!({"response": response, "model": state.model});
             (StatusCode::OK, Json(body))
         }
