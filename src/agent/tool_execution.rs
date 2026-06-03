@@ -78,6 +78,16 @@ pub(crate) async fn execute_one_tool(
     let tool_span: Option<Arc<dyn Span>> = current_span().map(|s| Arc::from(s.child("tool.call")));
     if let Some(ts) = &tool_span {
         ts.set_attr("tool.name", AttrValue::Str(call_name.to_string()));
+        // tool.input = the invocation args, scrubbed + truncated to 16k (mirrors tool.output).
+        // Surfaces WHAT the agent asked the tool to do, not just the result. Args routinely
+        // carry secrets, so scrub_credentials is mandatory here. Legalized under §7.1.
+        ts.set_attr(
+            "tool.input",
+            AttrValue::Str(truncate_with_ellipsis(
+                &scrub_credentials(&call_arguments.to_string()),
+                16_000,
+            )),
+        );
         // Composio is a single tool; differentiate by toolkit/action from the args.
         // (The Composio `log_…` id is not returned by the v3 execute API — unavailable.)
         if call_name == "composio" {
