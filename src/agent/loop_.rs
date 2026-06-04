@@ -3778,6 +3778,16 @@ pub async fn run(
     let activation_span: Arc<dyn Span> = observer.start_activation(Trigger::Cli, None).into();
     activation_span.set_attr("provider", AttrValue::Str(provider_name.to_string()));
     activation_span.set_attr("model", AttrValue::Str(model_name.to_string()));
+    // Laminar replay Root input: scrubbed+truncated triggering message on the
+    // activation root (mirrors process_message; Laminar derives root_span_input
+    // from `lmnr.span.input`). Interactive sessions started without `-m` carry no
+    // triggering message, so the attr stays unset there.
+    if let Some(msg) = message.as_deref() {
+        activation_span.set_attr(
+            "lmnr.span.input",
+            AttrValue::Str(truncate_with_ellipsis(&scrub_credentials(msg), 16_000)),
+        );
+    }
 
     // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
     let hardware_rag: Option<crate::rag::HardwareRag> = config
@@ -4597,6 +4607,15 @@ pub async fn run(
     // `observability::shutdown_telemetry()` at its process-terminal call site,
     // after this function returns and the activation span has dropped.
 
+    // Laminar replay Root output: scrubbed+truncated final response on the
+    // activation root (Laminar reads root_span_output from `lmnr.span.output`).
+    activation_span.set_attr(
+        "lmnr.span.output",
+        AttrValue::Str(truncate_with_ellipsis(
+            &scrub_credentials(&final_output),
+            16_000,
+        )),
+    );
     // Native OTel root status: clean session exit -> trace OK. (Rare `?`
     // early-returns above, e.g. session-history load/save, leave it Unset.)
     activation_span.set_status(true);

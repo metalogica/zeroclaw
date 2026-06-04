@@ -3016,6 +3016,16 @@ async fn process_channel_message(
             activation_span.set_attr("provider", AttrValue::Str(route.provider.clone()));
             activation_span.set_attr("model", AttrValue::Str(route.model.clone()));
             observability::tag_user_id(activation_span.as_ref());
+            // Laminar replay Root input: scrubbed+truncated user message on the
+            // activation root (mirrors process_message; Laminar derives
+            // root_span_input from `lmnr.span.input`).
+            activation_span.set_attr(
+                "lmnr.span.input",
+                AttrValue::Str(truncate_with_ellipsis(
+                    &scrub_credentials(&msg.content),
+                    16_000,
+                )),
+            );
 
             let loop_result = tokio::select! {
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
@@ -3106,14 +3116,25 @@ async fn process_channel_message(
                 }
             }
 
+            // Laminar replay Root output: scrubbed+truncated final response on the
+            // activation root. Only a completed, successful turn carries text;
+            // set per-attempt (beside status) since the span is minted per attempt.
+            if let LlmExecutionResult::Completed(Ok(Ok(ref text))) = loop_result {
+                activation_span.set_attr(
+                    "lmnr.span.output",
+                    AttrValue::Str(truncate_with_ellipsis(&scrub_credentials(text), 16_000)),
+                );
+            }
             // Native OTel root status: trace OK only on a completed, successful
             // turn; cancellation, timeout, and provider errors -> ERROR. Set here
             // (inside the retry loop) because `activation_span` is minted per
             // attempt. The span is threaded out below (kept alive past the loop)
             // so the delivery span can parent under it before it drops — a
             // delivery failure surfaces on that child span, not the root.
-            activation_span
-                .set_status(matches!(loop_result, LlmExecutionResult::Completed(Ok(Ok(_)))));
+            activation_span.set_status(matches!(
+                loop_result,
+                LlmExecutionResult::Completed(Ok(Ok(_)))
+            ));
             break (loop_result, activation_span);
         };
         let fb = take_last_provider_fallback();
