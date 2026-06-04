@@ -591,6 +591,14 @@ impl TraceSpan for OtelSpan {
             .span()
             .set_status(if ok { Status::Ok } else { Status::error("") });
     }
+
+    fn add_event(&self, name: &str, attrs: &[(&str, AttrValue)]) {
+        let kvs: Vec<KeyValue> = attrs
+            .iter()
+            .map(|(k, v)| KeyValue::new(k.to_string(), attr_to_value(v.clone())))
+            .collect();
+        self.cx.span().add_event(name.to_string(), kvs);
+    }
 }
 
 impl Drop for OtelSpan {
