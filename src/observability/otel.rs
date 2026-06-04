@@ -9,7 +9,7 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// Process-wide OTLP providers, built once and shared by every component's
 /// `OtelObserver`. Multiple subsystems (daemon, gateway, channels, scheduler,
@@ -524,6 +524,11 @@ fn attr_to_value(v: AttrValue) -> Value {
 /// construction and ends on `Drop`, giving true start→end timing.
 pub struct OtelSpan {
     cx: Context,
+    /// Configured `deployment.environment`, propagated to *every* span in the
+    /// trace (not just the root) so each span is independently sliceable by env
+    /// in backends that do not inherit the root span's attribute. `Arc` so child
+    /// spans share the value without re-allocating. `None` when unconfigured.
+    environment: Option<Arc<str>>,
 }
 
 impl OtelSpan {
@@ -538,24 +543,35 @@ impl OtelSpan {
         let span = tracer.start_with_context("agent.activation", &Context::new());
         let this = Self {
             cx: Context::new().with_span(span),
+            environment: environment.filter(|e| !e.is_empty()).map(Arc::from),
         };
         this.set_attr("trigger", AttrValue::Str(trigger.as_str().to_string()));
         if let Some(tid) = thread_id {
             this.set_attr("thread_id", AttrValue::Str(tid.to_string()));
         }
-        if let Some(env) = environment.filter(|e| !e.is_empty()) {
+        if let Some(env) = this.environment.as_deref() {
             this.set_attr("deployment.environment", AttrValue::Str(env.to_string()));
         }
         this
     }
 
     /// Concrete child constructor (used by [`TraceSpan::child`] and by tests).
+    ///
+    /// Re-stamps `deployment.environment` on the child span so it is queryable on
+    /// its own — backends that drop resource attributes and do not inherit the
+    /// root span's attributes (e.g. self-hosted Laminar) can still slice child
+    /// spans by environment.
     fn child_span(&self, name: &str) -> Self {
         let tracer = global::tracer("zeroclaw");
         let span = tracer.start_with_context(name.to_string(), &self.cx);
-        Self {
+        let child = Self {
             cx: self.cx.with_span(span),
+            environment: self.environment.clone(),
+        };
+        if let Some(env) = child.environment.as_deref() {
+            child.set_attr("deployment.environment", AttrValue::Str(env.to_string()));
         }
+        child
     }
 }
 
@@ -917,5 +933,50 @@ mod tests {
         let child = TraceSpan::child(&span, "llm.call");
         child.set_attr("k", AttrValue::Int(1));
         child.set_status(false);
+    }
+
+    /// The configured environment must propagate to *every* span in the trace —
+    /// root, child, and grandchild — not just the root. This is the per-span
+    /// delta this bead adds: each `OtelSpan` carries the value so `child_span`
+    /// can re-stamp `deployment.environment` on backends that don't inherit the
+    /// root's attributes (self-hosted Laminar). Asserting on the threaded field
+    /// keeps the test deterministic and dep-free; end-to-end attribute emission
+    /// is covered by the live Laminar verification gate (the existing convention
+    /// here is that span export is verified at runtime, not in unit tests).
+    #[test]
+    fn environment_propagates_to_every_span() {
+        let root = OtelSpan::root(Trigger::Cli, Some("thread-1"), Some("prod"));
+        let child = root.child_span("agent.step");
+        let grandchild = child.child_span("llm.call");
+
+        assert_eq!(root.environment.as_deref(), Some("prod"), "root carries env");
+        assert_eq!(
+            child.environment.as_deref(),
+            Some("prod"),
+            "child inherits env"
+        );
+        assert_eq!(
+            grandchild.environment.as_deref(),
+            Some("prod"),
+            "grandchild inherits env transitively"
+        );
+    }
+
+    /// An empty or absent environment must not propagate a value — the per-span
+    /// stamping must not invent `deployment.environment` when unconfigured.
+    #[test]
+    fn environment_absent_does_not_propagate() {
+        for env in [None, Some("")] {
+            let root = OtelSpan::root(Trigger::Cli, None, env);
+            let child = root.child_span("agent.step");
+            assert!(
+                root.environment.is_none(),
+                "root must not carry env for {env:?}"
+            );
+            assert!(
+                child.environment.is_none(),
+                "child must not carry env for {env:?}"
+            );
+        }
     }
 }
