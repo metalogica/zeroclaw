@@ -551,10 +551,7 @@ async fn handle_socket(
                         .observer
                         .start_activation(Trigger::WebChat, effective.as_deref())
                         .into();
-                    activation_span.set_attr(
-                        "channel",
-                        crate::observability::AttrValue::Str("web".into()),
-                    );
+                    crate::observability::tag_channel(activation_span.as_ref(), "web");
                     crate::observability::tag_user_id(activation_span.as_ref());
                     scope_span(
                         activation_span,
@@ -701,8 +698,7 @@ async fn handle_socket(
                     .observer
                     .start_activation(Trigger::WebChat, effective.as_deref())
                     .into();
-                activation_span
-                    .set_attr("channel", crate::observability::AttrValue::Str("web".into()));
+                crate::observability::tag_channel(activation_span.as_ref(), "web");
                 crate::observability::tag_user_id(activation_span.as_ref());
                 scope_span(
                     activation_span,

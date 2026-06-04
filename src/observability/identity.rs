@@ -67,6 +67,32 @@ fn set_user_id_attrs(span: &dyn Span, uid: &str) {
     );
 }
 
+/// Tag a root activation span with its delivery channel for Laminar's typed
+/// Tags trace-list column. Sets BOTH keys under one guard so the four root call
+/// sites stay one-liners and the dual-key contract cannot drift:
+///
+/// - `channel` — vendor-neutral plain attribute (the OTel-native copy that
+///   generic OTLP consumers read; the observability doctrine enumerates it).
+/// - `lmnr.association.properties.tags` — Laminar's association-property key,
+///   which self-hosted Laminar projects into its typed, indexed `tags_array`
+///   (`Array(String)`) column — the one that drives the trace-list Tags filter.
+///   Emitted as a **native OTLP string array** (`["web"]`); the plain `channel`
+///   attr alone never populates it, and a JSON-encoded string would land as one
+///   literal element. Mirrors the `user.id` / `lmnr.association.properties.user_id`
+///   dual-emit precedent — self-hosted Laminar keys on its own conventions.
+///
+/// Single-element (`[channel]`) on purpose: adding the trigger as a second tag
+/// is gated on a live multi-element render check (see bead zc-khnl). Call only
+/// on activation roots that carry a channel — never CLI/cron (no channel), and
+/// never the `delivery` child (tags belong on the root for the trace-list).
+pub fn tag_channel(span: &dyn Span, channel: &str) {
+    span.set_attr("channel", AttrValue::Str(channel.to_string()));
+    span.set_attr(
+        "lmnr.association.properties.tags",
+        AttrValue::Array(vec![channel.to_string()]),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,8 +142,15 @@ mod tests {
             Box::new(crate::observability::NoopSpan)
         }
         fn set_attr(&self, key: &str, value: AttrValue) {
-            if let AttrValue::Str(s) = value {
-                self.0.lock().unwrap().push((key.to_string(), s));
+            // Record Str verbatim and Array as `[a,b]` so both the user_id (Str)
+            // and tags (Array) contracts are assertable without a live span.
+            let recorded = match value {
+                AttrValue::Str(s) => Some(s),
+                AttrValue::Array(items) => Some(format!("[{}]", items.join(","))),
+                AttrValue::Int(_) | AttrValue::Float(_) | AttrValue::Bool(_) => None,
+            };
+            if let Some(v) = recorded {
+                self.0.lock().unwrap().push((key.to_string(), v));
             }
         }
         fn set_status(&self, _ok: bool) {}
@@ -136,6 +169,22 @@ mod tests {
             attrs
                 .iter()
                 .any(|(k, v)| k == "lmnr.association.properties.user_id" && v == id)
+        );
+    }
+
+    #[test]
+    fn tag_channel_sets_plain_attr_and_laminar_tags_array() {
+        let span = RecordingSpan(std::sync::Mutex::new(Vec::new()));
+        tag_channel(&span, "web");
+        let attrs = span.0.lock().unwrap();
+        // OTel-native plain attr — what generic OTLP consumers read.
+        assert!(attrs.iter().any(|(k, v)| k == "channel" && v == "web"));
+        // Laminar association-property key — a single-element native array that
+        // drives the typed `tags_array` column (recorded as `[web]`).
+        assert!(
+            attrs
+                .iter()
+                .any(|(k, v)| k == "lmnr.association.properties.tags" && v == "[web]")
         );
     }
 }

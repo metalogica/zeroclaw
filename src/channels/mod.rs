@@ -3012,7 +3012,7 @@ async fn process_channel_message(
                     msg.thread_ts.as_deref().or(Some(msg.id.as_str())),
                 )
                 .into();
-            activation_span.set_attr("channel", AttrValue::Str(msg.channel.clone()));
+            observability::tag_channel(activation_span.as_ref(), &msg.channel);
             activation_span.set_attr("provider", AttrValue::Str(route.provider.clone()));
             activation_span.set_attr("model", AttrValue::Str(route.model.clone()));
             observability::tag_user_id(activation_span.as_ref());

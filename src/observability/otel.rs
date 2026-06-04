@@ -3,7 +3,7 @@ use super::traits::{
 };
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::trace::{Status, TraceContextExt, Tracer};
-use opentelemetry::{Context, KeyValue, Value, global};
+use opentelemetry::{Array, Context, KeyValue, Value, global};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -513,6 +513,9 @@ fn attr_to_value(v: AttrValue) -> Value {
         AttrValue::Int(i) => Value::I64(i),
         AttrValue::Float(f) => Value::F64(f),
         AttrValue::Bool(b) => Value::Bool(b),
+        AttrValue::Array(items) => {
+            Value::Array(Array::String(items.into_iter().map(Into::into).collect()))
+        }
     }
 }
 
@@ -548,6 +551,18 @@ impl OtelSpan {
         this.set_attr("trigger", AttrValue::Str(trigger.as_str().to_string()));
         if let Some(tid) = thread_id {
             this.set_attr("thread_id", AttrValue::Str(tid.to_string()));
+            // Laminar's typed `session_id` column is filled only from the
+            // `lmnr.association.properties.session_id` key — the plain
+            // `thread_id` attr above never populates it. A conversation/thread
+            // id IS Laminar's "session", so the twin carries the SAME value
+            // under the SAME guard: absent when no thread id (never synthesized,
+            // never ""). One edit covers every root (CLI/channel/webhook/WS).
+            // Mirrors the `user.id` → `lmnr.association.properties.user_id`
+            // dual-emit precedent (see identity::set_user_id_attrs).
+            this.set_attr(
+                "lmnr.association.properties.session_id",
+                AttrValue::Str(tid.to_string()),
+            );
         }
         if let Some(env) = this.environment.as_deref() {
             this.set_attr("deployment.environment", AttrValue::Str(env.to_string()));
@@ -909,6 +924,33 @@ mod tests {
         // Empty env must be treated as unset (no attribute written, no panic).
         let _empty = OtelSpan::root(Trigger::WebChat, None, Some(""));
         root.set_status(true);
+    }
+
+    #[test]
+    fn root_session_id_twin_follows_thread_id_guard_without_panic() {
+        // OTel spans don't expose attributes for read-back, so as with the env
+        // branch we can only assert both code paths execute cleanly: a root WITH
+        // a thread id writes both `thread_id` and the `session_id` twin; a root
+        // WITHOUT one writes neither (the `if let Some(tid)` guard is skipped).
+        let _obs = test_observer();
+        let with_tid = OtelSpan::root(Trigger::WebChat, Some("thread-1"), None);
+        let without_tid = OtelSpan::root(Trigger::Cli, None, None);
+        with_tid.set_status(true);
+        without_tid.set_status(true);
+    }
+
+    #[test]
+    fn attr_to_value_maps_array_to_native_otlp_string_array() {
+        // The Array variant must become a native OTLP string array (not a JSON
+        // string) so Laminar's `Array(String)` tags column ingests it.
+        let v = attr_to_value(AttrValue::Array(vec!["web".into(), "web_chat".into()]));
+        match v {
+            Value::Array(Array::String(items)) => {
+                let got: Vec<String> = items.iter().map(|s| s.as_str().to_string()).collect();
+                assert_eq!(got, vec!["web".to_string(), "web_chat".to_string()]);
+            }
+            other => panic!("expected Value::Array(Array::String), got {other:?}"),
+        }
     }
 
     #[test]

@@ -1529,10 +1529,7 @@ async fn handle_webhook(
             session_id.as_deref(),
         )
         .into();
-    activation_span.set_attr(
-        "channel",
-        crate::observability::AttrValue::Str("webhook".into()),
-    );
+    crate::observability::tag_channel(activation_span.as_ref(), "webhook");
     crate::observability::tag_user_id(activation_span.as_ref());
     // Laminar replay Root input: scrubbed+truncated user message on the
     // activation root. Laminar derives root_span_input from `lmnr.span.input`

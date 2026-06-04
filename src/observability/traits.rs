@@ -183,6 +183,13 @@ pub enum AttrValue {
     Int(i64),
     Float(f64),
     Bool(bool),
+    /// A homogeneous array of strings, mapped to a native OTLP `ArrayValue`.
+    ///
+    /// Needed for Laminar association properties whose backing ClickHouse column
+    /// is `Array(String)` (e.g. `lmnr.association.properties.tags` →
+    /// `tags_array`): a JSON-encoded string would land as a single literal
+    /// element, not a parsed array. The scalar variants above cannot express it.
+    Array(Vec<String>),
 }
 
 /// A span in the activation trace tree.
