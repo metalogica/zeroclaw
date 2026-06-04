@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::i18n::ToolDescriptions;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{
-    self, AttrValue, Observer, ObserverEvent, Span, current_span, scope_span,
+    self, AttrValue, Observer, ObserverEvent, Span, current_span, scope_span, stamp_turn_exit,
 };
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
 use crate::runtime;
@@ -1099,6 +1099,10 @@ impl Agent {
                     text
                 };
 
+                // Queryable turn-outcome on the activation root (zc-ug3w):
+                // model completion with no tool calls — the normal terminal.
+                stamp_turn_exit("final_answer", iteration + 1);
+
                 // Store in response cache (text-only, no tool calls)
                 if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                     let token_count = response
@@ -1140,6 +1144,8 @@ impl Agent {
             self.trim_history();
         }
 
+        // Queryable turn-outcome on the activation root (zc-ug3w): hit the cap.
+        stamp_turn_exit("max_iterations", self.config.max_tool_iterations);
         anyhow::bail!(
             "Agent exceeded maximum tool iterations ({})",
             self.config.max_tool_iterations
@@ -1462,6 +1468,10 @@ impl Agent {
                     text
                 };
 
+                // Queryable turn-outcome on the activation root (zc-ug3w):
+                // model completion with no tool calls — the normal terminal.
+                stamp_turn_exit("final_answer", iteration + 1);
+
                 // Store in response cache
                 if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                     let token_count = response
@@ -1563,6 +1573,8 @@ impl Agent {
             self.trim_history();
         }
 
+        // Queryable turn-outcome on the activation root (zc-ug3w): hit the cap.
+        stamp_turn_exit("max_iterations", self.config.max_tool_iterations);
         anyhow::bail!(
             "Agent exceeded maximum tool iterations ({})",
             self.config.max_tool_iterations

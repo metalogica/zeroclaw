@@ -3135,6 +3135,21 @@ async fn process_channel_message(
                 loop_result,
                 LlmExecutionResult::Completed(Ok(Ok(_)))
             ));
+            // Queryable twins (zc-ug3w): status mirrors the native Status; the
+            // exit_reason for the non-success outcomes is sourced from the
+            // `LlmExecutionResult` variant the runtime already holds (no praxis
+            // parsing). On success the tool loop already stamped exit_reason
+            // (final_answer/max_iterations), so leave it.
+            let (turn_status, turn_exit) = match &loop_result {
+                LlmExecutionResult::Completed(Ok(Ok(_))) => ("ok", None),
+                LlmExecutionResult::Completed(Ok(Err(_))) => ("error", Some("error")),
+                LlmExecutionResult::Completed(Err(_)) => ("error", Some("timeout")),
+                LlmExecutionResult::Cancelled => ("error", Some("cancelled")),
+            };
+            activation_span.set_attr("agent.turn.status", AttrValue::Str(turn_status.into()));
+            if let Some(reason) = turn_exit {
+                activation_span.set_attr("agent.turn.exit_reason", AttrValue::Str(reason.into()));
+            }
             break (loop_result, activation_span);
         };
         let fb = take_last_provider_fallback();

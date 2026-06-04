@@ -818,6 +818,12 @@ async fn process_chat_message(
             // `lmnr.span.output`). Also set native OTel root status: OK.
             if let Some(sp) = crate::observability::current_span() {
                 sp.set_status(true);
+                // Queryable status twin (zc-ug3w); exit_reason+iterations are
+                // stamped by `Agent::turn_streamed` at its loop terminal.
+                sp.set_attr(
+                    "agent.turn.status",
+                    crate::observability::AttrValue::Str("ok".into()),
+                );
                 sp.set_attr(
                     "lmnr.span.output",
                     crate::observability::AttrValue::Str(crate::util::truncate_with_ellipsis(
@@ -883,6 +889,16 @@ async fn process_chat_message(
             // Native OTel root status: WS turn failed -> trace ERROR (ambient root).
             if let Some(sp) = crate::observability::current_span() {
                 sp.set_status(false);
+                // Queryable twins (zc-ug3w): the turn errored before reaching a
+                // final_answer terminal, so the loop stamped nothing — set both.
+                sp.set_attr(
+                    "agent.turn.status",
+                    crate::observability::AttrValue::Str("error".into()),
+                );
+                sp.set_attr(
+                    "agent.turn.exit_reason",
+                    crate::observability::AttrValue::Str("error".into()),
+                );
             }
             // Set session state to error
             if let Some(ref backend) = state.session_backend {

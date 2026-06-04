@@ -15,7 +15,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use super::traits::Span;
+use super::traits::{AttrValue, Span};
 
 tokio::task_local! {
     static ACTIVE_SPAN: Arc<dyn Span>;
@@ -37,4 +37,23 @@ where
 /// (e.g. tests, or code paths not yet wrapped by an owner).
 pub fn current_span() -> Option<Arc<dyn Span>> {
     ACTIVE_SPAN.try_with(|s| s.clone()).ok()
+}
+
+/// Stamp the queryable turn-outcome (`agent.turn.exit_reason` + `agent.turn.iterations`)
+/// on the ambient root span at a loop terminal point (zc-ug3w).
+///
+/// Set from inside the tool-call loops (`loop_::run_tool_call_loop`,
+/// `Agent::turn`/`turn_streamed`) because the iteration count and the
+/// final_answer-vs-max_iterations distinction live there, not at the root
+/// `set_status` sites where both surface as `Ok(String)`. `current_span()` at a
+/// loop-body terminal resolves to the activation root (`llm.call`/`tool.call`
+/// children are transient and out of scope here). No-op outside an activation
+/// scope (tests, untraced paths). Both values are structural enum/int — non-PII,
+/// prod-safe, no scrub/truncation/gate. The `agent.turn.status` twin is set at
+/// the root sites alongside the native OTel `set_status`.
+pub fn stamp_turn_exit(reason: &str, iterations: usize) {
+    if let Some(sp) = current_span() {
+        sp.set_attr("agent.turn.exit_reason", AttrValue::Str(reason.to_string()));
+        sp.set_attr("agent.turn.iterations", AttrValue::Int(iterations as i64));
+    }
 }

@@ -1550,6 +1550,21 @@ async fn handle_webhook(
         Ok(response) => {
             // Native OTel root status: webhook turn succeeded -> trace OK.
             activation_span.set_status(true);
+            // Queryable turn-outcome twins (zc-ug3w). The webhook path is a
+            // single simple-chat round (no tool loop), so stamp all three here:
+            // a clean completion is final_answer over one iteration.
+            activation_span.set_attr(
+                "agent.turn.status",
+                crate::observability::AttrValue::Str("ok".into()),
+            );
+            activation_span.set_attr(
+                "agent.turn.exit_reason",
+                crate::observability::AttrValue::Str("final_answer".into()),
+            );
+            activation_span.set_attr(
+                "agent.turn.iterations",
+                crate::observability::AttrValue::Int(1),
+            );
             // Laminar replay Root output: scrubbed+truncated final response on
             // the activation root (Laminar reads root_span_output from
             // `lmnr.span.output`).
@@ -1596,6 +1611,19 @@ async fn handle_webhook(
         Err(e) => {
             // Native OTel root status: webhook turn failed -> trace ERROR.
             activation_span.set_status(false);
+            // Queryable turn-outcome twins (zc-ug3w): failed simple-chat round.
+            activation_span.set_attr(
+                "agent.turn.status",
+                crate::observability::AttrValue::Str("error".into()),
+            );
+            activation_span.set_attr(
+                "agent.turn.exit_reason",
+                crate::observability::AttrValue::Str("error".into()),
+            );
+            activation_span.set_attr(
+                "agent.turn.iterations",
+                crate::observability::AttrValue::Int(0),
+            );
             let duration = started_at.elapsed();
             let sanitized = providers::sanitize_api_error(&e.to_string());
 

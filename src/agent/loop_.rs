@@ -6,7 +6,7 @@ use crate::memory::{self, Memory, MemoryCategory, decay};
 use crate::multimodal;
 use crate::observability::{
     self, AttrValue, Observer, ObserverEvent, Span, Trigger, current_span, runtime_trace,
-    scope_span,
+    scope_span, stamp_turn_exit,
 };
 use crate::providers::traits::StreamEvent;
 use crate::providers::{
@@ -2996,6 +2996,10 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            // Queryable turn-outcome on the activation root (zc-ug3w): the loop
+            // exited on a model completion with no tool calls — the normal
+            // terminal AND the orphaned-praxis stall shape.
+            stamp_turn_exit("final_answer", iteration + 1);
             runtime_trace::record_event(
                 "turn_final_response",
                 Some(channel_name),
@@ -3513,6 +3517,9 @@ pub(crate) async fn run_tool_call_loop(
         }
     }
 
+    // Queryable turn-outcome on the activation root (zc-ug3w): the loop hit its
+    // iteration cap (the graceful-summary call below is not counted as a round).
+    stamp_turn_exit("max_iterations", max_iterations);
     runtime_trace::record_event(
         "tool_loop_exhausted",
         Some(channel_name),
@@ -4190,6 +4197,11 @@ pub async fn run(
                     }
                     // Native OTel root status: fatal turn error -> trace ERROR.
                     activation_span.set_status(false);
+                    // Queryable twin (zc-ug3w): error outcome (the loop did not
+                    // reach a final_answer/max_iterations terminal).
+                    activation_span.set_attr("agent.turn.status", AttrValue::Str("error".into()));
+                    activation_span
+                        .set_attr("agent.turn.exit_reason", AttrValue::Str("error".into()));
                     return Err(e);
                 }
             }
@@ -4645,6 +4657,9 @@ pub async fn run(
     // Native OTel root status: clean session exit -> trace OK. (Rare `?`
     // early-returns above, e.g. session-history load/save, leave it Unset.)
     activation_span.set_status(true);
+    // Queryable status twin (zc-ug3w); exit_reason+iterations already stamped by
+    // the tool loop at its terminal (final_answer/max_iterations).
+    activation_span.set_attr("agent.turn.status", AttrValue::Str("ok".into()));
     Ok(final_output)
 }
 
@@ -5021,6 +5036,15 @@ pub async fn process_message(
     }
     // Native OTel root status: trace-level success/failure (queryable, ungated).
     activation_span.set_status(result.is_ok());
+    // Queryable status twin (zc-ug3w). On success the tool loop already stamped
+    // exit_reason (final_answer/max_iterations); on error stamp it here.
+    activation_span.set_attr(
+        "agent.turn.status",
+        AttrValue::Str(if result.is_ok() { "ok" } else { "error" }.into()),
+    );
+    if result.is_err() {
+        activation_span.set_attr("agent.turn.exit_reason", AttrValue::Str("error".into()));
+    }
     result
 }
 
@@ -6701,6 +6725,168 @@ mod tests {
         assert!(
             idx_a < idx_b,
             "tool results should preserve input order for tool call mapping"
+        );
+    }
+
+    /// Records every `set_attr` on an ambient span so tests can assert the
+    /// queryable turn-outcome twins (zc-ug3w) the tool loop stamps on the root.
+    #[derive(Clone, Default)]
+    struct AttrRecorder {
+        attrs: Arc<Mutex<Vec<(String, String)>>>,
+    }
+    impl crate::observability::Span for AttrRecorder {
+        fn child(&self, _name: &str) -> Box<dyn crate::observability::Span> {
+            Box::new(crate::observability::traits::NoopSpan)
+        }
+        fn set_attr(&self, key: &str, value: crate::observability::AttrValue) {
+            let rendered = match value {
+                crate::observability::AttrValue::Str(s) => s,
+                crate::observability::AttrValue::Int(i) => i.to_string(),
+                crate::observability::AttrValue::Bool(b) => b.to_string(),
+                crate::observability::AttrValue::Float(f) => f.to_string(),
+                crate::observability::AttrValue::Array(a) => a.join(","),
+            };
+            self.attrs.lock().unwrap().push((key.to_string(), rendered));
+        }
+        fn set_status(&self, _ok: bool) {}
+    }
+
+    /// zc-ug3w: a turn ending on a model completion with no tool calls stamps
+    /// `agent.turn.exit_reason=final_answer` and `agent.turn.iterations=1` on the
+    /// ambient activation root.
+    #[tokio::test]
+    async fn run_tool_call_loop_stamps_final_answer_turn_outcome_on_root() {
+        let recorder = AttrRecorder::default();
+        let attrs = Arc::clone(&recorder.attrs);
+        let span: Arc<dyn crate::observability::Span> = Arc::new(recorder);
+
+        let provider = ScriptedProvider::from_text_responses(vec!["just an answer"]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("hi")];
+        let observer = NoopObserver;
+
+        let result = crate::observability::scope_span(
+            span,
+            run_tool_call_loop(
+                &provider,
+                &mut history,
+                &tools_registry,
+                &observer,
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "telegram",
+                None,
+                &crate::config::MultimodalConfig::default(),
+                4,
+                None,
+                None,
+                None,
+                &[],
+                &[],
+                None,
+                None,
+                &crate::config::PacingConfig::default(),
+                0,
+                0,
+                None,
+            ),
+        )
+        .await
+        .expect("loop should complete");
+
+        assert_eq!(result, "just an answer");
+        let recorded = attrs.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|(k, v)| k == "agent.turn.exit_reason" && v == "final_answer"),
+            "expected final_answer exit_reason, got {recorded:?}"
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|(k, v)| k == "agent.turn.iterations" && v == "1"),
+            "expected iterations=1, got {recorded:?}"
+        );
+    }
+
+    /// zc-ug3w: `agent.turn.iterations` counts loop rounds — one tool round
+    /// followed by a final answer is two iterations.
+    #[tokio::test]
+    async fn run_tool_call_loop_counts_iterations_across_tool_round() {
+        let recorder = AttrRecorder::default();
+        let attrs = Arc::clone(&recorder.attrs);
+        let span: Arc<dyn crate::observability::Span> = Arc::new(recorder);
+
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "<tool_call>\n{\"name\":\"counter\",\"arguments\":{\"value\":\"x\"}}\n</tool_call>",
+            "done",
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "counter",
+            Arc::clone(&invocations),
+        ))];
+        let approval_cfg = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("use the tool"),
+        ];
+        let observer = NoopObserver;
+
+        let result = crate::observability::scope_span(
+            span,
+            run_tool_call_loop(
+                &provider,
+                &mut history,
+                &tools_registry,
+                &observer,
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                Some(&approval_mgr),
+                "telegram",
+                None,
+                &crate::config::MultimodalConfig::default(),
+                4,
+                None,
+                None,
+                None,
+                &[],
+                &[],
+                None,
+                None,
+                &crate::config::PacingConfig::default(),
+                0,
+                0,
+                None,
+            ),
+        )
+        .await
+        .expect("loop should complete");
+
+        assert_eq!(result, "done");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        let recorded = attrs.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|(k, v)| k == "agent.turn.exit_reason" && v == "final_answer"),
+            "expected final_answer exit_reason, got {recorded:?}"
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|(k, v)| k == "agent.turn.iterations" && v == "2"),
+            "expected iterations=2, got {recorded:?}"
         );
     }
 

@@ -16,7 +16,7 @@ pub mod verbose;
 pub use self::log::LogObserver;
 #[allow(unused_imports)]
 pub use self::multi::MultiObserver;
-pub use active::{current_span, scope_span};
+pub use active::{current_span, scope_span, stamp_turn_exit};
 pub use identity::{pod_user_id, tag_channel, tag_user_id};
 pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
