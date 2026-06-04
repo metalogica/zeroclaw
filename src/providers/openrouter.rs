@@ -207,6 +207,10 @@ struct UsageInfo {
 #[derive(Debug, Deserialize)]
 struct NativeChoice {
     message: NativeResponseMessage,
+    /// Provider's stop reason for this choice (`stop` / `tool_calls` / `length`
+    /// / …). Carried onto `ChatResponse.finish_reason` for the `llm.call` span.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -525,6 +529,9 @@ impl OpenRouterProvider {
             tool_calls,
             usage: None,
             reasoning_content,
+            // Populated by the caller from the enclosing `NativeChoice`; the
+            // message-only mapper has no access to the choice-level field.
+            finish_reason: None,
         }
     }
 
@@ -771,6 +778,9 @@ impl Provider for OpenRouterProvider {
         let images = native_choice.message.images.clone();
         let reasoning_details = native_choice.message.reasoning_details.clone();
         let mut result = Self::parse_native_response(native_choice.message);
+        // Carry the choice-level stop reason (the message-only mapper can't see it)
+        // onto the response so the `llm.call` span records why generation ended.
+        result.finish_reason = native_choice.finish_reason;
         // Save image data to disk if present.
         if result.text.as_deref().map_or(true, str::is_empty) {
             if let Some(ref workspace) = self.workspace_dir {
@@ -898,6 +908,9 @@ impl Provider for OpenRouterProvider {
         let images = native_choice.message.images.clone();
         let reasoning_details = native_choice.message.reasoning_details.clone();
         let mut result = Self::parse_native_response(native_choice.message);
+        // Carry the choice-level stop reason (the message-only mapper can't see it)
+        // onto the response so the `llm.call` span records why generation ended.
+        result.finish_reason = native_choice.finish_reason;
         // Save image data to disk if present.
         if result.text.as_deref().map_or(true, str::is_empty) {
             if let Some(ref workspace) = self.workspace_dir {
@@ -990,6 +1003,10 @@ impl Provider for OpenRouterProvider {
             let mut bytes_stream = response.bytes_stream();
             let mut buffer = String::new();
             let mut tool_accs: Vec<OrToolCallAccumulator> = Vec::new();
+            // Last non-null `finish_reason` seen across SSE chunks. OpenRouter only
+            // sets it on the terminal chunk, so capture-and-overwrite leaves the
+            // stop reason for `StreamEvent::Final` to carry to the `llm.call` span.
+            let mut final_finish_reason: Option<String> = None;
             // Accumulate UTF-8 bytes safely across HTTP chunk boundaries
             // (e.g. multibyte glyphs split across two TCP frames).
             let mut utf8_buf: Vec<u8> = Vec::new();
@@ -1040,6 +1057,9 @@ impl Provider for OpenRouterProvider {
                     };
 
                     for choice in &chunk.choices {
+                        if let Some(reason) = choice.finish_reason.as_deref() {
+                            final_finish_reason = Some(reason.to_string());
+                        }
                         if let Some(reasoning) = choice
                             .delta
                             .reasoning
@@ -1088,7 +1108,11 @@ impl Provider for OpenRouterProvider {
                 }
             }
 
-            let _ = tx.send(Ok(StreamEvent::Final)).await;
+            let _ = tx
+                .send(Ok(StreamEvent::Final {
+                    finish_reason: final_finish_reason,
+                }))
+                .await;
         });
 
         stream::unfold(rx, |mut rx| async {
@@ -1732,6 +1756,51 @@ mod tests {
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let message = &resp.choices[0].message;
         assert_eq!(message.reasoning_content.as_deref(), Some("deep thought"));
+    }
+
+    #[test]
+    fn native_choice_deserializes_finish_reason() {
+        // The choice-level `finish_reason` must survive deserialization so the
+        // `chat()`/`chat_with_tools()` paths can carry it onto `ChatResponse`.
+        let json = r#"{
+            "choices":[{
+                "finish_reason":"stop",
+                "message":{"content":"done"}
+            }]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn native_choice_finish_reason_absent_is_none() {
+        // Absent `finish_reason` deserializes to None; the emit site maps None to
+        // the literal "unknown" so the span field is never ambiguous.
+        let json = r#"{"choices":[{"message":{"content":"done"}}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.choices[0].finish_reason.is_none());
+    }
+
+    #[test]
+    fn finish_reason_tool_calls_with_zero_parsed_is_queryable() {
+        // The incident's "emission dropped" pathology: provider says it's calling
+        // tools (`finish_reason=tool_calls`) but the runtime parses zero. Both
+        // signals must reach `ChatResponse` so a trace can disambiguate it from a
+        // clean stop. Here the choice declares `tool_calls` but carries no
+        // `tool_calls` array → finish_reason="tool_calls" AND tool_calls.len()==0.
+        let json = r#"{
+            "choices":[{
+                "finish_reason":"tool_calls",
+                "message":{"content":null}
+            }]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let choice = resp.choices.into_iter().next().unwrap();
+        let finish_reason = choice.finish_reason.clone();
+        let mut parsed = OpenRouterProvider::parse_native_response(choice.message);
+        parsed.finish_reason = finish_reason;
+        assert_eq!(parsed.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(parsed.tool_calls.len(), 0);
     }
 
     #[test]

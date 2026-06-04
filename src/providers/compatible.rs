@@ -544,6 +544,10 @@ struct UsageInfo {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    /// Provider's stop reason for this choice (`stop` / `tool_calls` / `length`
+    /// / …). Carried onto `ChatResponse.finish_reason` for the `llm.call` span.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 /// Remove `<think>...</think>` blocks from model output.
@@ -1114,6 +1118,9 @@ fn sse_bytes_to_events(
         let mut buffer = String::new();
         let mut tool_calls: Vec<StreamToolCallAccumulator> = Vec::new();
         let mut emitted_tool_calls = false;
+        // Last non-null `finish_reason` across SSE chunks (set only on the
+        // terminal chunk), carried to `StreamEvent::Final` for the span.
+        let mut final_finish_reason: Option<String> = None;
 
         match response.error_for_status_ref() {
             Ok(_) => {}
@@ -1213,8 +1220,11 @@ fn sse_bytes_to_events(
                                 }
                             }
 
-                            if choice.finish_reason.as_deref() == Some("tool_calls") {
-                                should_emit_tool_calls = true;
+                            if let Some(reason) = choice.finish_reason.as_deref() {
+                                final_finish_reason = Some(reason.to_string());
+                                if reason == "tool_calls" {
+                                    should_emit_tool_calls = true;
+                                }
                             }
                         }
 
@@ -1249,7 +1259,11 @@ fn sse_bytes_to_events(
             }
         }
 
-        let _ = tx.send(Ok(StreamEvent::Final)).await;
+        let _ = tx
+            .send(Ok(StreamEvent::Final {
+                finish_reason: final_finish_reason,
+            }))
+            .await;
     });
 
     stream::unfold(rx, |mut rx| async move {
@@ -1608,6 +1622,9 @@ impl OpenAiCompatibleProvider {
             tool_calls,
             usage: None,
             reasoning_content,
+            // Populated by the caller from the enclosing `Choice`; the
+            // message-only mapper has no access to the choice-level field.
+            finish_reason: None,
         }
     }
 
@@ -1944,6 +1961,7 @@ impl Provider for OpenAiCompatibleProvider {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    finish_reason: None,
                 });
             }
         };
@@ -1965,6 +1983,7 @@ impl Provider for OpenAiCompatibleProvider {
             .next()
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
+        let finish_reason = choice.finish_reason;
         let text = choice.message.effective_content_optional();
         let reasoning_content = choice.message.reasoning_content;
         let tool_calls = choice
@@ -1989,6 +2008,7 @@ impl Provider for OpenAiCompatibleProvider {
             tool_calls,
             usage,
             reasoning_content,
+            finish_reason,
         })
     }
 
@@ -2043,6 +2063,7 @@ impl Provider for OpenAiCompatibleProvider {
                             tool_calls: vec![],
                             usage: None,
                             reasoning_content: None,
+                            finish_reason: None,
                         })
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
@@ -2072,6 +2093,7 @@ impl Provider for OpenAiCompatibleProvider {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    finish_reason: None,
                 });
             }
 
@@ -2084,6 +2106,7 @@ impl Provider for OpenAiCompatibleProvider {
                         tool_calls: vec![],
                         usage: None,
                         reasoning_content: None,
+                        finish_reason: None,
                     })
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
@@ -2102,15 +2125,16 @@ impl Provider for OpenAiCompatibleProvider {
             output_tokens: u.completion_tokens,
             cached_input_tokens: None,
         });
-        let message = native_response
+        let choice = native_response
             .choices
             .into_iter()
             .next()
-            .map(|choice| choice.message)
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
-        let mut result = Self::parse_native_response(message);
+        let finish_reason = choice.finish_reason;
+        let mut result = Self::parse_native_response(choice.message);
         result.usage = usage;
+        result.finish_reason = finish_reason;
         Ok(result)
     }
 
@@ -2134,7 +2158,12 @@ impl Provider for OpenAiCompatibleProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         if !options.enabled {
-            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+            return stream::once(async {
+                Ok(StreamEvent::Final {
+                    finish_reason: None,
+                })
+            })
+            .boxed();
         }
 
         let credential = self.credential.clone();
@@ -3036,6 +3065,24 @@ mod tests {
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].id, "call_123");
         assert_eq!(parsed.tool_calls[0].name, "shell");
+    }
+
+    #[test]
+    fn choice_deserializes_finish_reason() {
+        // The non-streaming `Choice` must capture the choice-level stop reason so
+        // `chat()`/`chat_with_tools()` can carry it onto `ChatResponse`.
+        let json = r#"{
+            "choices":[{"finish_reason":"length","message":{"content":"truncated"}}]
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("length"));
+    }
+
+    #[test]
+    fn choice_finish_reason_absent_is_none() {
+        let json = r#"{"choices":[{"message":{"content":"done"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.choices[0].finish_reason.is_none());
     }
 
     #[test]

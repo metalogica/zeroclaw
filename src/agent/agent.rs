@@ -1053,6 +1053,23 @@ impl Agent {
             };
             if let Some(sp) = &llm_span {
                 sp.set_status(true);
+                // Structural loop-exit diagnostics (see run_tool_call_loop): the
+                // provider's stop reason + parsed tool-call count, so a trace can
+                // tell *why* the turn ended. Non-content; always set (`"unknown"`
+                // when the path/provider didn't surface a reason).
+                sp.set_attr(
+                    "gen_ai.response.finish_reason",
+                    AttrValue::Str(
+                        response
+                            .finish_reason
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    ),
+                );
+                sp.set_attr(
+                    "gen_ai.response.tool_call_count",
+                    AttrValue::Int(response.tool_calls.len() as i64),
+                );
                 if let Some(reasoning) = response.reasoning_content.as_deref() {
                     sp.set_attr(
                         "gen_ai.reasoning",
@@ -1289,6 +1306,7 @@ impl Agent {
             let mut streamed_text = String::new();
             let mut streamed_reasoning = String::new();
             let mut streamed_tool_calls: Vec<crate::providers::traits::ToolCall> = Vec::new();
+            let mut streamed_finish_reason: Option<String> = None;
             let mut got_stream = false;
 
             while let Some(item) = stream.next().await {
@@ -1338,7 +1356,10 @@ impl Agent {
                         } => {
                             let _ = event_tx.send(TurnEvent::ToolResult { name, output }).await;
                         }
-                        crate::providers::traits::StreamEvent::Final => break,
+                        crate::providers::traits::StreamEvent::Final { finish_reason } => {
+                            streamed_finish_reason = finish_reason;
+                            break;
+                        }
                     },
                     Err(_) => break,
                 }
@@ -1361,6 +1382,7 @@ impl Agent {
                     } else {
                         Some(streamed_reasoning)
                     },
+                    finish_reason: streamed_finish_reason,
                 }
             } else {
                 // Fall back to non-streaming chat
@@ -1394,6 +1416,23 @@ impl Agent {
 
             if let Some(sp) = &llm_span {
                 sp.set_status(true);
+                // Structural loop-exit diagnostics (see run_tool_call_loop): the
+                // provider's stop reason + parsed tool-call count, so a trace can
+                // tell *why* the turn ended. Non-content; always set (`"unknown"`
+                // when the path/provider didn't surface a reason).
+                sp.set_attr(
+                    "gen_ai.response.finish_reason",
+                    AttrValue::Str(
+                        response
+                            .finish_reason
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    ),
+                );
+                sp.set_attr(
+                    "gen_ai.response.tool_call_count",
+                    AttrValue::Int(response.tool_calls.len() as i64),
+                );
                 if let Some(reasoning) = response.reasoning_content.as_deref() {
                     sp.set_attr(
                         "gen_ai.reasoning",
@@ -1651,6 +1690,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    finish_reason: None,
                 });
             }
             Ok(guard.remove(0))
@@ -1688,6 +1728,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    finish_reason: None,
                 });
             }
             Ok(guard.remove(0))
@@ -1727,6 +1768,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                finish_reason: None,
             }]),
         });
 
@@ -1767,12 +1809,14 @@ mod tests {
                     }],
                     usage: None,
                     reasoning_content: None,
+                    finish_reason: None,
                 },
                 crate::providers::ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    finish_reason: None,
                 },
             ]),
         });
@@ -1816,6 +1860,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                finish_reason: None,
             }]),
             seen_models: seen_models.clone(),
         });
@@ -2210,6 +2255,7 @@ mod tests {
                     }],
                     usage: None,
                     reasoning_content: None,
+                    finish_reason: None,
                 })
             } else {
                 Ok(crate::providers::ChatResponse {
@@ -2217,6 +2263,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    finish_reason: None,
                 })
             }
         }
@@ -2248,7 +2295,9 @@ mod tests {
                     });
                 stream::iter(vec![
                     Ok(tc),
-                    Ok(crate::providers::traits::StreamEvent::Final),
+                    Ok(crate::providers::traits::StreamEvent::Final {
+                        finish_reason: None,
+                    }),
                 ])
                 .boxed()
             } else {
@@ -2262,7 +2311,9 @@ mod tests {
                 );
                 stream::iter(vec![
                     Ok(chunk),
-                    Ok(crate::providers::traits::StreamEvent::Final),
+                    Ok(crate::providers::traits::StreamEvent::Final {
+                        finish_reason: None,
+                    }),
                 ])
                 .boxed()
             }
@@ -2370,6 +2421,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: Some("inner thought".into()),
+                finish_reason: None,
             })
         }
 
@@ -2466,6 +2518,7 @@ mod tests {
                     }],
                     usage: None,
                     reasoning_content: Some("thinking before tool".into()),
+                    finish_reason: None,
                 })
             } else {
                 Ok(crate::providers::ChatResponse {
@@ -2473,6 +2526,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    finish_reason: None,
                 })
             }
         }

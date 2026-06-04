@@ -73,6 +73,12 @@ pub struct ChatResponse {
     /// sent back in subsequent API requests — some providers reject tool-call
     /// history that omits this field.
     pub reasoning_content: Option<String>,
+    /// Provider's `choices[].finish_reason` verbatim (lowercased as returned:
+    /// `stop` / `tool_calls` / `length` / `content_filter` / …). `None` when the
+    /// provider omitted it or the path doesn't surface it; emitted as the literal
+    /// `"unknown"` on the `llm.call` span so the field is always present and
+    /// queryable. Structural, non-content — never scrubbed or truncated.
+    pub finish_reason: Option<String>,
 }
 
 impl ChatResponse {
@@ -195,14 +201,19 @@ pub enum StreamEvent {
     PreExecutedToolCall { name: String, args: String },
     /// The result of a pre-executed tool call.
     PreExecutedToolResult { name: String, output: String },
-    /// Stream has completed.
-    Final,
+    /// Stream has completed. Carries the terminal chunk's `finish_reason`
+    /// (`stop` / `tool_calls` / `length` / …) when the provider surfaces it on
+    /// the final SSE chunk, so consumers can record *why* the stream ended on the
+    /// `llm.call` span. `None` when the provider/path doesn't expose it.
+    Final { finish_reason: Option<String> },
 }
 
 impl StreamEvent {
     pub(crate) fn from_chunk(chunk: StreamChunk) -> Self {
         if chunk.is_final {
-            Self::Final
+            Self::Final {
+                finish_reason: None,
+            }
         } else {
             Self::TextDelta(chunk)
         }
@@ -413,6 +424,7 @@ pub trait Provider: Send + Sync {
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
+                    finish_reason: None,
                 });
             }
         }
@@ -425,6 +437,7 @@ pub trait Provider: Send + Sync {
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
+            finish_reason: None,
         })
     }
 
@@ -460,6 +473,7 @@ pub trait Provider: Send + Sync {
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
+            finish_reason: None,
         })
     }
 
@@ -615,6 +629,7 @@ mod tests {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+            finish_reason: None,
         };
         assert!(!empty.has_tool_calls());
         assert_eq!(empty.text_or_empty(), "");
@@ -628,6 +643,7 @@ mod tests {
             }],
             usage: None,
             reasoning_content: None,
+            finish_reason: None,
         };
         assert!(with_tools.has_tool_calls());
         assert_eq!(with_tools.text_or_empty(), "Let me check");
@@ -651,6 +667,7 @@ mod tests {
                 cached_input_tokens: None,
             }),
             reasoning_content: None,
+            finish_reason: None,
         };
         assert_eq!(resp.usage.as_ref().unwrap().input_tokens, Some(100));
         assert_eq!(resp.usage.as_ref().unwrap().output_tokens, Some(50));
@@ -1087,6 +1104,6 @@ mod tests {
             StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "hello"),
             other => panic!("expected text delta event, got {other:?}"),
         }
-        assert!(matches!(second, StreamEvent::Final));
+        assert!(matches!(second, StreamEvent::Final { .. }));
     }
 }

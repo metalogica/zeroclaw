@@ -559,6 +559,7 @@ impl AnthropicProvider {
             tool_calls,
             usage,
             reasoning_content: None,
+            finish_reason: None,
         }
     }
 
@@ -729,7 +730,11 @@ impl AnthropicProvider {
                 }
                 "message_stop" => {
                     tracing::debug!("Anthropic stream: message_stop");
-                    let _ = tx.send(Ok(StreamEvent::Final)).await;
+                    let _ = tx
+                        .send(Ok(StreamEvent::Final {
+                            finish_reason: None,
+                        }))
+                        .await;
                     return;
                 }
                 "error" => {
@@ -745,7 +750,11 @@ impl AnthropicProvider {
             }
         }
 
-        let _ = tx.send(Ok(StreamEvent::Final)).await;
+        let _ = tx
+            .send(Ok(StreamEvent::Final {
+                finish_reason: None,
+            }))
+            .await;
     }
 }
 
@@ -966,7 +975,12 @@ impl Provider for AnthropicProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         if !options.enabled {
-            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+            return stream::once(async {
+                Ok(StreamEvent::Final {
+                    finish_reason: None,
+                })
+            })
+            .boxed();
         }
 
         let credential = match self.credential.as_ref() {

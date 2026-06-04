@@ -309,6 +309,7 @@ impl Provider for ClaudeCodeProvider {
             tool_calls: Vec::new(),
             usage: Some(usage.unwrap_or_default()),
             reasoning_content: None,
+            finish_reason: None,
         })
     }
 }

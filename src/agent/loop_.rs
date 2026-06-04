@@ -2026,6 +2026,10 @@ struct StreamedChatOutcome {
     /// text-accumulation path; captured here so the synthetic `ChatResponse`
     /// can surface it on the `llm.call` span (`gen_ai.reasoning`).
     reasoning: String,
+    /// Stop reason from the terminal stream chunk (`StreamEvent::Final`), carried
+    /// onto the synthetic `ChatResponse` so the `llm.call` span records why the
+    /// stream ended. `None` when the provider didn't surface it.
+    finish_reason: Option<String>,
 }
 
 async fn consume_provider_streaming_response(
@@ -2067,7 +2071,10 @@ async fn consume_provider_streaming_response(
 
         let event = event_result.map_err(|err| anyhow::anyhow!("provider stream error: {err}"))?;
         match event {
-            StreamEvent::Final => break,
+            StreamEvent::Final { finish_reason } => {
+                outcome.finish_reason = finish_reason;
+                break;
+            }
             StreamEvent::ToolCall(tool_call) => {
                 outcome.tool_calls.push(tool_call);
                 suppress_forwarding = true;
@@ -2636,6 +2643,7 @@ pub(crate) async fn run_tool_call_loop(
                         tool_calls: streamed.tool_calls,
                         usage: None,
                         reasoning_content,
+                        finish_reason: streamed.finish_reason,
                     })
                 }
                 Err(stream_err) => {
@@ -2733,6 +2741,24 @@ pub(crate) async fn run_tool_call_loop(
         if let Some(sp) = &llm_span {
             sp.set_status(chat_result.is_ok());
             if let Ok(resp) = &chat_result {
+                // Structural loop-exit diagnostics: the provider's stop reason and
+                // the count of tool calls the runtime actually parsed. The pair
+                // disambiguates "model quit early" (stop + 0 calls mid-workflow)
+                // from "emission dropped" (tool_calls + 0 parsed). Non-content
+                // enum/int — never scrubbed, truncated, or dev-gated. Always set
+                // (`"unknown"` when absent) so absence-vs-unknown isn't ambiguous.
+                sp.set_attr(
+                    "gen_ai.response.finish_reason",
+                    AttrValue::Str(
+                        resp.finish_reason
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    ),
+                );
+                sp.set_attr(
+                    "gen_ai.response.tool_call_count",
+                    AttrValue::Int(resp.tool_calls.len() as i64),
+                );
                 // Capture OpenRouter inner thoughts (truncated; large-payload
                 // by-reference store is deferred per spec §6).
                 if let Some(reasoning) = resp.reasoning_content.as_deref() {
@@ -5472,6 +5498,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                finish_reason: None,
             })
         }
     }
@@ -5490,6 +5517,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
+                    finish_reason: None,
                 })
                 .collect();
             Self {
@@ -5708,18 +5736,24 @@ mod tests {
                 NativeStreamTurn::ToolCall(tool_call) => {
                     Box::pin(futures_util::stream::iter(vec![
                         Ok(StreamEvent::ToolCall(tool_call)),
-                        Ok(StreamEvent::Final),
+                        Ok(StreamEvent::Final {
+                            finish_reason: None,
+                        }),
                     ]))
                 }
                 NativeStreamTurn::Text(text) => Box::pin(futures_util::stream::iter(vec![
                     Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
-                    Ok(StreamEvent::Final),
+                    Ok(StreamEvent::Final {
+                        finish_reason: None,
+                    }),
                 ])),
                 NativeStreamTurn::TextWithReasoning { reasoning, text } => {
                     Box::pin(futures_util::stream::iter(vec![
                         Ok(StreamEvent::TextDelta(StreamChunk::reasoning(reasoning))),
                         Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
-                        Ok(StreamEvent::Final),
+                        Ok(StreamEvent::Final {
+                            finish_reason: None,
+                        }),
                     ]))
                 }
             }
@@ -7158,12 +7192,14 @@ mod tests {
                     }],
                     usage: None,
                     reasoning_content: None,
+                    finish_reason: None,
                 },
                 ChatResponse {
                     text: Some("Final answer".into()),
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
+                    finish_reason: None,
                 },
             ]))),
             capabilities: ProviderCapabilities {
@@ -9628,6 +9664,7 @@ Let me check the result."#;
                     cached_input_tokens: None,
                 }),
                 reasoning_content: None,
+                finish_reason: None,
             }]))),
             capabilities: ProviderCapabilities::default(),
         };
@@ -9788,6 +9825,7 @@ Let me check the result."#;
                     cached_input_tokens: None,
                 }),
                 reasoning_content: None,
+                finish_reason: None,
             }]))),
             capabilities: ProviderCapabilities::default(),
         };

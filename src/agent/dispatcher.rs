@@ -264,6 +264,7 @@ mod tests {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+            finish_reason: None,
         };
         let dispatcher = XmlToolDispatcher;
         let (_, calls) = dispatcher.parse_response(&response);
@@ -281,6 +282,7 @@ mod tests {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+            finish_reason: None,
         };
         let dispatcher = XmlToolDispatcher;
         let (text, calls) = dispatcher.parse_response(&response);
@@ -299,6 +301,7 @@ mod tests {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+            finish_reason: None,
         };
         let dispatcher = XmlToolDispatcher;
         let (_, calls) = dispatcher.parse_response(&response);
@@ -316,6 +319,7 @@ mod tests {
             }],
             usage: None,
             reasoning_content: None,
+            finish_reason: None,
         };
         let dispatcher = NativeToolDispatcher;
         let (_, calls) = dispatcher.parse_response(&response);

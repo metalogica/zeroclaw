@@ -1339,6 +1339,22 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
         .await;
     if let Some(sp) = &llm_span {
         sp.set_status(result.is_ok());
+        // Structural loop-exit diagnostics, kept present on every `llm.call`
+        // span. This simple-chat path sends no tools and calls `chat_with_history`
+        // (returns a bare String), so the parsed tool-call count is definitionally
+        // 0 and the provider's stop reason isn't surfaced — emit `"unknown"` so the
+        // field stays queryable rather than absent. (Surfacing the real reason here
+        // would require widening the `chat_with_history` trait return type across
+        // every provider; the tool-using gateway path delegates to
+        // `run_tool_call_loop` and is already covered there.)
+        sp.set_attr(
+            "gen_ai.response.finish_reason",
+            crate::observability::AttrValue::Str("unknown".to_string()),
+        );
+        sp.set_attr(
+            "gen_ai.response.tool_call_count",
+            crate::observability::AttrValue::Int(0),
+        );
         // Root output (Laminar replay): scrubbed+truncated response text.
         // Mirror onto `lmnr.span.output` so the llm.call renders in Laminar's
         // message view (gen_ai.completion is never read there).
