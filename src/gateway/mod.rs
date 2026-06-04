@@ -1535,6 +1535,8 @@ async fn handle_webhook(
     .await
     {
         Ok(response) => {
+            // Native OTel root status: webhook turn succeeded -> trace OK.
+            activation_span.set_status(true);
             // Laminar replay Root output: scrubbed+truncated final response on
             // the activation root (Laminar reads root_span_output from
             // `lmnr.span.output`).
@@ -1574,6 +1576,8 @@ async fn handle_webhook(
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
+            // Native OTel root status: webhook turn failed -> trace ERROR.
+            activation_span.set_status(false);
             let duration = started_at.elapsed();
             let sanitized = providers::sanitize_api_error(&e.to_string());
 

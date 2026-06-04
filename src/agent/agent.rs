@@ -1381,7 +1381,14 @@ impl Agent {
                     .await
                 {
                     Ok(resp) => resp,
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        // Close the llm.call span on the streamed error path so it
+                        // doesn't leave Status Unset (mirrors `turn()`).
+                        if let Some(sp) = &llm_span {
+                            sp.set_status(false);
+                        }
+                        return Err(err);
+                    }
                 }
             };
 

@@ -313,6 +313,16 @@ lib suite green (6151 passed; the only intermittent failures are a pre-existing 
   REPL) so a single input/output pair is ill-defined; left unset pending a per-turn model.
 - `tool.call` carries Composio **action** + **toolkit** (`composio.action`, `composio.toolkit`)
   parsed from the call args, in both engines.
+- **`agent.activation` root carries native OTel Status (`OK` | `ERROR`)** — every trigger site
+  (`loop_.rs` `run`/`process_message`, `gateway/mod.rs` webhook, `gateway/ws.rs` WS, `channels/mod.rs`
+  native channels) now sets the root span status from the outcome it already has, so trace-level
+  success/failure is queryable (error-rate, alerting, "show only failed traces"). **Ungated** — a
+  native OTel field, not content: status **code** only, with an empty Status description
+  (`otel.rs` maps `false -> Status::error("")`), so no §7.1 allowlist change. Child `llm.call`
+  error paths that previously left Status Unset (`agent.rs turn_streamed`) are also closed to
+  `ERROR`. **Edge:** the session-scoped CLI/cron `run()` leaves Status Unset on rare `?`
+  early-returns (session-history load/save); per-turn interactive errors are swallowed and
+  captured on child spans.
 
 **Documented gaps (not silently dropped):**
 - **Composio `log_…` id** — *unavailable*: the v3 execute API (`composio.rs`) does not return
