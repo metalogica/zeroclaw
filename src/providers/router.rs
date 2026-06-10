@@ -551,6 +551,7 @@ mod tests {
                 })),
                 Ok(StreamEvent::Final {
                     finish_reason: None,
+                    usage: None,
                 }),
             ])
             .boxed()

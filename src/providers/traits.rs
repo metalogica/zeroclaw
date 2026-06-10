@@ -205,7 +205,16 @@ pub enum StreamEvent {
     /// (`stop` / `tool_calls` / `length` / …) when the provider surfaces it on
     /// the final SSE chunk, so consumers can record *why* the stream ended on the
     /// `llm.call` span. `None` when the provider/path doesn't expose it.
-    Final { finish_reason: Option<String> },
+    ///
+    /// Also carries the streamed completion's token `usage` when the provider
+    /// reports it on the terminal SSE frame (requires requesting usage on the
+    /// stream, e.g. OpenRouter's `stream_options.include_usage`). Lets the
+    /// streaming `llm.call` span stamp `gen_ai.usage.*` at parity with the
+    /// non-streaming path. `None` when the provider/path doesn't surface it.
+    Final {
+        finish_reason: Option<String>,
+        usage: Option<TokenUsage>,
+    },
 }
 
 impl StreamEvent {
@@ -213,6 +222,7 @@ impl StreamEvent {
         if chunk.is_final {
             Self::Final {
                 finish_reason: None,
+                usage: None,
             }
         } else {
             Self::TextDelta(chunk)

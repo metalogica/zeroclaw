@@ -50,6 +50,10 @@ pub struct Agent {
     memory_loader: Box<dyn MemoryLoader>,
     config: crate::config::AgentConfig,
     model_name: String,
+    /// Provider identity (e.g. `openrouter`, `anthropic`) for the `gen_ai.system`
+    /// span attribute. Set at construction from the resolved provider name; the
+    /// `Provider` trait exposes no name accessor, so it is threaded in here.
+    provider_name: String,
     temperature: f64,
     workspace_dir: std::path::PathBuf,
     identity_config: crate::config::IdentityConfig,
@@ -101,6 +105,7 @@ pub struct AgentBuilder {
     memory_loader: Option<Box<dyn MemoryLoader>>,
     config: Option<crate::config::AgentConfig>,
     model_name: Option<String>,
+    provider_name: Option<String>,
     temperature: Option<f64>,
     workspace_dir: Option<std::path::PathBuf>,
     identity_config: Option<crate::config::IdentityConfig>,
@@ -132,6 +137,7 @@ impl AgentBuilder {
             memory_loader: None,
             config: None,
             model_name: None,
+            provider_name: None,
             temperature: None,
             workspace_dir: None,
             identity_config: None,
@@ -194,6 +200,11 @@ impl AgentBuilder {
 
     pub fn model_name(mut self, model_name: String) -> Self {
         self.model_name = Some(model_name);
+        self
+    }
+
+    pub fn provider_name(mut self, provider_name: String) -> Self {
+        self.provider_name = Some(provider_name);
         self
     }
 
@@ -329,6 +340,7 @@ impl AgentBuilder {
             model_name: self
                 .model_name
                 .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into()),
+            provider_name: self.provider_name.unwrap_or_else(|| "openrouter".into()),
             temperature: self.temperature.unwrap_or(0.7),
             workspace_dir: self
                 .workspace_dir
@@ -590,6 +602,7 @@ impl Agent {
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(config.agent.clone())
             .model_name(model_name)
+            .provider_name(provider_name.to_string())
             .temperature(config.default_temperature)
             .workspace_dir(config.workspace_dir.clone())
             .classification_config(config.query_classification.clone())
@@ -1313,6 +1326,7 @@ impl Agent {
             let mut streamed_reasoning = String::new();
             let mut streamed_tool_calls: Vec<crate::providers::traits::ToolCall> = Vec::new();
             let mut streamed_finish_reason: Option<String> = None;
+            let mut streamed_usage: Option<crate::providers::traits::TokenUsage> = None;
             let mut got_stream = false;
 
             while let Some(item) = stream.next().await {
@@ -1362,8 +1376,12 @@ impl Agent {
                         } => {
                             let _ = event_tx.send(TurnEvent::ToolResult { name, output }).await;
                         }
-                        crate::providers::traits::StreamEvent::Final { finish_reason } => {
+                        crate::providers::traits::StreamEvent::Final {
+                            finish_reason,
+                            usage,
+                        } => {
                             streamed_finish_reason = finish_reason;
+                            streamed_usage = usage;
                             break;
                         }
                     },
@@ -1382,7 +1400,7 @@ impl Agent {
                 crate::providers::ChatResponse {
                     text: Some(streamed_text),
                     tool_calls: streamed_tool_calls,
-                    usage: None,
+                    usage: streamed_usage,
                     reasoning_content: if streamed_reasoning.is_empty() {
                         None
                     } else {
@@ -1422,6 +1440,23 @@ impl Agent {
 
             if let Some(sp) = &llm_span {
                 sp.set_status(true);
+                // Provider identity, at parity with run_tool_call_loop's
+                // `llm.call` (the streaming path otherwise left it empty).
+                sp.set_attr(
+                    "gen_ai.system",
+                    AttrValue::Str(self.provider_name.clone()),
+                );
+                // Token usage from the streamed completion's terminal frame
+                // (requested via `stream_options.include_usage`), mirroring the
+                // non-streaming `llm.call` so streamed turns have cost visibility.
+                if let Some(usage) = response.usage.as_ref() {
+                    if let Some(it) = usage.input_tokens {
+                        sp.set_attr("gen_ai.usage.input_tokens", AttrValue::Int(it as i64));
+                    }
+                    if let Some(ot) = usage.output_tokens {
+                        sp.set_attr("gen_ai.usage.output_tokens", AttrValue::Int(ot as i64));
+                    }
+                }
                 // Structural loop-exit diagnostics (see run_tool_call_loop): the
                 // provider's stop reason + parsed tool-call count, so a trace can
                 // tell *why* the turn ended. Non-content; always set (`"unknown"`
@@ -2309,6 +2344,7 @@ mod tests {
                     Ok(tc),
                     Ok(crate::providers::traits::StreamEvent::Final {
                         finish_reason: None,
+                        usage: None,
                     }),
                 ])
                 .boxed()
@@ -2325,6 +2361,7 @@ mod tests {
                     Ok(chunk),
                     Ok(crate::providers::traits::StreamEvent::Final {
                         finish_reason: None,
+                        usage: None,
                     }),
                 ])
                 .boxed()

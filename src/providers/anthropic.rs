@@ -733,6 +733,7 @@ impl AnthropicProvider {
                     let _ = tx
                         .send(Ok(StreamEvent::Final {
                             finish_reason: None,
+                            usage: None,
                         }))
                         .await;
                     return;
@@ -753,6 +754,7 @@ impl AnthropicProvider {
         let _ = tx
             .send(Ok(StreamEvent::Final {
                 finish_reason: None,
+                usage: None,
             }))
             .await;
     }
@@ -978,6 +980,7 @@ impl Provider for AnthropicProvider {
             return stream::once(async {
                 Ok(StreamEvent::Final {
                     finish_reason: None,
+                    usage: None,
                 })
             })
             .boxed();

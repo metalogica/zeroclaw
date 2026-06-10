@@ -139,6 +139,19 @@ struct NativeChatRequest {
     /// chunks). Set by `stream_chat` only.
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    /// Stream-only: requests a trailing usage frame on the SSE stream so the
+    /// streaming `llm.call` span can record token usage at parity with the
+    /// non-streaming path. Set by `stream_chat` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<NativeStreamOptions>,
+}
+
+/// OpenAI/OpenRouter `stream_options` request field. With `include_usage`, the
+/// provider emits a final SSE chunk (empty `choices`) carrying the completion's
+/// token usage — otherwise streamed responses report no usage at all.
+#[derive(Debug, Serialize)]
+struct NativeStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -746,6 +759,7 @@ impl Provider for OpenRouterProvider {
             modalities: self.modalities.clone(),
             user: self.pod_user_id.clone(),
     stream: None,
+    stream_options: None,
         };
 
         let response = self
@@ -876,6 +890,7 @@ impl Provider for OpenRouterProvider {
             modalities: self.modalities.clone(),
             user: self.pod_user_id.clone(),
     stream: None,
+    stream_options: None,
         };
 
         let response = self
@@ -972,6 +987,9 @@ impl Provider for OpenRouterProvider {
             modalities: self.modalities.clone(),
             user: self.pod_user_id.clone(),
             stream: Some(true),
+            stream_options: Some(NativeStreamOptions {
+                include_usage: true,
+            }),
         };
 
         let client = self.http_client();
@@ -1007,6 +1025,11 @@ impl Provider for OpenRouterProvider {
             // sets it on the terminal chunk, so capture-and-overwrite leaves the
             // stop reason for `StreamEvent::Final` to carry to the `llm.call` span.
             let mut final_finish_reason: Option<String> = None;
+            // Token usage from the trailing usage frame (requested via
+            // `stream_options.include_usage`). Like `finish_reason`, it arrives
+            // only on a terminal chunk, so capture-and-overwrite leaves it for
+            // `StreamEvent::Final` to carry to the `llm.call` span.
+            let mut final_usage: Option<TokenUsage> = None;
             // Accumulate UTF-8 bytes safely across HTTP chunk boundaries
             // (e.g. multibyte glyphs split across two TCP frames).
             let mut utf8_buf: Vec<u8> = Vec::new();
@@ -1055,6 +1078,16 @@ impl Provider for OpenRouterProvider {
                             return;
                         }
                     };
+
+                    // The trailing usage frame carries usage with empty
+                    // `choices`, so capture it here rather than in the loop below.
+                    if let Some(u) = chunk.usage.as_ref() {
+                        final_usage = Some(TokenUsage {
+                            input_tokens: u.prompt_tokens,
+                            output_tokens: u.completion_tokens,
+                            cached_input_tokens: None,
+                        });
+                    }
 
                     for choice in &chunk.choices {
                         if let Some(reason) = choice.finish_reason.as_deref() {
@@ -1111,6 +1144,7 @@ impl Provider for OpenRouterProvider {
             let _ = tx
                 .send(Ok(StreamEvent::Final {
                     finish_reason: final_finish_reason,
+                    usage: final_usage,
                 }))
                 .await;
         });
@@ -1133,6 +1167,11 @@ impl Provider for OpenRouterProvider {
 struct OrSseChunkResponse {
     #[serde(default)]
     choices: Vec<OrSseChoice>,
+    /// Token usage, present only on the trailing usage frame emitted when the
+    /// request set `stream_options.include_usage` (empty `choices` on that
+    /// frame). `None` on every content/delta chunk.
+    #[serde(default)]
+    usage: Option<UsageInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2019,6 +2058,7 @@ mod tests {
             modalities: Some(vec!["image".into(), "text".into()]),
             user: None,
     stream: None,
+    stream_options: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""modalities":["image","text"]"#));
@@ -2036,6 +2076,7 @@ mod tests {
             modalities: None,
             user: None,
     stream: None,
+    stream_options: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("modalities"));
@@ -2081,6 +2122,7 @@ mod tests {
             modalities: None,
             user: Some("kd7a2a1aqrrxyhqjbdz449f3kh84mev6".into()),
     stream: None,
+    stream_options: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""user":"kd7a2a1aqrrxyhqjbdz449f3kh84mev6""#));

@@ -2030,6 +2030,11 @@ struct StreamedChatOutcome {
     /// onto the synthetic `ChatResponse` so the `llm.call` span records why the
     /// stream ended. `None` when the provider didn't surface it.
     finish_reason: Option<String>,
+    /// Token usage from the terminal stream chunk (`StreamEvent::Final`), carried
+    /// onto the synthetic `ChatResponse` so the streaming `llm.call` span stamps
+    /// `gen_ai.usage.*` at parity with the non-streaming path. `None` when the
+    /// provider didn't surface usage on the stream.
+    usage: Option<crate::providers::traits::TokenUsage>,
 }
 
 async fn consume_provider_streaming_response(
@@ -2071,8 +2076,12 @@ async fn consume_provider_streaming_response(
 
         let event = event_result.map_err(|err| anyhow::anyhow!("provider stream error: {err}"))?;
         match event {
-            StreamEvent::Final { finish_reason } => {
+            StreamEvent::Final {
+                finish_reason,
+                usage,
+            } => {
                 outcome.finish_reason = finish_reason;
+                outcome.usage = usage;
                 break;
             }
             StreamEvent::ToolCall(tool_call) => {
@@ -2641,7 +2650,7 @@ pub(crate) async fn run_tool_call_loop(
                     Ok(crate::providers::ChatResponse {
                         text: Some(streamed.response_text),
                         tool_calls: streamed.tool_calls,
-                        usage: None,
+                        usage: streamed.usage,
                         reasoning_content,
                         finish_reason: streamed.finish_reason,
                     })
@@ -5762,6 +5771,7 @@ mod tests {
                         Ok(StreamEvent::ToolCall(tool_call)),
                         Ok(StreamEvent::Final {
                             finish_reason: None,
+                            usage: None,
                         }),
                     ]))
                 }
@@ -5769,6 +5779,7 @@ mod tests {
                     Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
                     Ok(StreamEvent::Final {
                         finish_reason: None,
+                        usage: None,
                     }),
                 ])),
                 NativeStreamTurn::TextWithReasoning { reasoning, text } => {
@@ -5777,6 +5788,7 @@ mod tests {
                         Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
                         Ok(StreamEvent::Final {
                             finish_reason: None,
+                            usage: None,
                         }),
                     ]))
                 }

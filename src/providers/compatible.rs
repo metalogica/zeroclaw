@@ -1262,6 +1262,7 @@ fn sse_bytes_to_events(
         let _ = tx
             .send(Ok(StreamEvent::Final {
                 finish_reason: final_finish_reason,
+                usage: None,
             }))
             .await;
     });
@@ -2161,6 +2162,7 @@ impl Provider for OpenAiCompatibleProvider {
             return stream::once(async {
                 Ok(StreamEvent::Final {
                     finish_reason: None,
+                    usage: None,
                 })
             })
             .boxed();
