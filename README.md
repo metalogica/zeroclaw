@@ -60,7 +60,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 Sovereign fork with a pre-shared token functionality to simplify and speed up container service load time when hosted in Kubernetes.
 
 #### Change Log
-* **alpha-p10.7**: Add dev hotswap; fix laminar spans.
+* **alpha-p10.7**: Add dev hotswap; fix laminar spans: `a`; fixed more spans.
 * **alpha-p10.6**: Add inner thoughts; add synthetic span for OTEL.
 * **alpha-p10.5**: Add Praxis 0.9.0; add TBD to dev repo; fix session context issue.
 * **alpha-p10.4**: Add Praxis 0.4.0.
@@ -114,7 +114,7 @@ gh auth status
 # dev loop; make changes directly to this codebase and hot-swap the binary into the clawcraft container for sub 3min builds
 ./dev/hotswap/hotswap.sh
 
-export TAG=0.6.9-alpha-p10.7;
+export TAG=0.6.9-alpha-p10.7a;
 # export TAG=0.6.9-alpha-p10.5b; # needed to break cache
 export GITHUB_TOKEN=$(gh auth token);
 export PRAXIS_VERSION=0.9.0;
