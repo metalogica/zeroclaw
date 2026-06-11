@@ -414,9 +414,11 @@ fn build_hardware_context(
 
 // Tool execution moved to `super::tool_execution`.
 pub(crate) use super::tool_execution::{
-    ToolExecutionOutcome, execute_tools_parallel, execute_tools_sequential,
-    should_execute_tools_in_parallel,
+    ToolExecutionOutcome, execute_one_tool, execute_tools_parallel, execute_tools_sequential,
+    find_tool, should_execute_tools_in_parallel,
 };
+
+use super::continuation::{ContinuationDriver, DriveProgress, NextAction, render_cli_command};
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     match raw {
@@ -2303,6 +2305,231 @@ fn maybe_inject_channel_delivery_defaults(
     }
 }
 
+// ── NextAction continuation auto-drive (rnk-h6g3) ─────────────────────────
+// Praxis envelopes (`{data, next_action}`) carry a continuation the agent
+// must follow to walk an execution DAG. The loop enforces them instead of
+// trusting the model: `kind:"call"` is executed mechanically below,
+// `kind:"agent_work_then_call"` is forced via directives and the
+// turn-termination guard inside `run_tool_call_loop`.
+
+/// Drive pending `kind:"call"` continuations mechanically — zero model
+/// round-trips, no model cooperation required. Loops until the pending state
+/// is no longer a `call` (terminal, agent-work, or a surfaced failure) or
+/// the per-turn drive budget runs out (the caller surfaces/routes that).
+/// Each driven call and its result are appended to history so the model
+/// keeps full context.
+#[allow(clippy::too_many_arguments)]
+async fn drive_pending_continuation_calls(
+    continuation: &mut ContinuationDriver,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+    on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
+    channel_name: &str,
+    provider_name: &str,
+    model: &str,
+    turn_id: &str,
+    iteration: usize,
+    max_tool_result_chars: usize,
+) -> Result<()> {
+    loop {
+        let Some(NextAction::Call { tool, args }) = continuation.pending().cloned() else {
+            return Ok(());
+        };
+        if continuation.drive_budget_exhausted() {
+            tracing::warn!(target_tool = %tool, "NextAction auto-drive budget exhausted");
+            return Ok(());
+        }
+
+        // Resolve the continuation target: a registered tool by exact name,
+        // else the praxis CLI via the shell tool. The shell tool's own
+        // security policy still applies — auto-drive is never more
+        // privileged than a model-initiated call.
+        let (exec_name, exec_args, rendered) = if find_tool(tools_registry, &tool).is_some() {
+            let rendered = format!("{tool} {}", serde_json::Value::Object(args.clone()));
+            (
+                tool.clone(),
+                serde_json::Value::Object(args.clone()),
+                rendered,
+            )
+        } else if find_tool(tools_registry, "shell").is_some() {
+            let cmd = render_cli_command(&tool, &args);
+            (
+                "shell".to_string(),
+                serde_json::json!({ "command": cmd }),
+                cmd,
+            )
+        } else {
+            tracing::warn!(target_tool = %tool, "no executable tool for pending continuation");
+            history.push(ChatMessage::system(format!(
+                "[NextAction auto-drive] Cannot drive the pending continuation `{tool}`: no \
+                 matching tool and no shell tool is registered. Complete it with your own \
+                 tools before replying."
+            )));
+            continuation.clear_pending();
+            return Ok(());
+        };
+
+        if let Some(tx) = on_delta {
+            let _ = tx
+                .send(DraftEvent::Progress(format!(
+                    "\u{2699} auto-drive: {}\n",
+                    truncate_with_ellipsis(&rendered, 80)
+                )))
+                .await;
+        }
+
+        let outcome = execute_one_tool(
+            &exec_name,
+            exec_args,
+            tools_registry,
+            activated_tools,
+            observer,
+            cancellation_token,
+        )
+        .await?;
+
+        runtime_trace::record_event(
+            "continuation_auto_drive",
+            Some(channel_name),
+            Some(provider_name),
+            Some(model),
+            Some(turn_id),
+            Some(outcome.success),
+            outcome.error_reason.as_deref(),
+            serde_json::json!({
+                "iteration": iteration + 1,
+                "command": scrub_credentials(&rendered),
+            }),
+        );
+
+        let shown = truncate_tool_result(&outcome.output, max_tool_result_chars);
+        history.push(ChatMessage::user(format!(
+            "[NextAction auto-drive] Ran `{rendered}`:\n{shown}"
+        )));
+
+        if !outcome.success {
+            // Surfaced, not silent: the model sees the failure and the
+            // instruction to recover; the continuation is no longer
+            // mechanically drivable.
+            history.push(ChatMessage::system(format!(
+                "[NextAction auto-drive] The continuation call `{rendered}` failed; the \
+                 execution walk is paused. Inspect the error above, fix it, and resume the \
+                 walk before replying."
+            )));
+            continuation.clear_pending();
+            return Ok(());
+        }
+
+        if continuation.register_driven(&tool, &args, &outcome.output) == DriveProgress::Stalled {
+            runtime_trace::record_event(
+                "continuation_auto_drive_stall",
+                Some(channel_name),
+                Some(provider_name),
+                Some(model),
+                Some(turn_id),
+                Some(false),
+                Some("identical continuation call reproduced identical output"),
+                serde_json::json!({
+                    "iteration": iteration + 1,
+                    "command": scrub_credentials(&rendered),
+                }),
+            );
+            anyhow::bail!(
+                "Agent loop aborted: NextAction auto-drive stalled (identical continuation \
+                 call reproduced identical output — the execution FSM is not advancing)"
+            );
+        }
+
+        continuation.observe_driven_result(&outcome.output, outcome.success);
+    }
+}
+
+/// Route the failure safety net for a continuation that could not be
+/// completed: best-effort `praxis update <bead> --state waiting_for
+/// --assignee user` with the failure reason, an explicit notice for the
+/// model/user, and a trace event. A pending continuation is never dropped
+/// silently.
+#[allow(clippy::too_many_arguments)]
+async fn route_continuation_safety_net(
+    continuation: &mut ContinuationDriver,
+    reason: &str,
+    tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+    channel_name: &str,
+    provider_name: &str,
+    model: &str,
+    turn_id: &str,
+) -> Result<String> {
+    let pending_summary = continuation.pending_summary();
+    let bead_id = continuation.pending_bead_id();
+    let mut notice = format!(
+        "\u{26a0} A praxis execution continuation could not be completed \
+         ({pending_summary}): {reason}."
+    );
+    match &bead_id {
+        Some(bead) if find_tool(tools_registry, "shell").is_some() => {
+            let cmd = crate::agent::continuation::safety_net_command(bead, reason);
+            let outcome = execute_one_tool(
+                "shell",
+                serde_json::json!({ "command": cmd }),
+                tools_registry,
+                activated_tools,
+                observer,
+                cancellation_token,
+            )
+            .await?;
+            if outcome.success {
+                let _ = write!(
+                    notice,
+                    " Bead {bead} was routed to waiting_for (assignee: user) for manual \
+                     follow-up."
+                );
+            } else {
+                let _ = write!(
+                    notice,
+                    " Safety-net routing of bead {bead} to waiting_for FAILED: {}.",
+                    truncate_with_ellipsis(
+                        outcome.error_reason.as_deref().unwrap_or(&outcome.output),
+                        300
+                    )
+                );
+            }
+        }
+        Some(bead) => {
+            let _ = write!(
+                notice,
+                " Bead {bead} requires manual routing (no shell tool available)."
+            );
+        }
+        None => {
+            notice.push_str(
+                " No bead id is associated with this continuation; the execution requires \
+                 manual attention.",
+            );
+        }
+    }
+    runtime_trace::record_event(
+        "continuation_safety_net",
+        Some(channel_name),
+        Some(provider_name),
+        Some(model),
+        Some(turn_id),
+        Some(false),
+        Some(reason),
+        serde_json::json!({
+            "pending": pending_summary,
+            "bead": bead_id,
+        }),
+    );
+    continuation.clear_pending();
+    Ok(notice)
+}
+
 // ── Agent Tool-Call Loop ──────────────────────────────────────────────────
 // Core agentic iteration: send conversation to the LLM, parse any tool
 // calls from the response, execute them, append results to history, and
@@ -2367,6 +2594,11 @@ pub(crate) async fn run_tool_call_loop(
             max_repeats: pacing.loop_detection_max_repeats,
         },
     );
+
+    // Pending praxis NextAction continuation (rnk-h6g3). The turn must not
+    // end while this is non-null — see the auto-drive call sites and the
+    // turn-termination guard below.
+    let mut continuation = ContinuationDriver::new();
 
     // Message count fed to the previous `llm.call`, so each iteration can emit
     // just the newly appended context (the delta) as that call's input.
@@ -3005,6 +3237,132 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            // ── Turn-termination guard (rnk-h6g3) ──────────────────────
+            // The model wants to end the turn while a praxis continuation
+            // is pending — the documented stall shape (traces f3246a74 /
+            // e54257b3). Refuse: drive call-kind continuations mechanically
+            // and force agent-work continuations back into the loop
+            // (bounded); route the waiting_for safety net on exhaustion.
+            if continuation.has_pending() {
+                // Keep the model's narration in history so the
+                // conversation stays coherent across the re-drive.
+                history.push(ChatMessage::assistant(response_text.clone()));
+
+                drive_pending_continuation_calls(
+                    &mut continuation,
+                    history,
+                    tools_registry,
+                    activated_tools,
+                    observer,
+                    cancellation_token.as_ref(),
+                    on_delta.as_ref(),
+                    channel_name,
+                    provider_name,
+                    model,
+                    &turn_id,
+                    iteration,
+                    max_tool_result_chars,
+                )
+                .await?;
+
+                if !continuation.has_pending() {
+                    // The runtime completed the chain (e.g. execute →
+                    // verify → null) after the model already spoke; give it
+                    // one fresh look so the final reply reflects reality.
+                    history.push(ChatMessage::system(
+                        "[NextAction auto-drive] The pending continuation chain was \
+                         completed by the runtime. Review the results above and reply."
+                            .to_string(),
+                    ));
+                    runtime_trace::record_event(
+                        "continuation_stop_refused",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(model),
+                        Some(&turn_id),
+                        Some(true),
+                        None,
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "resolution": "auto_drive_completed",
+                        }),
+                    );
+                    continue;
+                }
+
+                let can_redrive = matches!(
+                    continuation.pending(),
+                    Some(NextAction::AgentWorkThenCall { .. })
+                ) && continuation.try_redrive();
+                if can_redrive {
+                    if let Some(directive) = continuation.forcing_directive() {
+                        history.push(ChatMessage::system(directive));
+                    }
+                    runtime_trace::record_event(
+                        "continuation_stop_refused",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(model),
+                        Some(&turn_id),
+                        Some(true),
+                        None,
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "resolution": "forced_redrive",
+                            "pending": continuation.pending_summary(),
+                        }),
+                    );
+                    continue;
+                }
+
+                // Exhausted (agent-work re-drives or the drive budget):
+                // route the failure safety net, surface it, and only then
+                // allow the turn to end.
+                let notice = route_continuation_safety_net(
+                    &mut continuation,
+                    "the agent repeatedly ended its turn without completing the \
+                     continuation and the bounded re-drive budget is exhausted",
+                    tools_registry,
+                    activated_tools,
+                    observer,
+                    cancellation_token.as_ref(),
+                    channel_name,
+                    provider_name,
+                    model,
+                    &turn_id,
+                )
+                .await?;
+                history.push(ChatMessage::system(notice.clone()));
+                stamp_turn_exit("continuation_exhausted", iteration + 1);
+                runtime_trace::record_event(
+                    "turn_final_response",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some("continuation re-drive budget exhausted"),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "text": scrub_credentials(&display_text),
+                    }),
+                );
+                let final_text = if display_text.is_empty() {
+                    notice.clone()
+                } else {
+                    format!("{display_text}\n\n{notice}")
+                };
+                if let Some(ref tx) = on_delta {
+                    if response_streamed_live {
+                        let _ = tx.send(DraftEvent::Content(format!("\n\n{notice}"))).await;
+                    } else {
+                        let _ = tx.send(DraftEvent::Clear).await;
+                        let _ = tx.send(DraftEvent::Content(final_text.clone())).await;
+                    }
+                }
+                return Ok(final_text);
+            }
+
             // Queryable turn-outcome on the activation root (zc-ug3w): the loop
             // exited on a model completion with no tool calls — the normal
             // terminal AND the orphaned-praxis stall shape.
@@ -3393,15 +3751,26 @@ pub(crate) async fn run_tool_call_loop(
             .enumerate()
             .filter_map(|(i, opt)| opt.map(|v| (i, v)))
         {
+            let call_args = tool_calls
+                .get(result_index)
+                .map(|c| &c.arguments)
+                .unwrap_or(&serde_json::Value::Null);
+
+            // Praxis envelopes update the pending NextAction continuation
+            // (rnk-h6g3); bare/non-praxis outputs are untouched. Observed on
+            // the full output, before model-facing truncation.
+            continuation.observe_tool_result(
+                &tool_name,
+                call_args,
+                &outcome.output,
+                outcome.success,
+            );
+
             if !loop_ignore_tools.contains(tool_name.as_str()) {
                 detection_relevant_output.push_str(&outcome.output);
 
                 // Feed the pattern-based loop detector with name + args + result.
-                let args = tool_calls
-                    .get(result_index)
-                    .map(|c| &c.arguments)
-                    .unwrap_or(&serde_json::Value::Null);
-                let det_result = loop_detector.record(&tool_name, args, &outcome.output);
+                let det_result = loop_detector.record(&tool_name, call_args, &outcome.output);
                 match det_result {
                     crate::agent::loop_detector::LoopDetectionResult::Ok => {}
                     crate::agent::loop_detector::LoopDetectionResult::Warning(ref msg) => {
@@ -3524,6 +3893,69 @@ pub(crate) async fn run_tool_call_loop(
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
         }
+
+        // ── NextAction auto-drive (rnk-h6g3) ────────────────────────────
+        // `kind:"call"` continuations are executed mechanically — zero
+        // model round-trips, no model cooperation required. A pending
+        // `agent_work_then_call` constrains the next model step via a
+        // forcing directive injected once per continuation.
+        drive_pending_continuation_calls(
+            &mut continuation,
+            history,
+            tools_registry,
+            activated_tools,
+            observer,
+            cancellation_token.as_ref(),
+            on_delta.as_ref(),
+            channel_name,
+            provider_name,
+            model,
+            &turn_id,
+            iteration,
+            max_tool_result_chars,
+        )
+        .await?;
+        if let Some(directive) = continuation.directive_to_inject() {
+            history.push(ChatMessage::system(directive));
+        }
+    }
+
+    // A continuation pending at iteration exhaustion is never dropped
+    // silently (rnk-h6g3): finish any mechanical call-kind chain (costs no
+    // model iterations), then route what remains to the failure safety net.
+    if continuation.has_pending() {
+        drive_pending_continuation_calls(
+            &mut continuation,
+            history,
+            tools_registry,
+            activated_tools,
+            observer,
+            cancellation_token.as_ref(),
+            on_delta.as_ref(),
+            channel_name,
+            provider_name,
+            model,
+            &turn_id,
+            max_iterations,
+            max_tool_result_chars,
+        )
+        .await?;
+    }
+    if continuation.has_pending() {
+        let notice = route_continuation_safety_net(
+            &mut continuation,
+            "the agent hit its tool-iteration cap with the continuation still pending",
+            tools_registry,
+            activated_tools,
+            observer,
+            cancellation_token.as_ref(),
+            channel_name,
+            provider_name,
+            model,
+            &turn_id,
+        )
+        .await?;
+        history.push(ChatMessage::system(notice));
     }
 
     // Queryable turn-outcome on the activation root (zc-ug3w): the loop hit its
@@ -10060,5 +10492,371 @@ Let me check the result."#;
         .expect("should succeed without cost scope");
 
         assert_eq!(result, "ok");
+    }
+
+    // ── NextAction continuation auto-drive (rnk-h6g3) ────────────────────
+    // Per-kind loop tests: `kind:"call"` driven with zero model steps,
+    // `agent_work_then_call` forced to its `then.tool` invocation, the
+    // turn-termination guard, bounded re-drives exhausting to the
+    // waiting_for safety net, and bare-mode outputs staying unaffected.
+    mod continuation_auto_drive {
+        use crate::agent::loop_::run_tool_call_loop;
+        use crate::observability::noop::NoopObserver;
+        use crate::providers::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolCall};
+        use crate::tools::{Tool, ToolResult};
+        use async_trait::async_trait;
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        /// Provider returning scripted full `ChatResponse`s, recording the
+        /// message list of every request for assertions.
+        struct ContinuationProvider {
+            responses: Mutex<VecDeque<ChatResponse>>,
+            requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        }
+
+        impl ContinuationProvider {
+            fn new(responses: Vec<ChatResponse>) -> Self {
+                Self {
+                    responses: Mutex::new(responses.into()),
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+
+            fn request_count(&self) -> usize {
+                self.requests.lock().unwrap().len()
+            }
+
+            fn any_request_message_contains(&self, needle: &str) -> bool {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .any(|m| m.content.contains(needle))
+            }
+        }
+
+        #[async_trait]
+        impl Provider for ContinuationProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: f64,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("not used")
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: f64,
+            ) -> anyhow::Result<ChatResponse> {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push(request.messages.to_vec());
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .ok_or_else(|| anyhow::anyhow!("scripted provider exhausted responses"))
+            }
+        }
+
+        /// Scripted mock of the `shell` tool: canned outputs matched by
+        /// command substring (first match wins), recording every command.
+        struct ScriptedShellTool {
+            scripts: Vec<(&'static str, String)>,
+            commands: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl ScriptedShellTool {
+            fn new(scripts: Vec<(&'static str, String)>) -> (Self, Arc<Mutex<Vec<String>>>) {
+                let commands = Arc::new(Mutex::new(Vec::new()));
+                (
+                    Self {
+                        scripts,
+                        commands: Arc::clone(&commands),
+                    },
+                    commands,
+                )
+            }
+        }
+
+        #[async_trait]
+        impl Tool for ScriptedShellTool {
+            fn name(&self) -> &str {
+                "shell"
+            }
+
+            fn description(&self) -> &str {
+                "Scripted shell mock for continuation tests"
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } },
+                    "required": ["command"]
+                })
+            }
+
+            async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                let command = args
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                self.commands.lock().unwrap().push(command.clone());
+                let output = self
+                    .scripts
+                    .iter()
+                    .find(|(needle, _)| command.contains(needle))
+                    .map(|(_, output)| output.clone())
+                    .unwrap_or_else(|| "ok".to_string());
+                Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                })
+            }
+        }
+
+        fn envelope(next_action: serde_json::Value) -> String {
+            serde_json::json!({"data": {"ok": true}, "next_action": next_action}).to_string()
+        }
+
+        fn call_action(tool: &str, args: serde_json::Value) -> serde_json::Value {
+            serde_json::json!({"kind": "call", "tool": tool, "args": args})
+        }
+
+        fn agent_work_action(factory_id: &str, bead_id: &str) -> serde_json::Value {
+            serde_json::json!({
+                "kind": "agent_work_then_call",
+                "factory_id": factory_id,
+                "agent_hint": "summarize the emails",
+                "output_contract": {"summary": "<value>"},
+                "then": {
+                    "tool": "praxis update",
+                    "args_template": {
+                        "id": bead_id,
+                        "state": "done",
+                        "output": "<json-object matching output_contract>"
+                    }
+                }
+            })
+        }
+
+        fn shell_call(id: &str, command: &str) -> ChatResponse {
+            ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![ToolCall {
+                    id: id.to_string(),
+                    name: "shell".to_string(),
+                    arguments: serde_json::json!({ "command": command }).to_string(),
+                }],
+                usage: None,
+                reasoning_content: None,
+                finish_reason: None,
+            }
+        }
+
+        fn text(content: &str) -> ChatResponse {
+            ChatResponse {
+                text: Some(content.to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                finish_reason: None,
+            }
+        }
+
+        async fn run(
+            provider: &ContinuationProvider,
+            tools: &[Box<dyn Tool>],
+        ) -> anyhow::Result<String> {
+            let observer = NoopObserver;
+            let mut history = vec![ChatMessage::user("walk the execution".to_string())];
+            run_tool_call_loop(
+                provider,
+                &mut history,
+                tools,
+                &observer,
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "test",
+                None,
+                &crate::config::MultimodalConfig::default(),
+                10,
+                None,
+                None,
+                None,
+                &[],
+                &[],
+                None,
+                None,
+                &crate::config::PacingConfig::default(),
+                0,
+                0,
+                None,
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn call_kind_chain_is_driven_with_no_model_steps() {
+            // update → (call execute) → (call verify) → null: after the
+            // model's single update call, the runtime walks the chain
+            // mechanically; the model is only consulted once more for the
+            // final reply.
+            let (shell, commands) = ScriptedShellTool::new(vec![
+                (
+                    "praxis update zc-a1",
+                    envelope(call_action(
+                        "praxis execute",
+                        serde_json::json!({"execution": "e1"}),
+                    )),
+                ),
+                (
+                    "praxis execute",
+                    envelope(call_action(
+                        "praxis verify",
+                        serde_json::json!({"execution": "e1"}),
+                    )),
+                ),
+                ("praxis verify", envelope(serde_json::Value::Null)),
+            ]);
+            let provider = ContinuationProvider::new(vec![
+                shell_call(
+                    "tc1",
+                    "praxis update zc-a1 --state done --output '{}' --json",
+                ),
+                text("walk complete"),
+            ]);
+            let tools: Vec<Box<dyn Tool>> = vec![Box::new(shell)];
+
+            let result = run(&provider, &tools).await.expect("loop should succeed");
+
+            assert_eq!(result, "walk complete");
+            assert_eq!(
+                provider.request_count(),
+                2,
+                "call-kind continuations must not cost model round-trips"
+            );
+            let commands = commands.lock().unwrap();
+            assert_eq!(commands.len(), 3, "commands: {commands:?}");
+            assert_eq!(commands[1], "praxis execute --execution e1 --json");
+            assert_eq!(commands[2], "praxis verify --execution e1 --json");
+        }
+
+        #[tokio::test]
+        async fn agent_work_stall_is_refused_and_redriven_to_then_tool() {
+            // The model stalls (terminal message with the continuation
+            // pending — the f3246a74/e54257b3 shape). The guard must refuse
+            // the turn end, re-inject the forcing directive, and the turn
+            // only ends after `then.tool` has been invoked.
+            let (shell, commands) = ScriptedShellTool::new(vec![
+                ("praxis execute", envelope(agent_work_action("f1", "zc-b1"))),
+                ("praxis update zc-b1", envelope(serde_json::Value::Null)),
+            ]);
+            let provider = ContinuationProvider::new(vec![
+                shell_call("tc1", "praxis execute --execution e1 --json"),
+                text("Full pipeline complete"), // stall
+                shell_call(
+                    "tc2",
+                    "praxis update zc-b1 --state done --output '{\"summary\":\"ok\"}' --json",
+                ),
+                text("actually done"),
+            ]);
+            let tools: Vec<Box<dyn Tool>> = vec![Box::new(shell)];
+
+            let result = run(&provider, &tools).await.expect("loop should succeed");
+
+            assert_eq!(result, "actually done");
+            assert_eq!(
+                provider.request_count(),
+                4,
+                "the stall must not end the turn"
+            );
+            assert!(
+                provider.any_request_message_contains("[NextAction continuation — MANDATORY]"),
+                "forcing directive must be injected into the conversation"
+            );
+            let commands = commands.lock().unwrap();
+            assert!(
+                commands.iter().any(|c| c.contains("praxis update zc-b1")),
+                "then.tool must be invoked before the turn ends: {commands:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn bounded_redrives_exhaust_to_waiting_for_safety_net() {
+            // A model that never complies: after the bounded re-drives are
+            // spent, the bead is routed to waiting_for + assignee user and
+            // the failure is surfaced in the final text — no infinite loop,
+            // no silent drop.
+            let (shell, commands) = ScriptedShellTool::new(vec![
+                ("--state waiting_for", envelope(serde_json::Value::Null)),
+                ("praxis execute", envelope(agent_work_action("f1", "zc-c1"))),
+            ]);
+            let provider = ContinuationProvider::new(vec![
+                shell_call("tc1", "praxis execute --execution e1 --json"),
+                text("done!"),
+                text("done!"),
+                text("done!"),
+                text("done!"),
+            ]);
+            let tools: Vec<Box<dyn Tool>> = vec![Box::new(shell)];
+
+            let result = run(&provider, &tools).await.expect("loop should succeed");
+
+            assert_eq!(
+                provider.request_count(),
+                5,
+                "initial attempt + MAX_AGENT_WORK_REDRIVES re-drives + exhausted stop"
+            );
+            assert!(
+                result.contains("could not be completed"),
+                "failure must be surfaced: {result}"
+            );
+            let commands = commands.lock().unwrap();
+            assert!(
+                commands
+                    .iter()
+                    .any(|c| c.contains("praxis update zc-c1 --state waiting_for --assignee user")),
+                "bead must be routed to the failure safety net: {commands:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn bare_mode_output_is_unaffected() {
+            // Without --json/PRAXIS_AGENT_INVOCATION the CLI emits the bare
+            // pre-envelope shape; the loop must not treat it as a
+            // continuation.
+            let (shell, commands) =
+                ScriptedShellTool::new(vec![("praxis execute", r#"{"ready": []}"#.to_string())]);
+            let provider = ContinuationProvider::new(vec![
+                shell_call("tc1", "praxis execute --execution e1"),
+                text("done"),
+            ]);
+            let tools: Vec<Box<dyn Tool>> = vec![Box::new(shell)];
+
+            let result = run(&provider, &tools).await.expect("loop should succeed");
+
+            assert_eq!(result, "done");
+            assert_eq!(provider.request_count(), 2);
+            assert_eq!(
+                commands.lock().unwrap().len(),
+                1,
+                "no auto-drive on bare-mode output"
+            );
+        }
     }
 }
