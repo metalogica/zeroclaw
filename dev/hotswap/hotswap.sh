@@ -107,7 +107,20 @@ fi
 #    The cp+restart above only patches the live container — a 'compose up' recreate
 #    rebuilds the container from the IMAGE and silently reverts to the stale baked
 #    binary. Baking the binary into that image tag closes the gap. Default-on:
-#    correctness beats the ~1s cached overlay build; NO_BAKE=1 opts out.
+#    correctness beats the few-second bake; NO_BAKE=1 opts out.
+#
+#    We bake with `docker commit`, NOT `docker build`. The old Dockerfile bake
+#    sent $OUT_DIR (the 159MB binary) as a build context — ~904s at ~185KB/s
+#    through Docker Desktop file sharing — to re-add bytes that `docker cp`
+#    already moved into the container in ~9s. `docker commit` captures a
+#    container's filesystem with ZERO context transfer (it rides the daemon API).
+#
+#    Layer accretion (why the old path pinned a 'hotswap-base' to FROM): naively
+#    committing the LIVE container would, after each 'compose up' recreate,
+#    stack another layer onto an ever-growing image. We sidestep that entirely:
+#    every bake commits a THROWAWAY container created from the pinned pristine
+#    base, with only the binary cp'd in — so $TAG is always base+exactly-1-layer,
+#    no matter how many times we swap or recreate. No per-N re-pin needed.
 #
 #    NOTE (prod, out of scope here): this fixes the LOCAL dev image only. The
 #    prod/GKE image (…/clawcraft-images/clawcraft-claw-runtime:latest) is a
@@ -117,35 +130,35 @@ TAG="$(docker inspect -f '{{.Config.Image}}' "$CONTAINER")"
 if [ "${NO_BAKE:-0}" = "1" ]; then
     bold "▶ bake skipped (NO_BAKE=1) — a 'compose up' recreate will revert '$TAG' to its baked-in binary"
 else
-    bold "▶ baking binary into image '$TAG' (survives 'compose up' recreate)…"
+    bold "▶ baking binary into image '$TAG' via docker commit (no build context)…"
 
-    # Avoid stacking a fresh layer on an already-baked image every run: FROM the
-    # ORIGINAL base, pinned under a stable local tag the first time we bake. On
-    # re-runs we build FROM that pinned tag, so a single bake layer replaces the
-    # last one instead of accreting. (We pin via a tag, not a bare image ID —
-    # BuildKit parses `FROM <sha256-id>` as a registry ref and tries to pull it.)
+    # Pin the ORIGINAL pristine image under a stable tag the first time we bake;
+    # every bake commits FROM it so a single binary layer replaces the last one
+    # instead of accreting.
     #
     # To re-pin after pulling a fresh upstream image (e.g. a real post-fix build):
     #   docker rmi "$BASE_TAG"; docker tag catonmat/zeroclaw:<tag> "$TAG"; rerun.
     BASE_TAG="${TAG%:*}:hotswap-base"
     if docker image inspect "$BASE_TAG" >/dev/null 2>&1; then
-        bold "  re-bake — FROM pinned base '$BASE_TAG' (no layer accretion)"
+        bold "  re-bake — committing FROM pinned base '$BASE_TAG' (no layer accretion)"
     else
         docker tag "$TAG" "$BASE_TAG"
-        bold "  first bake — pinned original base as '$BASE_TAG' (future runs FROM it)"
+        bold "  first bake — pinned original base as '$BASE_TAG' (future bakes FROM it)"
     fi
 
-    # The image runs as nonroot 65534, so we switch to root for the chmod and back.
-    cat > "$OUT_DIR/Dockerfile.bake" <<DOCKERFILE
-FROM $BASE_TAG
-USER 0
-COPY zeroclaw /usr/local/bin/zeroclaw
-RUN chmod 0755 /usr/local/bin/zeroclaw
-USER 65534:65534
-DOCKERFILE
-
-    docker build -f "$OUT_DIR/Dockerfile.bake" -t "$TAG" "$OUT_DIR" >/dev/null
-    bold "✓ baked into '$TAG' — a later 'compose up' recreate now carries your binary"
+    # Throwaway container created (not started) from the pristine base. docker cp
+    # streams the binary in over the daemon API (no context transfer) and the
+    # tar stream preserves the 0755 mode we set in step 2b, so the nonroot 65534
+    # runtime can exec it without a chmod (which would need a running container).
+    # `docker commit` then carries the base image's config (USER/CMD/ENV/...)
+    # forward unchanged, so the committed $TAG behaves exactly like the original.
+    stage_cid="$(docker create "$BASE_TAG")"
+    trap 'docker rm -f "$stage_cid" >/dev/null 2>&1 || true' EXIT
+    docker cp "$BIN_OUT" "$stage_cid:/usr/local/bin/zeroclaw"
+    docker commit "$stage_cid" "$TAG" >/dev/null
+    docker rm "$stage_cid" >/dev/null
+    trap - EXIT
+    bold "✓ baked into '$TAG' (base+1 layer) — a later 'compose up' recreate now carries your binary"
 fi
 
 cat <<EOF
