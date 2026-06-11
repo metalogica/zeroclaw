@@ -64,7 +64,21 @@ time docker run --rm \
     -e CARGO_TARGET_DIR=/target \
     -w /app \
     "$BUILDER_IMG" \
-    bash -c "cargo build --locked --bin zeroclaw --features '$FEATURES' && install -m0755 /target/debug/zeroclaw /app/target/hotswap/zeroclaw"
+    cargo build --locked --bin zeroclaw --features "$FEATURES"
+
+# 2b. Extract the binary off the named volume to the host. The old path baked an
+#     'install …/target/hotswap/zeroclaw' into the compile step, which wrote the
+#     ~159MB binary back through the /app bind mount — that ride over Docker
+#     Desktop file sharing clocked ~315KB/s ≈ 8.4min/swap. Streaming it out as a
+#     throwaway container's stdout rides the daemon API instead (the same fast
+#     path as `docker cp`): the same bytes land in ~9s. The compile container
+#     above touches only the named volume now, so it never pays the fs-share tax.
+bold "▶ extracting binary off named volume (stdout stream — not the bind mount)…"
+time docker run --rm \
+    -v zeroclaw-hotswap-target:/target \
+    "$BUILDER_IMG" \
+    cat /target/debug/zeroclaw > "$BIN_OUT"
+chmod 0755 "$BIN_OUT"
 
 # 3. Self-verify the build actually carries your source change. This closes the
 #    'is the fix even in this binary?' gap that burned earlier rebuild rounds —
