@@ -1,0 +1,145 @@
+# Doctrine Manifest (zeroclaw fork — migration-relevant subset)
+# Version: 1.0.0
+#
+# SNAPSHOT copy. Source of truth is clawcraft docs/doctrine/ @ 7f70c20.
+# See docs/doctrine/SNAPSHOT-PROVENANCE.md. Do not edit the doctrine bodies here.
+#
+# Purpose: let /substrate:architect-spec discover the binding doctrines when planning the
+# upstream-v0.8.0 migration in THIS repo. Only the doctrines that govern the runtime/infra
+# migration are registered; web-app/treasury doctrines were deliberately excluded.
+#
+# Usage:
+#   1. Agent scans a brief for trigger keywords
+#   2. Matches triggers -> relevant doctrines
+#   3. Self-loads (1-2) OR spawns one doctrine-architect per doctrine (3+)
+
+doctrines:
+  - id: praxis
+    name: Praxis Doctrine (Task Tracker CLI + NextAction contract)
+    triggers:
+      - praxis
+      - NextAction
+      - next_action
+      - continuation
+      - auto-drive
+      - beads
+      - tbd
+      - spec workflow
+      - GitHub Packages
+      - tag-driven
+      - PRAXIS_VERSION
+      - turn-end
+      - park
+    summary: >
+      Praxis is the durable task-tracker CLI bundled into the zeroclaw image via a Dockerfile
+      ARG. The agent-facing continuation envelope is { data, next_action } (§6.5): next_action
+      null is an UNCONDITIONAL turn-end and the runtime NEVER inspects data on null; PARK is
+      next_action:null + data.parked (emitted only by execute). The fork's continuation
+      auto-drive (continuation.rs + the turn/turn_streamed guard) implements this contract and
+      is the fork's keystone differentiator. Any migration MUST preserve this contract exactly.
+    path: docs/doctrine/architecture/praxis-doctrine.md
+    specialist: doctrine-architect
+
+  - id: observability
+    name: Observability Doctrine (Agentic Trace Contract)
+    triggers:
+      - laminar
+      - otel
+      - OpenTelemetry
+      - otlp
+      - otel_headers
+      - trace
+      - span
+      - gen_ai
+      - deployment.environment
+      - observability
+      - session_id
+      - user.id
+    summary: >
+      Trace scope = agent intent, originating at pod channel ingress. zeroclaw is the SOLE
+      emitter (praxis/OpenRouter/Composio/Convex are child spans or dark boundaries). Config is
+      carried via config.toml [observability] (backend/otel_endpoint/otel_headers) — NOT pod env
+      vars. Resource attrs limited to service.name + deployment.environment (zero PII/creds). The
+      fork's salvageable value is the Laminar-specific layer (lmnr.span.input/output,
+      association-property session_id/user_id columns, turn-outcome) re-homed onto upstream's
+      logging pipeline.
+    path: docs/doctrine/architecture/observability-doctrine.md
+    specialist: doctrine-architect
+
+  - id: claw
+    name: Claw Doctrine (Control Plane <-> Compute Plane)
+    triggers:
+      - unified relay
+      - pod API
+      - /api/chat
+      - brain.db
+      - workspace files
+      - tool policy
+      - control plane
+      - compute plane
+      - gateway
+      - threadId
+      - session_key
+    summary: >
+      Defines the boundary between clawcraft's Convex control plane and the zeroclaw compute
+      plane (the pod), including the pod API surface, brain.db, workspace files, and tool policy.
+      Gateway/threadId session continuity must be re-expressed against v0.8.0's per-agent ACP
+      session model without breaking the pod API contract clawcraft depends on.
+    path: docs/doctrine/architecture/claw-doctrine.md
+    specialist: doctrine-architect
+
+  - id: claw-state-machine
+    name: Claw System State Machine Doctrine
+    triggers:
+      - state machine
+      - lifecycle
+      - agent lifecycle
+      - pod lifecycle
+      - cold start
+      - preshared token
+    summary: >
+      The agent/pod lifecycle state machine — including cold-start behavior (the fork's pod
+      preshared-token insertion on cold start) and supervised-channel detection.
+    path: docs/doctrine/architecture/claw-system-state-machine-doctrine.md
+    specialist: doctrine-architect
+
+  - id: methodology
+    name: Methodology Doctrine (cross-cutting design principles)
+    triggers:
+      - methodology
+      - anti-duplication
+      - aspirational config
+      - transitional schema
+      - inventory-as-debugging
+      - design decision
+    summary: >
+      Cross-cutting design principles: polysemous-label avoidance, no aspirational config,
+      transitional-schema discipline, inventory-as-debugging, single-source-of-truth. Governs
+      HOW the migration is sequenced and how the fork-delta ledger avoids duplication drift.
+    path: docs/doctrine/architecture/methodology-doctrine.md
+    specialist: doctrine-architect
+
+  - id: infra
+    name: GCP Infrastructure Doctrine (tag-driven publish)
+    triggers:
+      - GKE
+      - Kubernetes
+      - Terraform
+      - Docker
+      - Dockerfile
+      - Artifact Registry
+      - CLAW_DOCKER_IMAGE
+      - tag-driven
+      - publish
+      - hotswap
+      - Wolfi
+      - CI
+      - release
+    summary: >
+      GCP infra + the tag-driven publish workflow: the zeroclaw fork image is SHA-pinned into
+      the clawcraft prod runtime via the CLAW_DOCKER_IMAGE Convex env var pointing at GCP
+      Artifact Registry (never :latest). The dev hotswap loop (dev/hotswap/*, Justfile,
+      Dockerfile -> clawcraft-claw-runtime:dev) must be preserved against the new multi-crate
+      build. A migration MUST NOT break this prod image-pin flow.
+    path: docs/doctrine/architecture/infra/infra-doctrine.md
+    specialist: doctrine-architect
