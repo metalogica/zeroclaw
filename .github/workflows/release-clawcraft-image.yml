@@ -1,0 +1,221 @@
+# Clawcraft prod release image (sovereign fork).
+#
+# Builds the fork's Wolfi+praxis runtime (Dockerfile `release` target, FD-01),
+# SMOKE-TESTS it, and — only on a green smoke — pushes a SHA-tagged image to
+# GCP Artifact Registry. The pushed tag is the git SHA ONLY; there is NO
+# mutable/rolling tag anywhere in this file (clawcraft prod pins
+# `CLAW_DOCKER_IMAGE` to an immutable SHA — a mutable rolling tag would defeat
+# rollback, spec §MUST-NOT).
+#
+# See docs/RELEASE.md for the full dev→prod loop, the human-gated Convex bump,
+# and the rollback drill. Fork-Delta: FD-11.
+#
+# ── Prerequisites (READ docs/RELEASE.md before first run) ────────────────────
+# * PRAXIS_PACKAGES_READ_PAT (repo secret): a GitHub Personal Access Token with
+#   `read:packages` scope on the @soulbound-labs org, used to `npm install` the
+#   private @soulbound-labs/praxis package. THIS FORK LIVES UNDER THE
+#   `metalogica` ORG, NOT `soulbound-labs` — so the ambient `GITHUB_TOKEN` does
+#   NOT carry cross-org packages-read. A dedicated PAT is REQUIRED here (a
+#   soulbound-labs-org repo could rely on the implicit token; this fork cannot).
+# * WIF (Workload Identity Federation) to GCP — no JSON service-account keys.
+#   The WIF pool must be extended to trust THIS repo's OIDC subject. That pool
+#   extension is a clawcraft Terraform change (plan-reviewed) — it is NOT made
+#   here. Until it lands, `google-github-actions/auth` will fail with a trust
+#   error; that is expected and is the Terraform gate, not a workflow bug.
+#
+# ── Required configuration (set in repo Settings) ────────────────────────────
+#   Secrets:
+#     PRAXIS_PACKAGES_READ_PAT   read:packages PAT for @soulbound-labs/praxis
+#   Variables (vars):
+#     GCP_WORKLOAD_IDENTITY_PROVIDER  full WIF provider resource name
+#     GCP_DEPLOY_SA_EMAIL             AR-writer-scoped service-account email
+#     GCP_AR_REGISTRY                 e.g. us-docker.pkg.dev
+#     GCP_AR_REPOSITORY              <project>/<repo> path of the AR repository
+name: Release Clawcraft Image
+
+on:
+  push:
+    tags:
+      - 'clawcraft-v*'
+  workflow_dispatch: {}
+
+concurrency:
+  group: release-clawcraft-image-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write   # required for WIF / google-github-actions/auth OIDC
+
+jobs:
+  build-smoke-push:
+    name: Build → smoke → push (amd64, SHA-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Immutable image coordinates. IMAGE_URI is the git-SHA-tagged reference —
+      # the ONLY tag this workflow ever pushes.
+      IMAGE_NAME: clawcraft-claw-runtime
+      IMAGE_REPO: ${{ vars.GCP_AR_REGISTRY }}/${{ vars.GCP_AR_REPOSITORY }}/clawcraft-claw-runtime
+      IMAGE_URI: ${{ vars.GCP_AR_REGISTRY }}/${{ vars.GCP_AR_REPOSITORY }}/clawcraft-claw-runtime:${{ github.sha }}
+    steps:
+      - name: Checkout (full history for SHA pinning)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      # ── Auth: WIF → GCP (no JSON keys; spec infra §15.4) ──────────────────
+      # NOTE: the WIF pool must trust this repo's OIDC subject. Extending the
+      # pool for THIS repo is a clawcraft Terraform change (plan-reviewed) — it
+      # is filed and reviewed there, NOT provisioned by this workflow.
+      - name: Authenticate to Google Cloud (WIF)
+        id: gcp-auth
+        uses: google-github-actions/auth@8254fb75a33b976a221574d287e93919e6a36f70 # v2.1.11
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA_EMAIL }}
+          token_format: access_token
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@6a7c903a70c8625ed6700fa299f5ddb4ca6022e9 # v2.1.5
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${{ vars.GCP_AR_REGISTRY }}" --quiet
+
+      # ── Praxis npm auth (private @soulbound-labs/praxis) ──────────────────
+      # metalogica-org repo → the ambient GITHUB_TOKEN has NO cross-org
+      # packages-read. A dedicated read:packages PAT is REQUIRED. The token is
+      # passed to BuildKit as a `--secret` (id=npm_token) and NEVER as an ARG or
+      # ENV, so it cannot persist in any image layer (Dockerfile stage
+      # `praxis-install` mounts it at `/run/secrets/npm_token`).
+      - name: Provision praxis npm token file
+        env:
+          PRAXIS_PACKAGES_READ_PAT: ${{ secrets.PRAXIS_PACKAGES_READ_PAT }}
+        run: |
+          if [ -z "${PRAXIS_PACKAGES_READ_PAT}" ]; then
+            echo "::error::PRAXIS_PACKAGES_READ_PAT is empty. This fork is under the metalogica org and CANNOT use the ambient GITHUB_TOKEN for the private @soulbound-labs/praxis read. Set the read:packages PAT secret — see docs/RELEASE.md." >&2
+            exit 1
+          fi
+          umask 077
+          printf '%s' "${PRAXIS_PACKAGES_READ_PAT}" > "${RUNNER_TEMP}/npm_token"
+
+      # ── Build the release image locally (load, do NOT push yet) ───────────
+      # Push is deferred until AFTER the smoke passes (spec §MUST: smoke before
+      # push). Single platform: linux/amd64 (prod pods are amd64).
+      - name: Build release image (amd64, load, no push)
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          target: release
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_URI }}
+          secret-files: |
+            npm_token=${{ runner.temp }}/npm_token
+          build-args: |
+            PRAXIS_VERSION=0.10.0
+          provenance: false
+
+      # ── SMOKE BEFORE PUSH ─────────────────────────────────────────────────
+      # Gate the push on: the daemon reaching a healthy status, praxis being
+      # invocable, and the zeroclaw binary having NO unresolved dynamic links
+      # (`ldd` clean — a broken link would crash the pod at boot). Only if ALL
+      # of these pass does the subsequent push step run.
+      - name: Smoke test the built image (must pass before push)
+        id: smoke
+        run: |
+          set -euo pipefail
+          IMG="${IMAGE_URI}"
+          echo "Smoke-testing ${IMG} (must be green before any push)"
+
+          # Boot the daemon; publish 42617 so we can host-curl /health.
+          docker run -d --rm --name zc-smoke -p 42617:42617 "${IMG}"
+
+          # Give the daemon a moment to bind its listener.
+          for i in $(seq 1 20); do
+            if docker exec zc-smoke zeroclaw status --format=exit-code >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+
+          echo "== zeroclaw status (--format=exit-code) =="
+          docker exec zc-smoke zeroclaw status --format=exit-code
+          RC=$?
+
+          echo "== host-curl /health (unauthenticated 200) =="
+          if command -v curl >/dev/null 2>&1; then
+            curl -sf --max-time 10 http://localhost:42617/health >/dev/null \
+              || echo "::warning::/health host-curl did not return 200 within timeout"
+          fi
+
+          echo "== praxis --version =="
+          docker exec zc-smoke praxis --version
+
+          echo "== ldd clean (no unresolved dynamic links) =="
+          docker exec zc-smoke sh -c 'ldd /usr/local/bin/zeroclaw | grep -c "not found" | grep -qx 0'
+
+          docker rm -f zc-smoke >/dev/null 2>&1 || true
+
+          if [ "${RC}" -ne 0 ]; then
+            echo "::error::zeroclaw status returned ${RC}; refusing to push." >&2
+            exit "${RC}"
+          fi
+          echo "smoke=pass" >> "${GITHUB_OUTPUT}"
+
+      # ── Push (SHA tag ONLY) — reached only when smoke is green ─────────────
+      # Re-build with push:true; the layers are cached from the load build, so
+      # this is a fast metadata push of the identical image. Tag = git SHA only;
+      # there is deliberately NO mutable/rolling tag.
+      - name: Push release image (SHA tag only)
+        id: push
+        if: steps.smoke.outputs.smoke == 'pass'
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          target: release
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE_URI }}
+          secret-files: |
+            npm_token=${{ runner.temp }}/npm_token
+          build-args: |
+            PRAXIS_VERSION=0.10.0
+          provenance: false
+
+      - name: Scrub npm token
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/npm_token" || true
+
+      # ── Step summary: pushed URI + digest + the human-gated bump command ──
+      - name: Emit release summary
+        if: steps.push.outcome == 'success'
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "## Clawcraft release image pushed"
+            echo ""
+            echo "| field | value |"
+            echo "|-------|-------|"
+            echo "| Image URI | \`${IMAGE_URI}\` |"
+            echo "| Digest | \`${IMAGE_DIGEST}\` |"
+            echo "| Git SHA | \`${{ github.sha }}\` |"
+            echo "| Ref | \`${{ github.ref }}\` |"
+            echo ""
+            echo "### Next step (human-gated) — bump the Convex prod env var"
+            echo ""
+            echo "Point clawcraft prod (Convex deployment \`colorful-rook-584\`) at this SHA:"
+            echo ""
+            echo '```sh'
+            echo "pnpm --filter @clawcraft/app exec convex env set CLAW_DOCKER_IMAGE \"${IMAGE_URI}\" --prod"
+            echo '```'
+            echo ""
+            echo "Then watch the pods roll. Rollback = re-pin the previous SHA + restore the brain.db \`backup-*\`. See docs/RELEASE.md."
+          } >> "${GITHUB_STEP_SUMMARY}"
