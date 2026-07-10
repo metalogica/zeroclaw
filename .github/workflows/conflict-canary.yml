@@ -1,0 +1,188 @@
+# conflict-canary.yml — weekly informational merge-tree walk (Fork-Delta: FD-10)
+#
+# Per spec §3.6 / Step 7.2: once a week (and on demand) replay the sovereign series against the
+# latest upstream main with `git merge-tree --write-tree` and attribute every conflicted file to
+# the FD-NN it belongs to (via each commit's `Fork-Delta:` trailer). Results go to the job step
+# summary and into a SINGLE pinned tracking issue that is created/updated only while conflicts > 0.
+#
+# INFORMATIONAL ONLY: the analysis job ALWAYS exits 0 on a successful walk — a detected conflict
+# is data, not a failure. This canary must never become a permanently-red gate (FMEA #9). The only
+# non-zero exit is a genuine tooling error (git/gh broke), not a merge conflict.
+#
+# AMBIGUOUS-REFNAME GOTCHA (Fable): `upstream` alone is ambiguous (local branch vs remote). The
+# UPSTREAM MAIN we diff against is the remote-tracking ref `refs/remotes/upstream/main`, fetched
+# fresh below; the SERIES we walk is `refs/heads/upstream..HEAD` where the range base is spelled
+# `refs/heads/upstream` explicitly and materialized from the pinned v0.8.0 base SHA.
+
+name: conflict-canary
+
+on:
+  schedule:
+    # Mondays 07:00 UTC — weekly cadence (FORK_DELTA.md rebase-cadence: fetch weekly).
+    - cron: "0 7 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  canary:
+    name: upstream conflict canary (informational)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream main
+        env:
+          UPSTREAM_URL: https://github.com/zeroclaw-labs/zeroclaw.git
+          UPSTREAM_BASE_SHA: 5fc9d3c387c84208579b52aebe87e2734d2b402f
+        run: |
+          set -euo pipefail
+          # Materialize refs/heads/upstream (range base) — same pin as fork-delta-check.yml.
+          if ! git show-ref --verify --quiet refs/heads/upstream; then
+            if git rev-parse --verify --quiet "${UPSTREAM_BASE_SHA}^{commit}" >/dev/null; then
+              git update-ref refs/heads/upstream "${UPSTREAM_BASE_SHA}"
+            else
+              base="$(git rev-list --max-parents=0 HEAD | tail -n1)"
+              git update-ref refs/heads/upstream "$base"
+            fi
+          fi
+          # Fetch the live upstream main we diff against. If the remote is unreachable we fall back
+          # to refs/heads/upstream (the pinned base) so the walk still runs (0 drift, informational).
+          git remote add upstream-canary "${UPSTREAM_URL}" 2>/dev/null || \
+            git remote set-url upstream-canary "${UPSTREAM_URL}"
+          if git fetch --no-tags upstream-canary main; then
+            git update-ref refs/remotes/upstream/main FETCH_HEAD
+            echo "UPSTREAM_MAIN=refs/remotes/upstream/main" >> "$GITHUB_ENV"
+          else
+            echo "WARN: could not fetch upstream main; falling back to pinned refs/heads/upstream" >&2
+            echo "UPSTREAM_MAIN=refs/heads/upstream" >> "$GITHUB_ENV"
+          fi
+
+      - name: Merge-tree walk + attribute conflicts to FD ids
+        env:
+          UPSTREAM_MAIN: ${{ env.UPSTREAM_MAIN }}
+        run: |
+          set -euo pipefail
+
+          upstream_sha="$(git rev-parse "${UPSTREAM_MAIN}")"
+          report="$(mktemp)"
+          total=0
+
+          # Walk every cumulative sovereign tip (upstream-base .. HEAD), replaying each against the
+          # latest upstream main. `git merge-tree --write-tree --merge-base=<mb> <tip> <upstream>`
+          # exits 0=clean / 1=conflicts; any other code is a real error. Conflicted paths are the
+          # `<mode> <oid> <stage>\t<path>` lines in the informational section after the tree oid.
+          for tip in $(git rev-list --reverse refs/heads/upstream..HEAD); do
+            fd="$(git show -s --format='%(trailers:key=Fork-Delta,valueonly)' "$tip" \
+                    | head -n1 | tr -d '[:space:]')"
+            fd="${fd:-UNLABELED}"
+            mb="$(git merge-base "$tip" "${UPSTREAM_MAIN}")"
+
+            set +e
+            out="$(git merge-tree --write-tree --merge-base="$mb" "$tip" "${UPSTREAM_MAIN}" 2>&1)"
+            rc=$?
+            set -e
+
+            if [ "$rc" -eq 0 ]; then
+              continue                      # clean merge — nothing to report for this tip
+            elif [ "$rc" -eq 1 ]; then
+              # `--write-tree` output: line 1 = tree oid, then the machine-readable conflicted-file
+              # block (`<mode> <oid> <stage>\t<path>`), then a blank line, then prose messages.
+              # Take the tab-delimited path column from every line BEFORE the first blank line
+              # (skipping line 1), and de-dup — a file conflicting at stages 2+3 lists twice.
+              files="$(printf '%s\n' "$out" \
+                        | awk 'NR==1{next} /^$/{exit} /\t/{sub(/^[^\t]*\t/,""); print}' \
+                        | sort -u || true)"
+              [ -z "$files" ] && files="(files not parsed; see raw merge-tree output)"
+              while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                echo "${fd}|${f}" >> "$report"
+                total=$((total + 1))
+              done <<< "$files"
+            else
+              echo "::error::merge-tree failed for ${tip} (${fd}) rc=${rc}"
+              printf '%s\n' "$out" | head -5 >&2
+              exit "$rc"                    # genuine tooling error — the ONLY non-zero exit
+            fi
+          done
+
+          # ---- Step summary: upstream SHA · per-FD file list · total ----
+          {
+            echo "## Conflict canary"
+            echo ""
+            echo "- Upstream main: \`${upstream_sha}\`"
+            echo "- Total conflicted files: **${total}**"
+            echo ""
+            if [ "$total" -gt 0 ]; then
+              echo "| FD | conflicted file |"
+              echo "|----|-----------------|"
+              sort -u "$report" | while IFS='|' read -r fd f; do
+                echo "| ${fd} | \`${f}\` |"
+              done
+            else
+              echo "_No conflicts against upstream main — sovereign series applies cleanly._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Export for the issue step.
+          echo "CONFLICT_TOTAL=${total}" >> "$GITHUB_ENV"
+          echo "UPSTREAM_SHA=${upstream_sha}" >> "$GITHUB_ENV"
+          echo "REPORT_FILE=${report}" >> "$GITHUB_ENV"
+
+      - name: Maintain single pinned tracking issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONFLICT_TOTAL: ${{ env.CONFLICT_TOTAL }}
+          UPSTREAM_SHA: ${{ env.UPSTREAM_SHA }}
+          REPORT_FILE: ${{ env.REPORT_FILE }}
+        run: |
+          set -euo pipefail
+          # Idempotent single-issue upsert, keyed by a stable marker label.
+          MARKER="conflict-canary"
+          title="Upstream conflict canary — sovereign series drift"
+
+          # Build the body once.
+          body="$(mktemp)"
+          {
+            echo "Automated by \`.github/workflows/conflict-canary.yml\` (informational; never a red gate)."
+            echo ""
+            echo "- Upstream main: \`${UPSTREAM_SHA}\`"
+            echo "- Total conflicted files: **${CONFLICT_TOTAL}**"
+            echo "- Last run: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+            if [ "${CONFLICT_TOTAL}" -gt 0 ] && [ -f "${REPORT_FILE}" ]; then
+              echo "| FD | conflicted file |"
+              echo "|----|-----------------|"
+              sort -u "${REPORT_FILE}" | while IFS='|' read -r fd f; do
+                echo "| ${fd} | \`${f}\` |"
+              done
+              echo ""
+              echo "> Escalation (FORK_DELTA.md cadence): conflicts persisting past one upstream minor release flip the tracking bead into a rebase-sprint."
+            fi
+          } > "$body"
+
+          # Ensure the marker label exists.
+          gh label create "$MARKER" --color BFD4F2 --description "Upstream conflict canary tracking" 2>/dev/null || true
+
+          existing="$(gh issue list --label "$MARKER" --state open --json number --jq '.[0].number' 2>/dev/null || true)"
+
+          if [ "${CONFLICT_TOTAL}" -gt 0 ]; then
+            if [ -n "$existing" ]; then
+              gh issue edit "$existing" --body-file "$body"
+              gh issue comment "$existing" --body "Canary re-ran at $(date -u +%Y-%m-%dT%H:%M:%SZ): ${CONFLICT_TOTAL} conflicted files vs \`${UPSTREAM_SHA}\`."
+            else
+              gh issue create --title "$title" --label "$MARKER" --body-file "$body"
+            fi
+          else
+            # Zero conflicts: close the pinned issue if one is open (drift resolved).
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "Canary at $(date -u +%Y-%m-%dT%H:%M:%SZ): 0 conflicts vs \`${UPSTREAM_SHA}\` — closing."
+              gh issue close "$existing"
+            fi
+          fi
