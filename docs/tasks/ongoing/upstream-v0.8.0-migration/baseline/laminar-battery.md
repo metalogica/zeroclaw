@@ -3,11 +3,49 @@
 **Bead:** `zc-b78l` (manual gate) · **Epic:** `upstream-v0.8.0-migration`
 **Sovereign tip under test:** `core/v0.8.0` @ `315220221` (FD-07 Laminar re-home) — battery run 2026-07-10
 **Root-I/O fix landed:** `core/v0.8.0` @ `b4288dc0b` (FD-07 follow-up, zc-gnpx) — **live re-verify PENDING**
-**Status:** 🟡 **PARTIAL — not yet a GREEN gate.** FD-07 span production PROVEN end-to-end; one clause
-(root I/O) failed → fixed in code, awaiting live re-verify; two clauses BLOCKED-manual; two not-yet-run.
+**Status:** 🟡 **PARTIAL — one live re-verify pass away from GREEN.** After re-run (b): root I/O FIXED &
+PROVEN (chat + webhook); negative control PASS; a NEW gap (ws has no root) found + FIXED in code
+(zc-a1bp); redaction conditional-pass (fork-faithful). Remaining before GREEN: ws root live re-verify +
+a `token:`-shaped redaction positive-probe. Triggers 4&5 remain BLOCKED-manual (zc-zb2t).
 
 Query transport: `docker exec clawcraft-laminar-clickhouse clickhouse-client -q "…"` (ClickHouse has no
-host port). Clean window used in the run: `start_time > '2026-07-10 17:36:30'` (UTC).
+host port).
+
+---
+
+## Re-run 2026-07-10 (b) — against `core/v0.8.0 @ b4288dc0b` (zc-gnpx). Clean window `> '2026-07-10 19:41:45'`
+
+**Root I/O — FIXED & PROVEN** (chat + webhook):
+```
+llm.call          n=2  with_input=2  with_output=2
+agent.activation  n=2  with_input=2  with_output=2      ← was 0/0 pre-fix
+root#1 web_chat  input="[Memory context]…"        output="Hello!"           exit=final_answer iters=1  session_id=""
+root#2 webhook   input="[…] hello via webhook"    output="Hello! How can…"  exit=final_answer iters=1  session_id="webhook_operator_operator"
+```
+(`JSONHas(attributes,'lmnr.span.input')=0` is expected — Laminar promotes the attrs into the typed
+`input`/`output` columns and strips them from the attributes JSON; the columns are populated.)
+`user_id` present on both · A6 key-leak = 0 rows.
+
+**Negative control — PASS:** blank `otel_headers` → `spans_after_blank_headers = 0`; restore → 7 spans.
+
+**⛔ NEW GAP — `/ws/chat` emits no `agent.activation` root** (2 roots for 3 surfaces). Isolated ws re-drive
+produced only `gen_ai.agent.invoke` + `llm.request` + `llm.response` (upstream-native), no `agent.activation`
+/`llm.call`. Root cause: `ws::handle_ws_chat` called `turn_streamed` with no `start_activation`/`scope_span`
+— the one prod ingress owner FD-07/Adj A omitted (the 0.6.9 fork instrumented it). **FIXED:** zc-a1bp,
+`core/v0.8.0 @ 8e309c9a8` (ported the root mint; gate green). **Live ws re-verify pending.**
+
+**Redaction — CONDITIONAL PASS (fork-faithful, not an FD-07 regression):** probe `sk-live-DEADBEEFdeadbeef00`
+(bare) + `Authorization: Bearer sk-live-DEADBEEFdead` (value-form) both landed RAW (`has_redacted=0`).
+`scrub_credentials` is a KEY-VALUE scrubber (`SENSITIVE_KV_REGEX`): bare tokens with no sensitive-key context
+are out of scope BY DESIGN (the earlier `token: SEKRET…` form DID redact → scrub path is live in the FD-07
+mirror), and the `Bearer` value-form is the known bug **zc-1qoq** (prod-gating; bare-prefix note appended).
+FD-07 ports scrub verbatim (Step 5.1). Positive-confirm next pass with a `token: sk-live-…` shaped probe.
+
+**Triggers 4 & 5 — BLOCKED-manual:** tool auto-approval denied post-migrate (→ zc-zb2t).
+
+**→ FINAL PASS needed** (one more live run after rebuilding `@8e309c9a8`): (1) drive `/ws/chat`, confirm an
+`agent.activation` root with typed `session_id` + non-empty root input/output + `llm.call` children;
+(2) `token:`-shaped redaction positive-confirm. Then flip to GREEN and close zc-b78l.
 
 ---
 
