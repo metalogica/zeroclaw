@@ -54,7 +54,10 @@
       "Waves 1\u20132 run serially by the orchestrator (foundation + human-gated STOP points), not as a fleet.",
       "substrate.yaml + docs/scripts/bead-graph.sh installed surgically (not via full /substrate:adopt) because the repo is already partially substrate-governed (custom docs/doctrine + real AGENTS.md/CLAUDE.md).",
       "GATE 2026-07-09: zc-jfun re-scoped to the 4-step Laminar re-home plan (option a) and re-opened; write-scope expanded across zeroclaw-api + otel.rs + rpc/turn.rs + agent.rs (approved, recorded in bead notes). Conservative edges zc-4leb/zc-p7tx <- zc-jfun dropped; zc-b78l edge retained.",
-      "GATE 2026-07-09: OTel-globals race extracted as P1 bug bead zc-ju48 (OnceLock + shutdown_shared_providers, 6 racing sites); zc-jfun blocked-by zc-ju48 (both edit otel.rs); zc-ju48 parallelizable with Wave 5, does not gate it. Upstreaming candidate."
+      "GATE 2026-07-09: OTel-globals race extracted as P1 bug bead zc-ju48 (OnceLock + shutdown_shared_providers, 6 racing sites); zc-jfun blocked-by zc-ju48 (both edit otel.rs); zc-ju48 parallelizable with Wave 5, does not gate it. Upstreaming candidate.",
+      "GATE 2026-07-10 (Fable, Decision 1): zc-jfun GO — single fleet worktree, 4-step plan CONFIRMED + 2 scope adjustments. Adj A: step-3 activation roots MUST also be minted at the run_tool_call_loop/process_message ingress owners (gateway/webhook/channels/CLI), not only rpc/turn.rs execute_turn (§7 root-span risk / FMEA #4 — prod front doors bypass execute_turn); step-4 mirrors+stamp_turn_exit at BOTH agent.rs turn* AND loop_.rs run_tool_call_loop sites. Adj B: port association-property guards verbatim (session_id None on /api/chat per claw §4.1; user_id gated on CLAW_USER_ID 32-char) — do NOT synthesize a session key. GATE: bead + union re-gate MUST add `cargo nextest run -p zeroclaw-runtime --features observability-otel` (default gate.test under-covers feature-gated otel). FD-07 = PRIVATE.",
+      "GATE 2026-07-10 (Fable, Decision 2): bijection (a)-variant — squash-by-theme is a dedicated ORCHESTRATOR step (bead zc-hnah) run immediately after zc-jfun merges, BEFORE Wave 6, pulled OUT of zc-t0ii (so zc-4leb never ships red-by-design). Rewrite refs/heads/upstream..core/v0.8.0 into ~12 trailered theme commits; assert `git diff old..new` empty; refresh worktree. zc-ju48 kept as its own commit trailered Fork-Delta: FD-12 (new PRIVATE row, upstreaming-candidate note). MUST use refs/heads/upstream explicitly (ambiguous refname). zc-hnah blocks zc-4leb; zc-t0ii reduced to archive + post-exec notes + final bijection AUDIT.",
+      "GATE 2026-07-10 (Fable, Decision 3): zc-jfun runner stays plain-commit + defer — NO runner-authored trailer. Orchestrator lands the FD-07 row (private) at merge; the zc-hnah squash pass materializes the FD-07 trailer commit minutes later. One protocol for all runners, one history rewrite total."
     ],
     "re-gates": [
       {
@@ -287,11 +290,11 @@
         "note": "merged; hotswap seeded+re-pointed; docker :dev OUT-OF-BAND (NPM_TOKEN)"
       },
       "zc-jfun": {
-        "status": "blocked",
-        "wave": 4,
-        "batch": "B",
+        "status": "ready-dispatching",
+        "wave": "5-jfun-window",
+        "batch": null,
         "commit": null,
-        "note": "SCOPE GAP: v0.8.0 dropped span-producing observability infra (Observer::start_activation trait, OtelSpan, activation owner, single-observer OnceLock). Bead write-scope insufficient \u2014 needs zeroclaw-api + rpc/turn.rs + otel.rs. Runner stopped rather than land inert spans. Blocks zc-b78l/zc-4leb/zc-p7tx."
+        "note": "2026-07-10 Fable GO (Decision 1): scope-gap RESOLVED \u2014 dispatching a single fleet worktree off core/v0.8.0@ac3b2df27 with the 4-step plan + Adj A (root-span at run_tool_call_loop/process_message ingress owners, not only execute_turn) + Adj B (port association-property guards verbatim). Bead gate + union re-gate include `cargo nextest run -p zeroclaw-runtime --features observability-otel`. Plain commit (Decision 3); orchestrator lands FD-07 row (private) at merge; zc-hnah squash materializes the trailer. Blocks zc-b78l (manual battery)."
       }
     },
     "notes": "Upstream advanced to v0.8.1/v0.8.2 during Wave 1; base held at v0.8.0 per locked spec decision. Continuation STOP-check negative.",
