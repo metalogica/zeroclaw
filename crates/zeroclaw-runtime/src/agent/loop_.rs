@@ -482,6 +482,72 @@ pub fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
+/// Build the `llm.call` input value for an *intermediate* call (iteration > 0).
+///
+/// Returns the **delta** — the messages appended to the provider message list
+/// since the previous `llm.call` (`messages[prev_count..]`), serialized as
+/// `role: content` lines, scrubbed + truncated to 16k. This answers "what
+/// prompted THIS call" (typically tool results / freshly appended context)
+/// without re-emitting the whole growing history on every iteration — the delta
+/// is the payload cost knob. Returns `None` when there is no new context (so the
+/// caller leaves the attribute unset rather than writing an empty string).
+///
+/// Shared across all multi-call engines (`loop_`, `agent.turn`,
+/// `agent.turn_streamed`) so the representation cannot drift between them.
+pub(crate) fn llm_call_input_delta(messages: &[ChatMessage], prev_count: usize) -> Option<String> {
+    let delta = messages.get(prev_count..)?;
+    if delta.is_empty() {
+        return None;
+    }
+    let joined = delta
+        .iter()
+        .map(|m| format!("{}: {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if joined.is_empty() {
+        return None;
+    }
+    Some(crate::util::truncate_with_ellipsis(
+        &scrub_credentials(&joined),
+        16_000,
+    ))
+}
+
+/// Build the `llm.call` output value, covering tool-call-only responses.
+///
+/// If the response carried assistant `text`, that (scrubbed + truncated 16k) is
+/// the output. Otherwise — the common intermediate case where the model emitted
+/// *only* tool calls and no text — summarize the decided calls as `name(args)`
+/// lines so the call's action is still captured (reasoning stays in
+/// `gen_ai.reasoning`). Returns `None` only when there is neither text nor any
+/// tool call, so a blank `llm.call` row is never emitted.
+///
+/// Shared across all multi-call engines so `gen_ai.completion` /
+/// `lmnr.span.output` stay consistent.
+pub(crate) fn llm_call_output_summary(
+    text: Option<&str>,
+    tool_calls: &[ToolCall],
+) -> Option<String> {
+    if let Some(t) = text.filter(|t| !t.is_empty()) {
+        return Some(crate::util::truncate_with_ellipsis(
+            &scrub_credentials(t),
+            16_000,
+        ));
+    }
+    if tool_calls.is_empty() {
+        return None;
+    }
+    let summary = tool_calls
+        .iter()
+        .map(|tc| format!("{}({})", tc.name, tc.arguments))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(crate::util::truncate_with_ellipsis(
+        &scrub_credentials(&summary),
+        16_000,
+    ))
+}
+
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
@@ -1965,6 +2031,21 @@ pub async fn run_tool_call_loop(
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
 
+    // Laminar `llm.call` mirror state (FD-07). Each iteration opens an
+    // `llm.call` child of the ambient activation root (`current_span()`), so
+    // the run_tool_call_loop ingress path (gateway `/api/chat`, webhook,
+    // channels, CLI `run`) emits the same connected trace tree as the ACP path.
+    // `prev_msg_count` tracks the provider message-list length fed to the
+    // *previous* call so each call's `lmnr.span.input` is the delta since then
+    // (see `llm_call_input_delta`) rather than the whole growing history. On
+    // iteration 0 the input is the last user message verbatim.
+    let mut prev_msg_count = history.len();
+    let iteration0_user_message = history
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone());
+
     // Pending praxis NextAction continuation (rnk-h6g3 / zc-n1mx). The turn
     // must not end while a continuation is pending — this is the gateway/
     // process_message mirror of the `Agent::turn` guard so `POST /api/chat`
@@ -2237,6 +2318,46 @@ pub async fn run_tool_call_loop(
             };
             let _ = tx.send(StreamDelta::Status(phase)).await;
         }
+
+        // ── Laminar `llm.call` span (FD-07) ───────────────────
+        // Open a child of the ambient activation root for THIS provider call.
+        // `gen_ai.prompt` is the OTel-native attr; `lmnr.span.input` is the
+        // Laminar message-view/full-text-search mirror. Scrub+truncate happens
+        // exactly once per site (inside `llm_call_input_delta`, or here for the
+        // iteration-0 user message). No-op when there is no ambient span
+        // (untraced paths / tests) or no OTel backend (NoopSpan).
+        let llm_span = crate::observability::current_span().map(|s| s.child("llm.call"));
+        if let Some(sp) = &llm_span {
+            sp.set_attr(
+                "gen_ai.request.model",
+                crate::observability::AttrValue::Str(active_model.to_string()),
+            );
+            if iteration == 0 {
+                if let Some(um) = iteration0_user_message.as_deref() {
+                    let input = crate::util::truncate_with_ellipsis(&scrub_credentials(um), 16_000);
+                    sp.set_attr(
+                        "gen_ai.prompt",
+                        crate::observability::AttrValue::Str(input.clone()),
+                    );
+                    sp.set_attr(
+                        "lmnr.span.input",
+                        crate::observability::AttrValue::Str(input),
+                    );
+                }
+            } else if let Some(input) = llm_call_input_delta(history, prev_msg_count) {
+                sp.set_attr(
+                    "gen_ai.prompt",
+                    crate::observability::AttrValue::Str(input.clone()),
+                );
+                sp.set_attr(
+                    "lmnr.span.input",
+                    crate::observability::AttrValue::Str(input),
+                );
+            }
+        }
+        // Record the message count fed to THIS call so the next iteration's
+        // delta starts after it.
+        prev_msg_count = history.len();
 
         observer.record_event(&ObserverEvent::LlmRequest {
             model_provider: active_model_provider_name.to_string(),
@@ -2704,6 +2825,27 @@ pub async fn run_tool_call_loop(
             !native_tool_calls.is_empty(),
         );
 
+        // ── Laminar `llm.call` output mirror (FD-07) ───────────
+        // `gen_ai.completion` is the OTel-native attr; `lmnr.span.output` is the
+        // Laminar render mirror. Tool-call-only responses (no assistant text)
+        // are summarized as `name(args)` lines so the call's action is captured
+        // — never a blank `llm.call` row. Scrub+truncate happens once inside
+        // `llm_call_output_summary`. The span ends on drop at the bottom of the
+        // iteration, giving true start→end timing.
+        if let Some(sp) = &llm_span
+            && let Some(output) =
+                llm_call_output_summary(Some(response_text.as_str()), &native_tool_calls)
+        {
+            sp.set_attr(
+                "gen_ai.completion",
+                crate::observability::AttrValue::Str(output.clone()),
+            );
+            sp.set_attr(
+                "lmnr.span.output",
+                crate::observability::AttrValue::Str(output),
+            );
+        }
+
         // Native provider tool_calls are converted into parsed `tool_calls`
         // above; if this branch is reached there is no valid native call to run.
         if tool_calls.is_empty() && parse_issue_detected {
@@ -2756,6 +2898,7 @@ pub async fn run_tool_call_loop(
                 let _ = tx.send(StreamDelta::Text(fallback.to_string())).await;
             }
             history.push(ChatMessage::assistant(fallback.to_string()));
+            crate::observability::stamp_turn_exit("malformed_tool_protocol", iteration + 1);
             return Ok(accumulated_display_text);
         }
 
@@ -2826,6 +2969,7 @@ pub async fn run_tool_call_loop(
                         format!("{display_text}\n\n{notice}")
                     };
                     accumulated_display_text.push_str(&final_text);
+                    crate::observability::stamp_turn_exit("continuation_exhausted", iteration + 1);
                     return Ok(accumulated_display_text);
                 }
             }
@@ -2875,6 +3019,8 @@ pub async fn run_tool_call_loop(
             }
 
             history.push(ChatMessage::assistant(response_text.clone()));
+            // Queryable turn-outcome on the activation root (zc-ug3w).
+            crate::observability::stamp_turn_exit("final_answer", iteration + 1);
             return Ok(accumulated_display_text);
         }
 
@@ -3545,6 +3691,11 @@ pub async fn run_tool_call_loop(
             history.push(ChatMessage::system(directive));
         }
     }
+
+    // Fell out of the iteration loop without a final answer: the runaway-safety
+    // cap fired. Stamp the queryable turn-outcome on the activation root before
+    // the graceful-summary shutdown (zc-ug3w).
+    crate::observability::stamp_turn_exit("max_iterations", max_iterations);
 
     // A continuation pending at iteration exhaustion is never dropped silently
     // (rnk-h6g3): finish any mechanical call-kind chain (costs no model
@@ -6363,6 +6514,76 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    // ── FD-07 `llm.call` mirror helpers (zc-jfun) ─────────────
+
+    #[test]
+    fn llm_call_input_delta_returns_appended_messages_only() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+            ChatMessage::tool("tool result body"),
+        ];
+        // Delta since prev_count=2 is the assistant + tool messages.
+        let delta = llm_call_input_delta(&messages, 2).expect("delta present");
+        assert!(delta.contains("assistant: hi"));
+        assert!(delta.contains("tool: tool result body"));
+        assert!(!delta.contains("hello"), "prior messages must not re-emit");
+    }
+
+    #[test]
+    fn llm_call_input_delta_none_when_no_new_context() {
+        let messages = vec![ChatMessage::user("only")];
+        assert!(llm_call_input_delta(&messages, 1).is_none());
+        assert!(
+            llm_call_input_delta(&messages, 99).is_none(),
+            "out-of-range prev_count yields None, not a panic"
+        );
+    }
+
+    #[test]
+    fn llm_call_input_delta_scrubs_secrets() {
+        let messages = vec![
+            ChatMessage::user("q"),
+            ChatMessage::tool("token: 1234567890abcdef"),
+        ];
+        let delta = llm_call_input_delta(&messages, 1).expect("delta present");
+        assert!(delta.contains("*[REDACTED]"));
+        assert!(!delta.contains("1234567890abcdef"));
+    }
+
+    #[test]
+    fn llm_call_output_summary_prefers_text() {
+        let out = llm_call_output_summary(Some("the answer"), &[]).expect("text output");
+        assert_eq!(out, "the answer");
+    }
+
+    #[test]
+    fn llm_call_output_summary_falls_back_to_tool_call_names() {
+        // Tool-call-only response (no text): summarize as `name(args)` so no
+        // blank llm.call row is emitted.
+        let calls = vec![ToolCall {
+            id: "c1".into(),
+            name: "shell".into(),
+            arguments: r#"{"command":"date"}"#.into(),
+            extra_content: None,
+        }];
+        let out = llm_call_output_summary(None, &calls).expect("tool summary");
+        assert_eq!(out, r#"shell({"command":"date"})"#);
+        // Empty text also falls back.
+        let out2 = llm_call_output_summary(Some(""), &calls).expect("tool summary");
+        assert_eq!(out2, r#"shell({"command":"date"})"#);
+    }
+
+    #[test]
+    fn llm_call_output_summary_none_when_neither_text_nor_calls() {
+        assert!(llm_call_output_summary(None, &[]).is_none());
+        assert!(
+            llm_call_output_summary(Some(""), &[]).is_none(),
+            "empty text + no tool calls must yield None (no blank llm.call row)"
+        );
+    }
 
     #[test]
     fn scrub_credentials_redacts_bearer_token() {

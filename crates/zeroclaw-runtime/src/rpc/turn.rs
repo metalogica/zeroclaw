@@ -64,6 +64,23 @@ where
     let mut turn_handle = zeroclaw_spawn::spawn!(async move {
         let mut guard = agent.lock().await;
         let sk = attribution.session_key.clone();
+        // ── Laminar activation root (FD-07) ────────────────────────
+        // Mint ONE root span per turn on the ACP/rpc path and scope the whole
+        // turn beneath it, so every `llm.call`/`tool.call` opened deep in the
+        // agent loop parents into this trace. `session_id` is absence-not-empty
+        // (Adjustment B): the session_key twins into Laminar's typed
+        // `session_id` only when present. Channel + pod-user attribution ride
+        // on the root. No-op when the backend is non-tracing (NoopSpan).
+        let root: std::sync::Arc<dyn crate::observability::Span> = {
+            let observer = guard.observer_handle();
+            let root = observer.start_activation(
+                crate::observability::trigger_for_channel(attribution.channel),
+                sk.as_deref(),
+            );
+            crate::observability::tag_channel(root.as_ref(), attribution.channel);
+            crate::observability::tag_user_id(root.as_ref());
+            std::sync::Arc::from(root)
+        };
         crate::agent::loop_::scope_session_key(attribution.session_key, async move {
             use ::zeroclaw_log::Instrument as _;
             let span = ::zeroclaw_log::info_span!(
@@ -75,10 +92,13 @@ where
                 model = %attribution.model,
                 channel = %attribution.channel,
             );
-            guard
-                .turn_streamed_with_steering_state(&prompt, event_tx, Some(cancel_clone), None)
-                .instrument(span)
-                .await
+            crate::observability::scope_span(
+                root,
+                guard
+                    .turn_streamed_with_steering_state(&prompt, event_tx, Some(cancel_clone), None)
+                    .instrument(span),
+            )
+            .await
         })
         .await
     });

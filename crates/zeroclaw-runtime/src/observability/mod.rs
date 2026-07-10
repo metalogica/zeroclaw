@@ -1,4 +1,6 @@
+pub mod active;
 pub mod dora;
+pub mod identity;
 pub mod log;
 pub mod multi;
 pub mod noop;
@@ -26,6 +28,18 @@ pub use otel::shutdown_shared_providers;
 #[cfg(feature = "observability-prometheus")]
 pub use prometheus::PrometheusObserver;
 pub use traits::{Observer, ObserverEvent};
+// Ambient activation-span helpers and pod-user attribution (Laminar salvage,
+// FD-07). Re-exported at the module root so call sites use
+// `observability::{scope_span, tag_user_id, …}` and the span-trace primitives
+// (`Span`/`AttrValue`/`Trigger`/`NoopSpan`, sourced from `zeroclaw-api` via
+// `traits`) resolve as `observability::{Span, AttrValue, …}`. Consumers land
+// with Step 5.2 (otel pipeline wiring); allow dead_code until then.
+#[allow(unused_imports)]
+pub use active::{current_span, scope_span, stamp_turn_exit};
+#[allow(unused_imports)]
+pub use identity::{pod_user_id, tag_channel, tag_user_id, trigger_for_channel};
+#[allow(unused_imports)]
+pub use traits::{AttrValue, NoopSpan, Span, Trigger};
 #[allow(unused_imports)]
 pub use verbose::VerboseObserver;
 
@@ -152,6 +166,13 @@ impl Observer for TeeObserver {
         // Expose the primary so downcasts (e.g. to PrometheusObserver in the
         // gateway's /metrics handler) keep working transparently.
         self.primary.as_any()
+    }
+
+    fn start_activation(&self, trigger: Trigger, session_hint: Option<&str>) -> Box<dyn Span> {
+        // Root spans are minted by the primary backend (only OTel produces a
+        // real activation span; every other backend returns a NoopSpan). The
+        // broadcast hook is event-only, so it does not participate here.
+        self.primary.start_activation(trigger, session_hint)
     }
 }
 

@@ -1,13 +1,15 @@
-use super::traits::{Observer, ObserverEvent, ObserverMetric};
+use super::traits::{
+    AttrValue, Observer, ObserverEvent, ObserverMetric, Span as TraceSpan, Trigger,
+};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt as _, Tracer};
-use opentelemetry::{Context, KeyValue, global};
+use opentelemetry::{Array, Context, KeyValue, Value, global};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Process-wide OTLP providers, built once and shared by every component's
 /// `OtelObserver`. Multiple subsystems (daemon, gateway, channels, agent loop,
@@ -62,6 +64,19 @@ pub struct OtelObserver {
     tracer_provider: SdkTracerProvider,
     meter_provider: SdkMeterProvider,
 
+    /// Configured `deployment.environment` (non-empty), surfaced on the root
+    /// activation span and every child. Self-hosted Laminar discards OTLP
+    /// *resource* attributes, so the resource-level copy is invisible there —
+    /// the span attribute is the queryable one. `None` when unconfigured/empty.
+    ///
+    /// v0.8.0 has no `otel_deployment_environment` config field (the upstream
+    /// re-home deleted the fork's config surface), and this file may not widen
+    /// [`OtelObserver::new`]'s signature (owned by zc-ju48's shared-provider
+    /// factory). So the value is sourced from the environment
+    /// (`ZEROCLAW_DEPLOYMENT_ENVIRONMENT`, falling back to the OTel-standard
+    /// `OTEL_DEPLOYMENT_ENVIRONMENT`) inside `new`.
+    environment: Option<String>,
+
     // Metrics instruments
     agent_starts: Counter<u64>,
     agent_duration: Histogram<f64>,
@@ -81,6 +96,62 @@ pub struct OtelObserver {
     active_agent_spans: Mutex<HashMap<String, (global::BoxedSpan, Context)>>,
 }
 
+/// Resolve the configured `deployment.environment`.
+///
+/// v0.8.0's config schema (owned by another crate, out of this bead's scope)
+/// has no `otel_deployment_environment` field, and [`OtelObserver::new`]'s
+/// signature is owned by the shared-provider factory (zc-ju48) and must not be
+/// widened here. So the deployment environment is read from the process
+/// environment: `ZEROCLAW_DEPLOYMENT_ENVIRONMENT` first (fork-specific), then
+/// the OTel-standard `OTEL_DEPLOYMENT_ENVIRONMENT`. Empty/whitespace values are
+/// treated as unset so the resource + span stay minimal (no empty
+/// `deployment.environment`).
+fn deployment_environment_from_env() -> Option<String> {
+    for key in [
+        "ZEROCLAW_DEPLOYMENT_ENVIRONMENT",
+        "OTEL_DEPLOYMENT_ENVIRONMENT",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Build the OTLP `Resource` shared by the trace and metric providers.
+///
+/// Carries `service.name` always and `deployment.environment` when configured.
+/// Kept deliberately minimal — resource attributes are process-global and must
+/// never carry credentials or PII (`user.id` and request content ride on spans,
+/// not the resource).
+fn build_otlp_resource(
+    service_name: &str,
+    environment: Option<&str>,
+) -> opentelemetry_sdk::Resource {
+    let mut builder =
+        opentelemetry_sdk::Resource::builder().with_service_name(service_name.to_string());
+    if let Some(env) = environment.filter(|e| !e.is_empty()) {
+        builder = builder.with_attribute(KeyValue::new("deployment.environment", env.to_string()));
+    }
+    builder.build()
+}
+
+/// Convert a backend-neutral [`AttrValue`] into an OTel attribute value.
+fn attr_to_value(v: AttrValue) -> Value {
+    match v {
+        AttrValue::Str(s) => Value::String(s.into()),
+        AttrValue::Int(i) => Value::I64(i),
+        AttrValue::Float(f) => Value::F64(f),
+        AttrValue::Bool(b) => Value::Bool(b),
+        AttrValue::Array(items) => {
+            Value::Array(Array::String(items.into_iter().map(Into::into).collect()))
+        }
+    }
+}
+
 impl OtelObserver {
     /// Create a new OTel observer exporting to the given OTLP endpoint.
     ///
@@ -95,6 +166,7 @@ impl OtelObserver {
         let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
         let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
         let service_name = service_name.unwrap_or("zeroclaw");
+        let environment = deployment_environment_from_env();
 
         // ── Trace + metric providers (built once per process) ───
         // Reuse the shared providers if another component already initialized
@@ -119,11 +191,7 @@ impl OtelObserver {
 
                 let tracer_provider = SdkTracerProvider::builder()
                     .with_batch_exporter(span_exporter)
-                    .with_resource(
-                        opentelemetry_sdk::Resource::builder()
-                            .with_service_name(service_name.to_string())
-                            .build(),
-                    )
+                    .with_resource(build_otlp_resource(service_name, environment.as_deref()))
                     .build();
 
                 // ── Metric exporter ─────────────────────────────
@@ -142,11 +210,7 @@ impl OtelObserver {
 
                 let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
                     .with_reader(metric_reader)
-                    .with_resource(
-                        opentelemetry_sdk::Resource::builder()
-                            .with_service_name(service_name.to_string())
-                            .build(),
-                    )
+                    .with_resource(build_otlp_resource(service_name, environment.as_deref()))
                     .build();
 
                 global::set_tracer_provider(tracer_provider.clone());
@@ -235,6 +299,7 @@ impl OtelObserver {
         Ok(Self {
             tracer_provider,
             meter_provider: meter_provider_clone,
+            environment,
             agent_starts,
             agent_duration,
             llm_calls,
@@ -630,6 +695,121 @@ impl Observer for OtelObserver {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn start_activation(&self, trigger: Trigger, session_hint: Option<&str>) -> Box<dyn TraceSpan> {
+        Box::new(OtelSpan::root(
+            trigger,
+            session_hint,
+            self.environment.as_deref(),
+        ))
+    }
+}
+
+/// An OTel-backed [`Span`](TraceSpan) node in the activation trace.
+///
+/// Holds an OTel [`Context`] with this node's span active. The root is created
+/// with an empty parent context (a fresh `trace_id`); children are created with
+/// the parent's context so they inherit its `trace_id` and link as descendants.
+/// The span opens on construction and ends on `Drop`, giving true start→end
+/// timing.
+pub struct OtelSpan {
+    cx: Context,
+    /// Configured `deployment.environment`, propagated to *every* span in the
+    /// trace (not just the root) so each span is independently sliceable by env
+    /// in backends that do not inherit the root span's attribute. `Arc` so child
+    /// spans share the value without re-allocating. `None` when unconfigured.
+    environment: Option<Arc<str>>,
+}
+
+impl OtelSpan {
+    /// Open the root activation span (`agent.activation`) on a fresh trace.
+    ///
+    /// `environment` (when non-empty) is set as the `deployment.environment`
+    /// span attribute in addition to the OTLP resource attribute — self-hosted
+    /// Laminar drops resource attributes, so the span copy is the one that stays
+    /// queryable.
+    fn root(trigger: Trigger, session_hint: Option<&str>, environment: Option<&str>) -> Self {
+        let tracer = global::tracer("zeroclaw");
+        // Empty parent context ⇒ a brand-new trace_id (one trace per activation).
+        let span = tracer.start_with_context("agent.activation", &Context::new());
+        let this = Self {
+            cx: Context::new().with_span(span),
+            environment: environment.filter(|e| !e.is_empty()).map(Arc::from),
+        };
+        this.set_attr("trigger", AttrValue::Str(trigger.as_str().to_string()));
+        // `session_id` is absence-not-empty (Adjustment B / claw §4.1): only when
+        // a real thread/session key exists do we associate it. `POST /api/chat`
+        // passes `None` and neither key is written — never synthesized, never "".
+        // Laminar's typed `session_id` column is filled ONLY from the
+        // `lmnr.association.properties.session_id` key; the plain `session_id`
+        // attr never populates it. A conversation/thread id IS Laminar's
+        // "session", so the twin carries the SAME value under the SAME guard.
+        // Mirrors the `user.id` → `lmnr.association.properties.user_id` dual-emit
+        // precedent (see identity::set_user_id_attrs).
+        if let Some(sid) = session_hint {
+            this.set_attr("session_id", AttrValue::Str(sid.to_string()));
+            this.set_attr(
+                "lmnr.association.properties.session_id",
+                AttrValue::Str(sid.to_string()),
+            );
+        }
+        if let Some(env) = this.environment.as_deref() {
+            this.set_attr("deployment.environment", AttrValue::Str(env.to_string()));
+        }
+        this
+    }
+
+    /// Concrete child constructor (used by [`TraceSpan::child`] and by tests).
+    ///
+    /// Re-stamps `deployment.environment` on the child span so it is queryable
+    /// on its own — backends that drop resource attributes and do not inherit
+    /// the root span's attributes (e.g. self-hosted Laminar) can still slice
+    /// child spans by environment.
+    fn child_span(&self, name: &str) -> Self {
+        let tracer = global::tracer("zeroclaw");
+        let span = tracer.start_with_context(name.to_string(), &self.cx);
+        let child = Self {
+            cx: self.cx.with_span(span),
+            environment: self.environment.clone(),
+        };
+        if let Some(env) = child.environment.as_deref() {
+            child.set_attr("deployment.environment", AttrValue::Str(env.to_string()));
+        }
+        child
+    }
+}
+
+impl TraceSpan for OtelSpan {
+    fn child(&self, name: &str) -> Box<dyn TraceSpan> {
+        Box::new(self.child_span(name))
+    }
+
+    fn set_attr(&self, key: &str, value: AttrValue) {
+        self.cx
+            .span()
+            .set_attribute(KeyValue::new(key.to_string(), attr_to_value(value)));
+    }
+
+    fn set_status(&self, ok: bool) {
+        self.cx
+            .span()
+            .set_status(if ok { Status::Ok } else { Status::error("") });
+    }
+
+    fn add_event(&self, name: &str, attrs: &[(&str, AttrValue)]) {
+        let kvs: Vec<KeyValue> = attrs
+            .iter()
+            .map(|(k, v)| KeyValue::new(k.to_string(), attr_to_value(v.clone())))
+            .collect();
+        self.cx.span().add_event(name.to_string(), kvs);
+    }
+}
+
+impl Drop for OtelSpan {
+    fn drop(&mut self) {
+        // End the span so the batch processor exports true start→end timing.
+        self.cx.span().end();
     }
 }
 
@@ -1035,5 +1215,97 @@ mod tests {
             result.is_ok(),
             "observer creation with empty headers must succeed"
         );
+    }
+
+    // ── FD-07 span-producing path (zc-jfun) ────────────────────
+
+    #[test]
+    fn start_activation_returns_span_and_records_without_panic() {
+        let obs = test_observer();
+        // A root with a session hint writes the `session_id` + Laminar twin; a
+        // child inherits the trace. We can't read exported attrs (async OTLP
+        // pipeline), but exercising the span-producing path proves it does not
+        // panic and honors the object-safe `Span` contract.
+        let root = obs.start_activation(Trigger::WebChat, Some("thread-abc"));
+        root.set_attr("k", AttrValue::Str("v".into()));
+        root.set_status(true);
+        let child = root.child("llm.call");
+        child.set_attr("lmnr.span.input", AttrValue::Str("hi".into()));
+        child.add_event("attempt", &[("n", AttrValue::Int(1))]);
+    }
+
+    #[test]
+    fn start_activation_without_session_hint_does_not_panic() {
+        // `/api/chat` passes None: absence-not-empty. No session_id twin is
+        // written, and minting the root must still succeed.
+        let obs = test_observer();
+        let root = obs.start_activation(Trigger::WebChat, None);
+        root.set_status(true);
+    }
+
+    #[test]
+    fn build_otlp_resource_includes_env_only_when_set() {
+        use opentelemetry::Key;
+        let with = build_otlp_resource("svc", Some("prod"));
+        assert_eq!(
+            with.get(&Key::from_static_str("deployment.environment")),
+            Some(Value::String("prod".into())),
+            "deployment.environment must be present on the resource when configured"
+        );
+        for empty in [None, Some(""), Some("   ")] {
+            let res = build_otlp_resource("svc", empty.map(str::trim).filter(|e| !e.is_empty()));
+            assert_eq!(
+                res.get(&Key::from_static_str("deployment.environment")),
+                None,
+                "deployment.environment must be omitted for {empty:?} (resource stays minimal)"
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_environment_prefers_zeroclaw_then_otel_env() {
+        // Guarded by a process-global mutex indirectly via serial exec of env;
+        // these keys are unlikely to be set in CI, but restore afterward.
+        let saved_z = std::env::var("ZEROCLAW_DEPLOYMENT_ENVIRONMENT").ok();
+        let saved_o = std::env::var("OTEL_DEPLOYMENT_ENVIRONMENT").ok();
+
+        // SAFETY: single-threaded test scope; restored below.
+        unsafe {
+            std::env::remove_var("ZEROCLAW_DEPLOYMENT_ENVIRONMENT");
+            std::env::remove_var("OTEL_DEPLOYMENT_ENVIRONMENT");
+        }
+        assert_eq!(deployment_environment_from_env(), None);
+
+        unsafe {
+            std::env::set_var("OTEL_DEPLOYMENT_ENVIRONMENT", "staging");
+        }
+        assert_eq!(
+            deployment_environment_from_env().as_deref(),
+            Some("staging")
+        );
+
+        unsafe {
+            std::env::set_var("ZEROCLAW_DEPLOYMENT_ENVIRONMENT", "prod");
+        }
+        assert_eq!(deployment_environment_from_env().as_deref(), Some("prod"));
+
+        // Empty/whitespace is treated as unset.
+        unsafe {
+            std::env::set_var("ZEROCLAW_DEPLOYMENT_ENVIRONMENT", "   ");
+            std::env::set_var("OTEL_DEPLOYMENT_ENVIRONMENT", "");
+        }
+        assert_eq!(deployment_environment_from_env(), None);
+
+        // Restore.
+        unsafe {
+            match saved_z {
+                Some(v) => std::env::set_var("ZEROCLAW_DEPLOYMENT_ENVIRONMENT", v),
+                None => std::env::remove_var("ZEROCLAW_DEPLOYMENT_ENVIRONMENT"),
+            }
+            match saved_o {
+                Some(v) => std::env::set_var("OTEL_DEPLOYMENT_ENVIRONMENT", v),
+                None => std::env::remove_var("OTEL_DEPLOYMENT_ENVIRONMENT"),
+            }
+        }
     }
 }

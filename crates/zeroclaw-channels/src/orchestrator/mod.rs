@@ -4473,6 +4473,28 @@ async fn process_channel_message_body(
             collector: std::sync::Arc::clone(&tool_receipts_collector),
         }
     });
+    // ── Laminar activation root (FD-07 / Adjustment A) ──────────────
+    // The channels orchestrator (native channels AND the inbound webhook
+    // channel) drives the SHARED `run_tool_call_loop` directly — NOT
+    // `execute_turn`. Mint ONE activation root per dispatched message here and
+    // scope the loop beneath it so every channel's turn emits a connected trace
+    // with typed session/user columns. The root is minted through the REAL
+    // backend observer (`ctx.observer`) — the `ChannelNotifyObserver` wrapper is
+    // event-only and does not produce spans. `history_key` is a real
+    // conversation/thread key, so it twins into Laminar's `session_id`
+    // (absence-not-empty is moot here — a channel always has a thread key).
+    // `msg.channel` maps to the coarse trigger; the concrete channel name +
+    // pod-user ride on the root.
+    let activation_root: std::sync::Arc<dyn observability::Span> = {
+        let r = ctx.observer.start_activation(
+            observability::trigger_for_channel(msg.channel.as_str()),
+            Some(history_key.as_str()),
+        );
+        observability::tag_channel(r.as_ref(), msg.channel.as_str());
+        observability::tag_user_id(r.as_ref());
+        std::sync::Arc::from(r)
+    };
+
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let loop_result = tokio::select! {
@@ -4489,7 +4511,15 @@ async fn process_channel_message_body(
                             cost_tracking_context.clone(),
                         zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
                             receipt_scope.clone(),
-                        run_tool_call_loop(
+                        observability::scope_span(
+                            std::sync::Arc::clone(&activation_root),
+                        // Box the loop future: `run_tool_call_loop` is a very
+                        // large async state machine and wrapping it in
+                        // `scope_span` inside this already deeply-nested
+                        // `scope_*` chain overflows the stack (the archive's
+                        // `large_futures` note). Heap-pinning it keeps the outer
+                        // future small.
+                        Box::pin(run_tool_call_loop(
                         active_model_provider.as_ref(),
                         &mut history,
                         ctx.tools_registry.as_ref(),
@@ -4534,11 +4564,12 @@ async fn process_channel_message_body(
                         ctx.receipt_generator
                             .as_ref()
                             .map(|_| tool_receipts_collector.as_ref()),
-                    ),
-                    ),
-                    ),
-                    ),
-                    ),
+                    )), // run_tool_call_loop + Box::pin
+                    ), // scope_span
+                    ), // RECEIPT scope
+                    ), // COST scope
+                    ), // scope_session_key
+                    ), // scope_thread_id
                 ) => LlmExecutionResult::Completed(result),
             };
 

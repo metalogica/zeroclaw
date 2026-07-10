@@ -1097,6 +1097,14 @@ impl Agent {
     /// injects the TUI's captured shell environment so that tools like
     /// `ShellTool` inherit the user's real `PATH`, `SSH_AUTH_SOCK`, etc.
     /// rather than the daemon's stripped-down process environment.
+    /// The agent's observer handle, for callers that must mint an activation
+    /// root span outside the turn (e.g. `rpc::execute_turn`, FD-07). Cloned
+    /// `Arc` so `start_activation` can be called without holding the agent lock
+    /// across the turn.
+    pub fn observer_handle(&self) -> Arc<dyn Observer> {
+        Arc::clone(&self.observer)
+    }
+
     pub async fn from_config_with_tui_env(
         config: &Config,
         agent_alias: &str,
@@ -2055,16 +2063,62 @@ impl Agent {
         if !self.config.resolved.parallel_tools || approval_required {
             let mut results = Vec::with_capacity(calls.len());
             for call in calls {
-                results.push(self.execute_tool_call(call, turn_id).await);
+                let result = self.scoped_tool_call(call, turn_id).await;
+                results.push(result);
             }
             return results;
         }
 
         let futs: Vec<_> = calls
             .iter()
-            .map(|call| self.execute_tool_call(call, turn_id))
+            .map(|call| self.scoped_tool_call(call, turn_id))
             .collect();
         futures_util::future::join_all(futs).await
+    }
+
+    /// Run one tool call beneath a `tool.call` child of the ambient activation
+    /// root (FD-07). Opens the child, stamps `tool.name` + scrubbed+truncated
+    /// `tool.input`/`input.value`, scopes the execution so any nested
+    /// sub-agent's spans parent beneath this `tool.call`, then stamps
+    /// `tool.output`/`tool.error` (+ `output.value`) once. No-op / plain
+    /// delegation when there is no ambient span (untraced paths / tests) or a
+    /// non-tracing backend (NoopSpan).
+    async fn scoped_tool_call(&self, call: &ParsedToolCall, turn_id: &str) -> ToolExecutionResult {
+        let Some(root) = observability::current_span() else {
+            return self.execute_tool_call(call, turn_id).await;
+        };
+        let ts: Arc<dyn observability::Span> = Arc::from(root.child("tool.call"));
+        ts.set_attr(
+            "tool.name",
+            observability::AttrValue::Str(call.name.clone()),
+        );
+        // tool.input = the invocation args, scrubbed + truncated to 16k (mirrors
+        // tool.output). Args can carry secrets, so scrub is mandatory here.
+        let input = crate::util::truncate_with_ellipsis(
+            &super::loop_::scrub_credentials(&call.arguments.to_string()),
+            16_000,
+        );
+        ts.set_attr("tool.input", observability::AttrValue::Str(input.clone()));
+        ts.set_attr("input.value", observability::AttrValue::Str(input));
+
+        let result =
+            observability::scope_span(Arc::clone(&ts), self.execute_tool_call(call, turn_id)).await;
+
+        // tool_execution outputs may not be scrubbed at every source, so redact
+        // here before it reaches the span.
+        let body = crate::util::truncate_with_ellipsis(
+            &super::loop_::scrub_credentials(&result.output),
+            16_000,
+        );
+        if result.success {
+            ts.set_attr("tool.output", observability::AttrValue::Str(body.clone()));
+            ts.set_attr("output.value", observability::AttrValue::Str(body));
+        } else {
+            ts.set_attr("tool.error", observability::AttrValue::Str(body.clone()));
+            ts.set_attr("output.value", observability::AttrValue::Str(body));
+        }
+        ts.set_status(result.success);
+        result
     }
 
     fn classify_model(&self, user_message: &str) -> String {
@@ -2540,6 +2594,14 @@ impl Agent {
         // not end while one is pending — see the termination guard below.
         let mut continuation = ContinuationDriver::new();
 
+        // Laminar `llm.call` mirror state (FD-07). Parallels the
+        // `run_tool_call_loop` wiring so the ACP/`Agent::turn` path emits the
+        // same connected trace tree. `prev_msg_count` tracks the provider
+        // message-list length fed to the *previous* call so each call's
+        // `lmnr.span.input` is the delta since then; iteration 0 uses the raw
+        // user message.
+        let mut prev_msg_count = 0usize;
+
         for iteration in 0..self.config.resolved.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let prepared_messages = self.prepare_provider_messages(&messages).await?;
@@ -2589,6 +2651,37 @@ impl Agent {
                     "agent: outbound prompt size (non-streaming)"
                 );
             }
+
+            // ── Laminar `llm.call` span (FD-07) ───────────────
+            // Open a child of the ambient activation root for THIS provider
+            // call. Scrub+truncate happens exactly once per site.
+            let llm_span = observability::current_span().map(|s| s.child("llm.call"));
+            if let Some(sp) = &llm_span {
+                sp.set_attr(
+                    "gen_ai.request.model",
+                    observability::AttrValue::Str(effective_model.clone()),
+                );
+                if iteration == 0 {
+                    let input = crate::util::truncate_with_ellipsis(
+                        &super::loop_::scrub_credentials(user_message),
+                        16_000,
+                    );
+                    sp.set_attr(
+                        "gen_ai.prompt",
+                        observability::AttrValue::Str(input.clone()),
+                    );
+                    sp.set_attr("lmnr.span.input", observability::AttrValue::Str(input));
+                } else if let Some(input) =
+                    super::loop_::llm_call_input_delta(&prepared_messages, prev_msg_count)
+                {
+                    sp.set_attr(
+                        "gen_ai.prompt",
+                        observability::AttrValue::Str(input.clone()),
+                    );
+                    sp.set_attr("lmnr.span.input", observability::AttrValue::Str(input));
+                }
+            }
+            prev_msg_count = prepared_messages.len();
 
             let llm_started_at = Instant::now();
             self.observer.record_event(&ObserverEvent::LlmRequest {
@@ -2665,6 +2758,26 @@ impl Agent {
             };
 
             let (text, calls) = self.parse_response_for_effective_tools(&response);
+
+            // ── Laminar `llm.call` output mirror (FD-07) ──────
+            // Tool-call-only responses summarize as `name(args)` lines so the
+            // call's action is captured — never a blank `llm.call` row.
+            if let Some(sp) = &llm_span {
+                let out_text = response.text.as_deref().filter(|t| !t.is_empty());
+                if let Some(output) =
+                    super::loop_::llm_call_output_summary(out_text, &response.tool_calls)
+                {
+                    sp.set_attr(
+                        "gen_ai.completion",
+                        observability::AttrValue::Str(output.clone()),
+                    );
+                    sp.set_attr("lmnr.span.output", observability::AttrValue::Str(output));
+                }
+            }
+            // Drop the llm.call span before running tools so its end timestamp
+            // reflects the provider call, not the subsequent tool executions.
+            drop(llm_span);
+
             if calls.is_empty() {
                 let final_text = if text.is_empty() && !self.tool_specs.is_empty() {
                     response.text.unwrap_or_default()
@@ -2697,6 +2810,7 @@ impl Agent {
                             format!("{final_text}\n\n{notice}")
                         };
                         self.trim_history();
+                        observability::stamp_turn_exit("continuation_exhausted", iteration + 1);
                         return Ok(final_text);
                     }
                 }
@@ -2718,6 +2832,7 @@ impl Agent {
                     )));
                 self.trim_history();
 
+                observability::stamp_turn_exit("final_answer", iteration + 1);
                 return Ok(final_text);
             }
 
@@ -2764,6 +2879,10 @@ impl Agent {
 
             self.trim_history();
         }
+
+        // Fell out of the iteration loop without a final answer: the
+        // runaway-safety cap fired (zc-ug3w).
+        observability::stamp_turn_exit("max_iterations", self.config.resolved.max_tool_iterations);
 
         // A continuation pending at iteration exhaustion is never dropped
         // silently (rnk-h6g3): finish any mechanical call-kind chain (costs
@@ -2914,6 +3033,9 @@ impl Agent {
         // not end while one is pending — see the termination guard below.
         let mut continuation = ContinuationDriver::new();
 
+        // Laminar `llm.call` mirror state (FD-07) — see `Agent::turn`.
+        let mut prev_msg_count = 0usize;
+
         // ── Turn loop ──────────────────────────────────────────────────
         for iteration in 0..self.config.resolved.max_tool_iterations {
             // Early exit if the caller cancelled this turn (e.g. user abort)
@@ -3021,6 +3143,35 @@ impl Agent {
             // Try streaming first; if the model_provider returns content we
             // forward deltas.  Otherwise fall back to non-streaming chat.
             use futures_util::StreamExt;
+
+            // ── Laminar `llm.call` span (FD-07) ───────────────
+            let llm_span = observability::current_span().map(|s| s.child("llm.call"));
+            if let Some(sp) = &llm_span {
+                sp.set_attr(
+                    "gen_ai.request.model",
+                    observability::AttrValue::Str(effective_model.clone()),
+                );
+                if iteration == 0 {
+                    let input = crate::util::truncate_with_ellipsis(
+                        &super::loop_::scrub_credentials(user_message),
+                        16_000,
+                    );
+                    sp.set_attr(
+                        "gen_ai.prompt",
+                        observability::AttrValue::Str(input.clone()),
+                    );
+                    sp.set_attr("lmnr.span.input", observability::AttrValue::Str(input));
+                } else if let Some(input) =
+                    super::loop_::llm_call_input_delta(&prepared_messages, prev_msg_count)
+                {
+                    sp.set_attr(
+                        "gen_ai.prompt",
+                        observability::AttrValue::Str(input.clone()),
+                    );
+                    sp.set_attr("lmnr.span.input", observability::AttrValue::Str(input));
+                }
+            }
+            prev_msg_count = prepared_messages.len();
 
             let llm_started_at = Instant::now();
             self.observer.record_event(&ObserverEvent::LlmRequest {
@@ -3414,6 +3565,22 @@ impl Agent {
             }
 
             let (text, mut calls) = self.parse_response_for_effective_tools(&response);
+
+            // ── Laminar `llm.call` output mirror (FD-07) ──────
+            if let Some(sp) = &llm_span {
+                let out_text = response.text.as_deref().filter(|t| !t.is_empty());
+                if let Some(output) =
+                    super::loop_::llm_call_output_summary(out_text, &response.tool_calls)
+                {
+                    sp.set_attr(
+                        "gen_ai.completion",
+                        observability::AttrValue::Str(output.clone()),
+                    );
+                    sp.set_attr("lmnr.span.output", observability::AttrValue::Str(output));
+                }
+            }
+            drop(llm_span);
+
             if calls.is_empty() {
                 let final_text = if text.is_empty() && !self.tool_specs.is_empty() {
                     response.text.unwrap_or_default()
@@ -3476,6 +3643,7 @@ impl Agent {
                         )));
                         committed_response.push_str(&final_text);
                         self.trim_history();
+                        observability::stamp_turn_exit("continuation_exhausted", iteration + 1);
                         self.observer.record_event(&ObserverEvent::TurnComplete);
                         return Ok(StreamedTurnSuccess {
                             response: committed_response,
@@ -3537,6 +3705,7 @@ impl Agent {
                     )));
                 committed_response.push_str(&final_text);
                 self.trim_history();
+                observability::stamp_turn_exit("final_answer", iteration + 1);
                 self.observer.record_event(&ObserverEvent::TurnComplete);
                 return Ok(StreamedTurnSuccess {
                     response: committed_response,
@@ -3764,6 +3933,10 @@ impl Agent {
             self.trim_history();
         }
 
+        // Fell out of the iteration loop without a final answer: the
+        // runaway-safety cap fired (zc-ug3w).
+        observability::stamp_turn_exit("max_iterations", self.config.resolved.max_tool_iterations);
+
         // A continuation pending at iteration exhaustion is never dropped
         // silently (rnk-h6g3): finish any mechanical call-kind chain (costs
         // no model iterations), then route what remains to the failure
@@ -3806,7 +3979,17 @@ impl Agent {
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {
-        self.turn(message).await
+        // ── Laminar activation root (FD-07) ────────────────────
+        // CLI `run` is a shared-loop front door (Adjustment A): mint a
+        // `Trigger::Cli` root and scope the turn so llm.call/tool.call spans
+        // parent into one trace. CLI carries no channel and no session, so
+        // neither `channel`/tags nor `session_id` is set, and `tag_user_id` is
+        // intentionally NOT called (never CLI/cron — see identity.rs).
+        let cli_root = self
+            .observer
+            .start_activation(observability::Trigger::Cli, None);
+        let root: Arc<dyn observability::Span> = Arc::from(cli_root);
+        observability::scope_span(root, self.turn(message)).await
     }
 
     pub async fn run_interactive(&mut self) -> Result<()> {
@@ -3824,7 +4007,12 @@ impl Agent {
         });
 
         while let Some(msg) = rx.recv().await {
-            let response = match self.turn(&msg.content).await {
+            // One activation root per interactive turn (FD-07 / Adjustment A).
+            let cli_root = self
+                .observer
+                .start_activation(observability::Trigger::Cli, None);
+            let root: Arc<dyn observability::Span> = Arc::from(cli_root);
+            let response = match observability::scope_span(root, self.turn(&msg.content)).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     eprintln!("\nError: {e}\n");

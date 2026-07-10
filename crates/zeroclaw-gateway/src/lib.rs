@@ -2263,12 +2263,34 @@ async fn run_gateway_chat_with_tools(
         let captured_usage = cost_tracking_context
             .as_ref()
             .map(|ctx| ctx.turn_usage.clone());
-        let response = Box::pin(
+
+        // ── Laminar activation root (FD-07 / Adjustment A) ──────────
+        // `POST /api/chat` and the webhook both delegate to the SHARED
+        // `process_message`/`run_tool_call_loop` path, NOT `execute_turn`. Mint
+        // the activation root HERE and scope the whole call so the primary prod
+        // ingress emits a connected trace with typed session/user columns —
+        // otherwise prod pods emit no root on their real front door.
+        // `session_id` is absence-not-empty (Adjustment B / claw §4.1): it twins
+        // into Laminar's `session_id` ONLY when a real thread key is present
+        // (`/api/chat` passes `None` — never synthesized). Channel + pod-user
+        // ride on the root.
+        let root: std::sync::Arc<dyn zeroclaw_runtime::observability::Span> = {
+            let r = state.observer.start_activation(
+                zeroclaw_runtime::observability::Trigger::WebChat,
+                session_id,
+            );
+            zeroclaw_runtime::observability::tag_channel(r.as_ref(), "web");
+            zeroclaw_runtime::observability::tag_user_id(r.as_ref());
+            std::sync::Arc::from(r)
+        };
+
+        let response = Box::pin(zeroclaw_runtime::observability::scope_span(
+            root,
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
                 zeroclaw_runtime::agent::process_message(config, &agent_alias, message, session_id),
             ),
-        )
+        ))
         .await?;
         let usage = captured_usage
             .map(|cell| *cell.lock())
