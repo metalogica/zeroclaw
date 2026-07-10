@@ -1,15 +1,19 @@
 # Upstream v0.8.0 Migration & Fork-Maintenance Playbook
 
-> ⚠️ **PRIOR ANALYSIS — CROSS-CHECK ONLY, DO NOT TRUST BLINDLY.** This is a first-pass planning
-> ledger from 2026-06-16. The handover to Fable requires **re-deriving** the commit clustering
-> and each per-theme disposition from the raw ledger (`research/fork-delta-commits.md` +
-> `git show <sha>`) and the verified facts (`research/upstream-v0.8.0-facts.md`). Use this
-> document to cross-check; **flag any place its claims contradict the verified facts.** Known
-> corrections already found: v0.8.0 has **15** `zeroclaw-*` crates (this doc's §2 list missed
-> `zeroclaw-spawn` and `zeroclaw-tool-call-parser`); the open questions Q1–Q5 in §6 are now
-> **resolved** in `research/upstream-v0.8.0-facts.md §3`.
+> 🗄️ **ARCHIVED — superseded by `docs/FORK_DELTA.md` (the live sovereign-delta ledger) + the
+> migration spec (`upstream-v0.8.0-migration-spec.md`).** This first-pass planning ledger
+> (2026-06-16) is retained as historical analysis only; it was re-derived and, where it
+> contradicted the verified facts, corrected during execution (see spec §3.9 Contradictions).
+> **Do not trust or edit it as live guidance.** The durable graduate of §7 (the standing
+> fork-maintenance playbook — branch semantics, delta ledger, rebase cadence, conflict canary)
+> now lives in the `docs/FORK_DELTA.md` header; live divergences are the FORK_DELTA rows; drop
+> verdicts and the bijection audit live in the spec's Post-execution notes. Archived by zc-t0ii
+> (Phase 7, Step 7.4).
 >
-> **Status:** planning ledger — durable, iterate in place.
+> _Original cross-check note (historical): re-derive commit clustering + per-theme dispositions
+> from `research/fork-delta-commits.md` + `git show <sha>` against `research/upstream-v0.8.0-facts.md`;
+> known corrections — v0.8.0 has **15** `zeroclaw-*` crates (§2 missed `zeroclaw-spawn` +
+> `zeroclaw-tool-call-parser`); Q1–Q5 in §6 resolved in facts §3. Original status: planning ledger._
 > **Fork tip:** `0.6.9-alpha-p10.7` (84 commits on top of `v0.6.9`).
 > **Target:** upstream `metalogica/zeroclaw` **v0.8.0** (2026-06-12).
 > **Owner:** rei nova. **Last updated:** 2026-06-16.

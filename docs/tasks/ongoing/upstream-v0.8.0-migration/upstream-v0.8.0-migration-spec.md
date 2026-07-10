@@ -725,3 +725,34 @@ _(populated during execution — scope expansions per execution-format §7.1, dr
 - **`a0d1a8fbd` `ZEROCLAW_SYSTEM_DIR` split-mount — DROP (superseded).** The fork's system/workspace split-mount env is superseded by upstream's per-agent workspace boundaries; `git grep -il ZEROCLAW_SYSTEM_DIR` at v0.8.0 returns zero matches. No re-home; not a ledger row.
 - **`c276ffe6a` webhook-only supervision fix — DROP (absorbed upstream, test-pinned).** Upstream `has_supervised_channels` → `ChannelsConfig::has_any_enabled()` counts webhook (schema.rs:11089) and is regression-pinned by `webhook_only_config_is_supervised` (daemon/mod.rs:1641–1662). The fork intent is fully covered; referenced in the FD-04 ledger-row rationale rather than carried as fork code. No new fork test added.
 - **Scope note (zc-e6t0):** FD-04/05/06 *code* landed earlier (zc-2sw0 config-compat, zc-qwhe token + `/api/chat`, zc-nvqs ws-threadId); zc-e6t0's deliverable reduced to the FD-04 + FD-05 ledger rows (FD-06 already present) + these drop records. Residual optional follow-up: no end-to-end test drives a clawcraft-rendered *legacy* `[channels_config.webhook]` config through migration→supervision (the invariant and the migration are each covered separately, not composed). The per-theme trailer-squash for FD-04/05/06 is deferred to zc-t0ii finalization (bijection reconciliation, zc-4leb).
+
+#### Phase 6 (Theme A — provider divergences) drop verdicts — recorded by zc-t0ii (from zc-qskr/zc-ul1f verify-then-decide)
+
+Of the four Step-1.3 provider candidates, one was ported (into FD-08) and three DROPPED as upstream-absorbed:
+
+- **`reasoning` alias — PORTED (thin) into FD-08.** zc-qskr's verify-then-decide pass confirmed the alias is still fork-useful and carried it under the FD-08 row (OpenRouter `user` + `[AUDIO:]` + ported provider verdicts).
+- **SSE streaming — DROP (upstream-absorbed).** v0.8.0 openrouter already streams (`stream_chat()` verified in facts §1) — the fork's streaming re-home is unnecessary; no streaming code re-homed.
+- **Image-gen output extraction — DROP from thin-port (upstream lacks the substrate).** Upstream removed the `images`-field extraction substrate; not thin-portable. Recorded as the **image-to-disk** standalone follow-up below rather than carried as thin fork code.
+- **Thinking events — DROP (upstream-absorbed).** v0.8.0 TurnEvents cover `reasoning_content` on both paths, so the fork's Thinking-event port is unnecessary.
+
+#### Theme H (README / tbd noise, ~21 commits) — DROP (no product value)
+
+Per spec §4 clustering (Theme H): the ~21 README/tbd-churn commits carry no product value and are regenerated rather than re-homed. Not a ledger row, not re-applied. This is the §7.6 "no README-churn commits on the feature line" playbook rule applied retroactively to the backlog.
+
+#### Carried-forward follow-ups (filed as beads / future work — NOT blockers for epic close)
+
+- **zc-mk2r (P3, independent) — exit-time telemetry drain.** `shutdown_shared_providers` (restored under FD-12) is re-exported but not yet wired to an exit-time drain caller (main.rs / CLI teardown). Not on the critical path; providers still flush per-span.
+- **FD-07 `deployment.environment` env-source follow-up.** The per-span `deployment.environment` attribute is currently sourced from `ZEROCLAW_/OTEL_DEPLOYMENT_ENVIRONMENT` env because **v0.8.0 config lacks the field** (0.6.9 carried it in config). Follow-up: restore a config field and source from it (env stays as the override). Non-gating — the attribute is stamped correctly today.
+- **Image-to-disk persistence (OpenRouter) — standalone feature bead.** Upstream removed the image-persistence substrate; if the fork still wants disk-persisted generated images, file a standalone feature bead (per zc-qskr — not thin-portable, hence dropped from the FD-08 thin-port above).
+- **Runtime-trace JSONL writer — possible follow-up (per zc-rfri).** Continuation trace events route via `zeroclaw_log::record!`; v0.8.0 has no `runtime_trace` JSONL writer equivalent. If the fork wants the JSONL trace artifact back, it is a standalone follow-up (no thin port exists).
+- **Doc-accuracy correction (42618 webhook body shape).** The 42618 webhook is `[channels.webhook.default]` → body `{"sender","content"}` — **NOT** `{"message"}`, which is the `/api/chat` relay shape (FD-05). Earlier handoff prose conflated the two; the code is correct, the note corrects the doc.
+- **Optional non-gating enhancement (ws surface attribution).** Give `/ws/chat` a distinct `trigger`/`surface` span attribute: chat (`/api/chat`) and ws currently share `web_chat`/`web` and are distinguishable only by `session_id`. Splitting the attribute would make the ws surface first-class in Laminar without a session-id join. Cosmetic; not required for the FD-07 §4.4 clauses (all of which passed).
+
+#### Final ledger / bijection AUDIT — zc-t0ii (no history rewrite; squash already ran at zc-hnah)
+
+Audited `refs/heads/upstream..core/v0.8.0` (`v0.8.0` tag `5fc9d3c38` → sovereign tip `8e309c9a8`) — the audit `fork-delta-check.yml` enforces, re-run by hand at finalization:
+
+- **Bijection GREEN — 16 commits ⇄ 13 FD rows.** Every one of the 16 sovereign-only commits carries a `Fork-Delta: FD-NN` trailer matching exactly one ledger row; every one of the 13 rows (FD-00 … FD-12, contiguous) matches ≥1 commit. Multi-commit rows: **FD-04 ×2** (config-compat + token/`/api/chat`) and **FD-07 ×3** (Laminar re-home + zc-gnpx root I/O + zc-a1bp ws root) — both explicitly allowed (a theme row may carry multiple commits).
+- **Field completeness GREEN.** All 13 rows are disposition `private`; **no `transitional` rows** (none require `end-state`+`removal-ref`) and **no `upstreaming` rows** (none require a PR URL). FD-12 (single-instance OTLP exporter) is a noted upstreaming *candidate* whose disposition flips to `upstreaming` only when a PR URL exists — correctly `private` today.
+- **History shape GREEN.** The series is linear (no merge commits in the range) — a merge commit would carry no trailer and red the bijection CI (FD-09). Cherry-pick/ff only was honored throughout.
+- **Live FD-07 battery: GREEN** (record: `baseline/laminar-battery.md`). 3 activation roots / 3 surfaces (`/api/chat`, `/ws/chat`, 42618 webhook), root + `llm.call` I/O non-empty 3/3, typed `user_id`, `session_id` absence-not-empty, `final_answer` stamped, redaction fires on the mirror, negative control drops all spans, 0 key leaks. **Carve-out:** battery triggers 4 & 5 (multi-iteration tool loop → `max_iterations` exit + tool-only `llm.call`) stay BLOCKED-manual behind the tool-approval gap and are folded into **zc-zb2t**'s scope (re-verify once the clawcraft config-renderer fix lands) — the only two §4.4 clauses not yet live-verified, explicitly deferred and tracked.
