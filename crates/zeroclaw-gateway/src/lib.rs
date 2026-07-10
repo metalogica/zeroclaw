@@ -1174,9 +1174,23 @@ pub async fn run_gateway(
     };
 
     // ── Pairing guard ──────────────────────────────────────
+    // Seed the configured pre-shared token (plaintext — the guard hashes it
+    // on load) alongside any persisted paired tokens, so a caller presenting
+    // `[gateway] pre_shared_token` is authenticated without going through the
+    // interactive pairing flow.
+    let mut initial_tokens = config.gateway.paired_tokens.clone();
+    if let Some(pst) = config
+        .gateway
+        .pre_shared_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        initial_tokens.push(pst.to_string());
+    }
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
-        &config.gateway.paired_tokens,
+        &initial_tokens,
     ));
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
@@ -1752,10 +1766,10 @@ pub async fn run_gateway(
 
     // Manual cron-trigger route lives on its own sub-router so it can opt out
     // of the 30s gateway-wide TimeoutLayer. Layers attached here travel with
-    // the route through `merge`, so only this endpoint sees the longer
-    // timeout.
-    let cron_run_router: Router = Router::new()
-        .route("/api/cron/{id}/run", post(api::handle_api_cron_run))
+    // the route through `merge`, so only these endpoints see the longer
+    // timeout. `/api/chat` shares this sub-router because the full agent loop
+    // (tool use, long turns) can outlast the short gateway-wide timeout.
+    let cron_run_router: Router = long_running_routes()
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -2326,6 +2340,22 @@ pub struct WebhookBody {
     pub message: String,
 }
 
+/// `POST /api/chat` request body.
+///
+/// Same shape as [`WebhookBody`] (`{ "message": ... }`) but additionally
+/// tolerates an optional `context` field, which is accepted and then
+/// **ignored** — legacy fork clients send it, and rejecting the request on an
+/// unknown field would break them. The regression is pinned by
+/// `api_chat_ignores_context_field`.
+#[derive(serde::Deserialize)]
+pub struct ApiChatBody {
+    pub message: String,
+    /// Accepted for backward compatibility with fork clients, then ignored.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub context: Option<serde_json::Value>,
+}
+
 /// Webhook query parameters
 #[derive(Default, serde::Deserialize)]
 pub struct WebhookQuery {
@@ -2670,6 +2700,50 @@ async fn handle_webhook(
             }
         }
     }
+}
+
+/// Routes that opt out of the short gateway-wide timeout and instead ride the
+/// long-running (600s) [`TimeoutLayer`]: the manual cron trigger and
+/// `/api/chat` (both run a synchronous, possibly tool-using agent turn).
+///
+/// Factored out of the router build so the router-membership contract
+/// (`api_chat_is_on_long_running_router`) can assert `/api/chat` lives here —
+/// on the same sub-router as `/api/cron/{id}/run` — rather than on the default
+/// short-timeout router.
+fn long_running_routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/cron/{id}/run", post(api::handle_api_cron_run))
+        .route("/api/chat", post(handle_api_chat))
+}
+
+/// `POST /api/chat` — full agent-loop chat endpoint.
+///
+/// Registered on the long-running (600s) sub-router alongside
+/// `/api/cron/{id}/run`, so a slow tool-using turn is not cut off by the
+/// gateway-wide short timeout. Behaves exactly like [`handle_webhook`]: same
+/// bearer-token pairing check, same agent-alias resolution (`?agent=` query
+/// param else the runtime default), and the same `{"response", "model"}`
+/// reply shape. The body additionally tolerates an ignored `context` field
+/// (see [`ApiChatBody`]).
+async fn handle_api_chat(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<WebhookQuery>,
+    headers: HeaderMap,
+    body: Result<Json<ApiChatBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    // Fold the `context`-tolerant body down to the webhook body and reuse the
+    // full webhook loop verbatim (auth, rate limit, idempotency, agent
+    // dispatch, observability, reply shape). `context` is dropped here.
+    let webhook_body = body.map(|Json(b)| Json(WebhookBody { message: b.message }));
+    handle_webhook(
+        State(state),
+        ConnectInfo(peer_addr),
+        Query(query),
+        headers,
+        webhook_body,
+    )
+    .await
 }
 
 /// `WhatsApp` verification query params
@@ -7139,6 +7213,208 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── Pre-shared token seeding (fork FD-04) ─────────────────────
+    // Ported from the fork archive (archive/0.6.9-alpha-p10.7:src/gateway/mod.rs).
+    // These pin that a plaintext pre-shared token, once seeded into
+    // `PairingGuard::new`, authenticates without an interactive pairing flow.
+    // The config-deserialization tests for `[gateway] pre_shared_token` live
+    // in `zeroclaw-config`; here we cover only the guard-side behavior.
+
+    #[test]
+    fn pre_shared_token_is_accepted_by_pairing_guard() {
+        let token = "my-secret-pre-shared-token";
+        let guard = PairingGuard::new(true, &[token.to_string()]);
+        assert!(guard.is_authenticated(token));
+    }
+
+    #[test]
+    fn pre_shared_token_coexists_with_paired_tokens() {
+        let pst = "pre-shared-token";
+        let guard = PairingGuard::new(true, &[pst.to_string()]);
+
+        assert!(guard.is_authenticated(pst));
+        assert!(!guard.is_authenticated("wrong-token"));
+    }
+
+    #[tokio::test]
+    async fn pre_shared_token_survives_normal_pairing_flow() {
+        let pst = "pre-shared-token";
+        let guard = PairingGuard::new(true, &[pst.to_string()]);
+
+        if let Some(code) = guard.pairing_code() {
+            let paired = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
+            assert!(guard.is_authenticated(pst));
+            assert!(guard.is_authenticated(&paired));
+        }
+
+        assert!(guard.is_authenticated(pst));
+    }
+
+    #[test]
+    fn pre_shared_token_from_config_seeds_initial_token_list() {
+        // Mirrors the production seeding at the `PairingGuard::new` call site:
+        // the plaintext `[gateway] pre_shared_token` is appended to
+        // `paired_tokens` before the guard is constructed.
+        let mut initial_tokens: Vec<String> = vec!["zc_existing_token".to_string()];
+        let pre_shared_token = Some("  seeded-pst  ".to_string());
+        if let Some(pst) = pre_shared_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            initial_tokens.push(pst.to_string());
+        }
+        let guard = PairingGuard::new(true, &initial_tokens);
+        assert!(guard.is_authenticated("zc_existing_token"));
+        assert!(guard.is_authenticated("seeded-pst"));
+        assert!(!guard.is_authenticated("  seeded-pst  "));
+    }
+
+    // ── POST /api/chat (fork FD-05) ───────────────────────────────
+
+    #[tokio::test]
+    async fn api_chat_returns_200_for_message_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+
+        let body = Ok(Json(ApiChatBody {
+            message: "hello".into(),
+            context: None,
+        }));
+        let response = handle_api_chat(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        // Same `{"response","model"}` reply shape as /webhook.
+        assert_eq!(parsed["response"], "ok");
+        assert!(parsed.get("model").is_some());
+    }
+
+    #[tokio::test]
+    async fn api_chat_ignores_context_field() {
+        // Regression pin: a `context` field is accepted and dropped, not
+        // rejected — fork clients send it and must keep working.
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+
+        let raw = r#"{"message":"hello","context":{"anything":[1,2,3],"nested":{"k":"v"}}}"#;
+        let parsed_body: ApiChatBody = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed_body.message, "hello");
+        assert!(parsed_body.context.is_some());
+
+        let response = handle_api_chat(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            Ok(Json(parsed_body)),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["response"], "ok");
+    }
+
+    #[tokio::test]
+    async fn api_chat_returns_401_without_bearer() {
+        // Same bearer-token pairing check as /webhook: pairing required + no
+        // Authorization header => 401.
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+
+        let body = Ok(Json(ApiChatBody {
+            message: "hello".into(),
+            context: None,
+        }));
+        let response = handle_api_chat(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_chat_is_on_long_running_router() {
+        // Router-membership contract: `/api/chat` must ride the SAME sub-router
+        // as `/api/cron/{id}/run` — the one carrying the 600s (>300s) timeout —
+        // not the default short-timeout router. We build the long-running
+        // sub-router exactly as production does (`long_running_routes()` +
+        // the same TimeoutLayer) and prove `/api/chat` routes to a handler
+        // (not 404) while a sibling path NOT on this router does 404.
+        use tower::ServiceExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+
+        // Assert the timeout this sub-router carries is the long-running one
+        // (>300s), i.e. the 600s bucket rather than the 30s gateway-wide one.
+        let long_secs = gateway_long_running_request_timeout_secs(&state.config.read().gateway);
+        assert!(
+            long_secs > 300,
+            "long-running router must carry a >300s timeout, got {long_secs}s"
+        );
+
+        let router: Router = long_running_routes()
+            .with_state(state)
+            .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                Duration::from_secs(long_secs),
+            ));
+
+        // `/api/chat` is a member: it routes to the handler (never 404) —
+        // membership, not the reply shape, is what this test pins (the 200 +
+        // `{"response","model"}` shape is covered by
+        // `api_chat_returns_200_for_message_body`). We only require that the
+        // request reaches the handler rather than falling through to a 404.
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/api/chat")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"message":"hi"}"#))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "/api/chat must be registered on the long-running sub-router"
+        );
+        assert_ne!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "/api/chat must accept POST on the long-running sub-router"
+        );
+
+        // A path NOT on this sub-router 404s — proving membership is real,
+        // not a catch-all.
+        let miss = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/webhook")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"message":"hi"}"#))
+            .unwrap();
+        let miss_resp = router.oneshot(miss).await.unwrap();
+        assert_eq!(miss_resp.status(), StatusCode::NOT_FOUND);
     }
 }
 

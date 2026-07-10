@@ -113,8 +113,10 @@ pub struct WsQuery {
     pub session_id: Option<String>,
     /// Optional human-readable name for the session.
     pub name: Option<String>,
-    /// Configured agent alias to run as. Required — every WebSocket
-    /// session is bound to an explicit agent (no default agent exists).
+    /// Configured agent alias to run as. Optional — when omitted, the session
+    /// falls back to the runtime default pick (`resolved_runtime_agent_alias`),
+    /// matching `/webhook` and `/api/chat`. Only rejected when there is also no
+    /// default agent configured.
     #[serde(default, alias = "agentAlias", alias = "agent")]
     pub agent_alias: Option<String>,
     /// Project root / working directory for this session.
@@ -199,14 +201,29 @@ pub async fn handle_ws_chat(
         ws
     };
 
-    // Reject the upgrade up-front when the client didn't pick an agent.
-    // No default — every WS session is bound to an explicit agent.
-    let Some(agent_alias) = params.agent_alias.filter(|s| !s.trim().is_empty()) else {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            "Missing required `agent` query parameter — pass `?agent=<alias>` matching a configured [agents.<alias>] entry.",
-        )
-            .into_response();
+    // Resolve the agent alias: an explicit `?agent=<alias>` wins; otherwise
+    // fall back to the runtime default pick (`resolved_runtime_agent_alias`),
+    // matching `/webhook` and `/api/chat`. Only reject when neither is
+    // available (no `?agent=` and no default agent configured).
+    let explicit_alias = params.agent_alias.filter(|s| !s.trim().is_empty());
+    let agent_alias = match explicit_alias {
+        Some(alias) => alias,
+        None => {
+            let default_alias = {
+                let cfg = state.config.read();
+                cfg.resolved_runtime_agent_alias().map(str::to_owned)
+            };
+            match default_alias {
+                Some(alias) => alias,
+                None => {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "Missing `agent` query parameter and no default [agents.<alias>] entry configured — pass `?agent=<alias>`.",
+                    )
+                        .into_response();
+                }
+            }
+        }
     };
     {
         let cfg = state.config.read();
