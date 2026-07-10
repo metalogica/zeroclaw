@@ -240,6 +240,132 @@ pub async fn handle_ws_chat(
 /// Gateway session key prefix to avoid collisions with channel sessions.
 const GW_SESSION_PREFIX: &str = "gw_";
 
+/// `SessionBackend` key prefix for thread-scoped storage. A per-message
+/// `threadId` resolves to `thread:<id>`; connection-scoped turns keep the
+/// `gw_<session_id>` key.
+///
+/// This prefix is an internal storage key only. It must NEVER be surfaced
+/// as an `X-Session-Id` header value or any client-facing session id — the
+/// header path in `lib.rs` operates on the raw session id, independent of
+/// this thread key.
+const GW_THREAD_PREFIX: &str = "thread:";
+
+/// Where the thread identifier was sourced from on an inbound message.
+///
+/// Reported in logs during the transition window: clawcraft clients moved
+/// from the legacy `[conversationId: <id>]` content prefix to a typed
+/// `threadId` envelope field, and we want the source observable while both
+/// are in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadIdSource {
+    TypedField,
+    PrefixFallback,
+    None,
+}
+
+impl ThreadIdSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TypedField => "typed_field",
+            Self::PrefixFallback => "prefix_fallback",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Strip a leading `[conversationId: <id>]` prefix from `content`, returning
+/// `(id, remainder)` when present.
+///
+/// Hand-parsed (no `regex` dependency) to match the fork's emission shape
+/// `[conversationId: <id>]<optional-whitespace><content>`:
+/// - must start exactly with `[conversationId:` (case-sensitive),
+/// - the id runs up to the first `]`,
+/// - the id and surrounding whitespace are trimmed,
+/// - a single run of whitespace after the `]` is consumed.
+///
+/// Other bracketed prefixes (`[SYSTEM]`, `[MEDIA_UPLOAD: …]`) do not match
+/// and are left intact — the strip is path-explicit to `[conversationId:]`.
+fn strip_conversation_id_prefix(content: &str) -> Option<(String, String)> {
+    const OPEN: &str = "[conversationId:";
+    let rest = content.strip_prefix(OPEN)?;
+    let close = rest.find(']')?;
+    let id = rest[..close].trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let after = rest[close + 1..].trim_start();
+    Some((id, after.to_string()))
+}
+
+/// Parse the thread identifier from an inbound message envelope.
+///
+/// Priority:
+/// 1. `parsed.threadId` (typed field) — authoritative when present and
+///    non-empty; content is returned unchanged.
+/// 2. Legacy `[conversationId: <id>]` content prefix — extracted and
+///    stripped from the returned content.
+///
+/// Returns `(thread_id, cleaned_content, source)`.
+fn parse_thread_id(
+    parsed: &serde_json::Value,
+    content: &str,
+) -> (Option<String>, String, ThreadIdSource) {
+    if let Some(tid) = parsed.get("threadId").and_then(|v| v.as_str()) {
+        let trimmed = tid.trim();
+        if !trimmed.is_empty() {
+            return (
+                Some(trimmed.to_string()),
+                content.to_string(),
+                ThreadIdSource::TypedField,
+            );
+        }
+    }
+
+    if let Some((id, stripped)) = strip_conversation_id_prefix(content) {
+        return (Some(id), stripped, ThreadIdSource::PrefixFallback);
+    }
+
+    (None, content.to_string(), ThreadIdSource::None)
+}
+
+/// Resolve the `SessionBackend` storage key for the current turn.
+///
+/// Prefers a thread-scoped `thread:<id>` key when `thread_id` is present and
+/// non-empty; otherwise falls back to the connection's session key. The
+/// fallback preserves upstream connection-fixed behavior for non-clawcraft
+/// clients that never send a `threadId`.
+fn pick_session_key(thread_id: Option<&str>, fallback: &str) -> String {
+    match thread_id {
+        Some(tid) if !tid.is_empty() => format!("{GW_THREAD_PREFIX}{tid}"),
+        _ => fallback.to_string(),
+    }
+}
+
+/// Emit one structured log line recording where the turn's thread id came
+/// from (typed field, legacy prefix, or absent). Observability only during
+/// the clawcraft transition window — no control-flow effect.
+fn log_thread_id_source(session_id: &str, thread_id: Option<&str>, src: ThreadIdSource) {
+    match src {
+        ThreadIdSource::None => ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({ "session_id": session_id })),
+            "WS message has no threadId (typed or legacy prefix); connection-scoped key"
+        ),
+        _ => ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "session_id": session_id,
+                    "thread_id": thread_id.unwrap_or(""),
+                    "source": src.as_str(),
+                })
+            ),
+            "WS message threadId parsed"
+        ),
+    }
+}
+
 async fn resolve_ws_memory_handle(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -500,9 +626,16 @@ async fn handle_socket(
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
-                let content = parsed["content"].as_str().unwrap_or("").to_string();
+                let raw_content = parsed["content"].as_str().unwrap_or("").to_string();
+                let (thread_id, content, src) = parse_thread_id(&parsed, &raw_content);
+                log_thread_id_source(&session_id, thread_id.as_deref(), src);
+                // Per-message key: `thread:<id>` when a threadId is present,
+                // else the connection's session key (upstream behavior for
+                // non-clawcraft clients). No hydration/history swap — just key
+                // selection for this turn's persistence + lock scope.
+                let turn_key = pick_session_key(thread_id.as_deref(), &session_key);
                 if !content.is_empty() {
-                    let _session_guard = match state.session_queue.acquire(&session_key).await {
+                    let _session_guard = match state.session_queue.acquire(&turn_key).await {
                         Ok(guard) => guard,
                         Err(e) => {
                             let err = serde_json::json!({
@@ -523,7 +656,7 @@ async fn handle_socket(
                         &pending_approvals,
                         &ws_memory,
                         &content,
-                        &session_key,
+                        &turn_key,
                     )
                     .await;
                 }
@@ -631,7 +764,9 @@ async fn handle_socket(
                     continue;
                 }
 
-                let content = parsed["content"].as_str().unwrap_or("").to_string();
+                let raw_content = parsed["content"].as_str().unwrap_or("").to_string();
+                let (thread_id, content, src) = parse_thread_id(&parsed, &raw_content);
+                log_thread_id_source(&session_id, thread_id.as_deref(), src);
                 if content.is_empty() {
                     let err = serde_json::json!({
                         "type": "error",
@@ -642,8 +777,15 @@ async fn handle_socket(
                     continue;
                 }
 
+                // Per-message key: `thread:<id>` when a threadId is present,
+                // else the connection's session key. Resolved every turn so a
+                // client can switch threads on one connection and get distinct
+                // histories — without any hydration/history-swap machinery
+                // (persistence keys diverge; the backend keeps them separate).
+                let turn_key = pick_session_key(thread_id.as_deref(), &session_key);
+
                 // Acquire session lock to serialize concurrent turns
-                let _session_guard = match state.session_queue.acquire(&session_key).await {
+                let _session_guard = match state.session_queue.acquire(&turn_key).await {
                     Ok(guard) => guard,
                     Err(e) => {
                         let err = serde_json::json!({
@@ -665,7 +807,7 @@ async fn handle_socket(
                     &pending_approvals,
                     &ws_memory,
                     &content,
-                    &session_key,
+                    &turn_key,
                 )
                 .await;
             }
@@ -1930,6 +2072,117 @@ mod tests {
             // The user deleted the session between cancel and append.
             false
         }
+    }
+
+    // ── zc-nvqs: threadId → thread:<id> per-message key resolution ──────
+    //
+    // Parsing half only: typed `threadId` beats a legacy `[conversationId:]`
+    // prefix, and the per-message key is `thread:<id>` when present else the
+    // connection's session key. No hydration / replace_history / switch
+    // detection — those stay on the clawcraft-side machinery.
+
+    #[test]
+    fn typed_thread_id_beats_legacy_prefix() {
+        // A message carrying BOTH a typed threadId and a legacy content
+        // prefix must honor the typed field and leave content untouched.
+        let parsed = serde_json::json!({
+            "type": "message",
+            "threadId": "typed-123",
+            "content": "[conversationId: legacy-999] hello there",
+        });
+        let raw = parsed["content"].as_str().unwrap();
+        let (tid, content, src) = parse_thread_id(&parsed, raw);
+
+        assert_eq!(tid.as_deref(), Some("typed-123"));
+        assert_eq!(src, ThreadIdSource::TypedField);
+        // Typed field wins → content is NOT stripped.
+        assert_eq!(content, "[conversationId: legacy-999] hello there");
+    }
+
+    #[test]
+    fn legacy_prefix_used_when_no_typed_thread_id() {
+        let parsed = serde_json::json!({
+            "type": "message",
+            "content": "[conversationId: legacy-42]   actual message",
+        });
+        let raw = parsed["content"].as_str().unwrap();
+        let (tid, content, src) = parse_thread_id(&parsed, raw);
+
+        assert_eq!(tid.as_deref(), Some("legacy-42"));
+        assert_eq!(src, ThreadIdSource::PrefixFallback);
+        assert_eq!(content, "actual message");
+    }
+
+    #[test]
+    fn empty_typed_thread_id_falls_through_to_prefix() {
+        // A blank/whitespace typed field is not authoritative; fall to prefix.
+        let parsed = serde_json::json!({
+            "type": "message",
+            "threadId": "   ",
+            "content": "[conversationId: p-7] body",
+        });
+        let raw = parsed["content"].as_str().unwrap();
+        let (tid, _content, src) = parse_thread_id(&parsed, raw);
+        assert_eq!(tid.as_deref(), Some("p-7"));
+        assert_eq!(src, ThreadIdSource::PrefixFallback);
+    }
+
+    #[test]
+    fn non_conversation_id_prefixes_are_left_intact() {
+        // Only `[conversationId:]` is stripped; sibling bracket prefixes pass.
+        for content in ["[SYSTEM] hi", "[MEDIA_UPLOAD: x] yo", "plain body"] {
+            let parsed = serde_json::json!({ "type": "message", "content": content });
+            let (tid, out, src) = parse_thread_id(&parsed, content);
+            assert_eq!(tid, None);
+            assert_eq!(src, ThreadIdSource::None);
+            assert_eq!(out, content, "content must be untouched for {content:?}");
+        }
+    }
+
+    #[test]
+    fn deterministic_key_for_same_thread_id() {
+        // The same threadId always maps to the same backend key, regardless
+        // of the connection's fallback session key.
+        let k1 = pick_session_key(Some("abc"), "gw_conn-A");
+        let k2 = pick_session_key(Some("abc"), "gw_conn-B");
+        assert_eq!(k1, "thread:abc");
+        assert_eq!(k1, k2, "same threadId must yield the same key");
+    }
+
+    #[test]
+    fn falls_back_to_connection_key_without_thread_id() {
+        // No threadId (or empty) → connection-scoped key preserved; this is
+        // the upstream behavior for non-clawcraft clients.
+        assert_eq!(pick_session_key(None, "gw_conn-1"), "gw_conn-1");
+        assert_eq!(pick_session_key(Some(""), "gw_conn-1"), "gw_conn-1");
+    }
+
+    #[test]
+    fn thread_switch_on_one_connection_yields_distinct_keys() {
+        // A single connection (same fallback session key) that switches
+        // threads mid-stream must resolve DISTINCT backend keys per thread —
+        // which is what keeps their persisted histories separate without any
+        // in-memory hydration/switch machinery.
+        let conn = "gw_shared-connection";
+        let key_thread_1 = pick_session_key(Some("thread-1"), conn);
+        let key_thread_2 = pick_session_key(Some("thread-2"), conn);
+
+        assert_eq!(key_thread_1, "thread:thread-1");
+        assert_eq!(key_thread_2, "thread:thread-2");
+        assert_ne!(
+            key_thread_1, key_thread_2,
+            "distinct threads on one connection must not share a session key"
+        );
+    }
+
+    #[test]
+    fn thread_key_prefix_is_never_a_gateway_session_key() {
+        // The thread key must not collide with the `gw_` connection-key
+        // namespace, and (defense) must not look like a raw client session
+        // id that could be echoed as an X-Session-Id value.
+        let key = pick_session_key(Some("xyz"), "gw_conn");
+        assert!(key.starts_with(GW_THREAD_PREFIX));
+        assert!(!key.starts_with(GW_SESSION_PREFIX));
     }
 
     #[test]
