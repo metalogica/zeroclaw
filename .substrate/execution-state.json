@@ -1,0 +1,257 @@
+{
+  "upstream-v0.8.0-migration": {
+    "run-id": "upstream-v0.8.0-migration-20260709-1622",
+    "mode": "hybrid-orchestrate",
+    "integration-branch": "core/v0.8.0",
+    "integration-worktree": "/Users/reinova/code/forks/zeroclaw-worktrees/core-v0.8.0",
+    "control-plane-branch": "docs/v0.8.0-migration-handoff",
+    "partition": {
+      "window-1": [
+        "zc-7c42",
+        "zc-d5i0",
+        "zc-h1l5",
+        "zc-m67s"
+      ],
+      "window-2": [
+        "zc-n6so",
+        "zc-8zdt"
+      ],
+      "window-3": [
+        "zc-pauf",
+        "zc-rfri",
+        "zc-n1mx"
+      ],
+      "window-4": [
+        "zc-2sw0",
+        "zc-nvqs",
+        "zc-qwhe",
+        "zc-e6t0",
+        "zc-vja9"
+      ],
+      "window-5": [
+        "zc-yz6h",
+        "zc-jfun",
+        "zc-b78l"
+      ],
+      "window-6": [
+        "zc-ul1f",
+        "zc-qskr"
+      ],
+      "window-7": [
+        "zc-1g6p",
+        "zc-4leb",
+        "zc-p7tx",
+        "zc-t0ii"
+      ],
+      "window-8": [
+        "zc-garf"
+      ]
+    },
+    "deviations": [
+      "Integration base is core/v0.8.0 off the v0.8.0 tag (spec \u00a78), not feat/<epic> off trunk; Wave 1 bead zc-7c42 creates it.",
+      "Control-plane model: orchestrator checkout stays on scaffolding branch (holds .tbd/spec/doctrines/substrate.yaml); product work runs in worktrees off core/v0.8.0 to avoid losing the tracker.",
+      "Close preserves per-theme Fork-Delta: FD-NN trailer commits (no final squash) \u2014 required by the fork-delta-check bijection (zc-4leb).",
+      "Waves 1\u20132 run serially by the orchestrator (foundation + human-gated STOP points), not as a fleet.",
+      "substrate.yaml + docs/scripts/bead-graph.sh installed surgically (not via full /substrate:adopt) because the repo is already partially substrate-governed (custom docs/doctrine + real AGENTS.md/CLAUDE.md)."
+    ],
+    "re-gates": [
+      {
+        "wave": "1-2 (foundation)",
+        "tip-sha": "core/v0.8.0@ba9a0e4f2",
+        "commands": [
+          "cargo build --all-targets --locked",
+          "cargo fmt --all -- --check",
+          "cargo clippy --all-targets"
+        ],
+        "result": "green (build ok; fmt drift 0; clippy warnings 0)",
+        "note": "neutrality anchors for later theme gates"
+      },
+      {
+        "wave": "3-batch1",
+        "tip-sha": "core/v0.8.0@8cc1a6266",
+        "commands": [
+          "cargo build --all-targets --locked",
+          "cargo test --workspace --locked",
+          "cargo clippy --all-targets",
+          "cargo fmt --all -- --check"
+        ],
+        "result": "green (after gateway secret-classification reconciliation 926ff5e; initial run had 1 failure: every_gateway_secret_is_classified)",
+        "note": "union re-gate caught composition failure invisible to crate-scoped zc-2sw0 gate"
+      },
+      {
+        "wave": "3-batch2",
+        "tip-sha": "core/v0.8.0@48576fc23",
+        "commands": [
+          "cargo build --all-targets --locked",
+          "cargo test --workspace --locked",
+          "cargo clippy --all-targets",
+          "cargo fmt --all -- --check"
+        ],
+        "result": "green (0 failed, clippy 0, fmt clean)",
+        "note": "nvqs+yz6h combined"
+      },
+      {
+        "wave": "3-batch3",
+        "tip-sha": "core/v0.8.0@06ae0b1b7",
+        "commands": [
+          "cargo build --all-targets --locked",
+          "cargo test --workspace --locked",
+          "cargo clippy --all-targets",
+          "cargo fmt --all -- --check"
+        ],
+        "result": "green (build 0, clippy 0, fmt clean). 2 content_search tests flaked under parallel cargo test \u2014 PASS in isolation (--test-threads=1); zc-ul1f touches no zeroclaw-tools; pre-existing parallel-isolation flake (cf zc-vyca), CI avoids via nextest.",
+        "flake-note": "content_search_basic_match + content_search_admits_absolute_path_under_read_only_root"
+      },
+      {
+        "wave": "4-A",
+        "tip-sha": "core/v0.8.0@52547a243",
+        "commands": [
+          "cargo build --all-targets --locked",
+          "cargo nextest run --workspace",
+          "cargo clippy --all-targets",
+          "cargo fmt --all -- --check"
+        ],
+        "result": "green (8567 tests pass, 0 failed; clippy 0; fmt clean; no flake under nextest)"
+      },
+      {
+        "wave": "4-B",
+        "tip-sha": "core/v0.8.0@b2ba48608",
+        "commands": [
+          "(no cargo re-gate: zc-1g6p + zc-8zdt add zero Rust \u2014 workflow yaml, RELEASE.md, hotswap.sh, Dockerfile.builder)",
+          "file/grep/yaml gates green per bead"
+        ],
+        "result": "green (non-code additions; Batch-A cargo re-gate @52547a243 with 8567 tests still covers all compiled code)"
+      }
+    ],
+    "outcomes": {
+      "zc-7c42": {
+        "status": "pass",
+        "wave": 1,
+        "commit": null,
+        "note": "git-topology only (gate-scope: partial); no code commit"
+      },
+      "zc-d5i0": {
+        "status": "pass",
+        "wave": 2,
+        "commit": "ba9a0e4f2",
+        "fork-delta": "FD-00"
+      },
+      "zc-h1l5": {
+        "status": "pass",
+        "wave": 2,
+        "commit": "64a29a16e",
+        "note": "build green; fmt=0 clippy=0 anchors"
+      },
+      "zc-m67s": {
+        "status": "pass",
+        "wave": 2,
+        "commit": "64a29a16e",
+        "note": "5 facts verified"
+      },
+      "zc-pauf": {
+        "status": "pass",
+        "wave": 3,
+        "batch": 1,
+        "commit": "ec8d9ea",
+        "note": "continuation re-home; allow(dead_code) until zc-rfri"
+      },
+      "zc-2sw0": {
+        "status": "pass",
+        "wave": 3,
+        "batch": 1,
+        "commit": "eedfb7e",
+        "note": "config compat; gateway secret-class reconciled 926ff5e"
+      },
+      "zc-n6so": {
+        "status": "open",
+        "wave": 3,
+        "batch": 1,
+        "commit": "81bbc3a",
+        "fork-delta": "FD-01",
+        "note": "merged; docker smoke OUT-OF-BAND (NPM_TOKEN); unblocks zc-8zdt"
+      },
+      "zc-nvqs": {
+        "status": "pass",
+        "wave": 3,
+        "batch": 2,
+        "commit": "ca7d428",
+        "fork-delta": "FD-06",
+        "note": "ws threadId session key, 9 tests"
+      },
+      "zc-yz6h": {
+        "status": "pass",
+        "wave": 3,
+        "batch": 2,
+        "commit": "b922a63",
+        "note": "identity/active + zeroclaw-api validator; orchestrator-completed after runner session-limit; FD-07 with zc-jfun"
+      },
+      "zc-ul1f": {
+        "status": "pass",
+        "wave": 3,
+        "batch": 3,
+        "commit": "2e30b15",
+        "note": "openrouter user + [AUDIO:]; FD-08 with zc-qskr"
+      },
+      "zc-rfri": {
+        "status": "pass",
+        "wave": 4,
+        "batch": "A",
+        "commit": "0896b6b0",
+        "note": "KEYSTONE continuation wiring; FD-03 with zc-n1mx"
+      },
+      "zc-qwhe": {
+        "status": "pass",
+        "wave": 4,
+        "batch": "A",
+        "commit": "f01b964",
+        "note": "gateway token + /api/chat; FD-04/05 at zc-e6t0"
+      },
+      "zc-qskr": {
+        "status": "pass",
+        "wave": 4,
+        "batch": "A",
+        "commit": "7d00334",
+        "note": "reasoning alias ported; rest dropped; FD-08 finalization"
+      },
+      "zc-1g6p": {
+        "status": "pass",
+        "wave": 4,
+        "batch": "B",
+        "commit": "e7a0944",
+        "fork-delta": "FD-11",
+        "note": "release workflow + RELEASE.md"
+      },
+      "zc-8zdt": {
+        "status": "open",
+        "wave": 4,
+        "batch": "B",
+        "commit": "688424114",
+        "fork-delta": "FD-02",
+        "note": "merged; hotswap seeded+re-pointed; docker :dev OUT-OF-BAND (NPM_TOKEN)"
+      },
+      "zc-jfun": {
+        "status": "blocked",
+        "wave": 4,
+        "batch": "B",
+        "commit": null,
+        "note": "SCOPE GAP: v0.8.0 dropped span-producing observability infra (Observer::start_activation trait, OtelSpan, activation owner, single-observer OnceLock). Bead write-scope insufficient \u2014 needs zeroclaw-api + rpc/turn.rs + otel.rs. Runner stopped rather than land inert spans. Blocks zc-b78l/zc-4leb/zc-p7tx."
+      }
+    },
+    "notes": "Upstream advanced to v0.8.1/v0.8.2 during Wave 1; base held at v0.8.0 per locked spec decision. Continuation STOP-check negative.",
+    "run-log": ".substrate/runs/upstream-v0.8.0-migration/upstream-v0.8.0-migration-20260709-1622/",
+    "known-flakes": [
+      "zeroclaw-tools content_search: 2 tests flake under parallel `cargo test`, pass with --test-threads=1 or nextest (zc-hb9i)"
+    ],
+    "followups": [
+      "OpenRouter image-to-disk: upstream removed the substrate; if fork still wants it, file a standalone feature bead (per zc-qskr).",
+      "Continuation trace events route via zeroclaw_log::record! not runtime_trace JSONL (per zc-rfri); possible follow-up."
+    ],
+    "blockers": [
+      {
+        "bead": "zc-jfun",
+        "kind": "scope-gap",
+        "detail": "Laminar layer needs re-homing dropped span infra across zeroclaw-api (start_activation trait) + otel.rs (OtelSpan + OnceLock sharing) + rpc/turn.rs (activation owner) + agent.rs (mirrors) \u2014 4-step plan from runner a5437e9ec184969ac"
+      }
+    ]
+  }
+}

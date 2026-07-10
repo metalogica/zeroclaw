@@ -1,0 +1,47 @@
+# substrate.yaml — declared verification gates for ZeroClaw (Rust fork).
+#
+# The substrate engine (/substrate:execute, /substrate:quick-spec, /substrate:diagnose,
+# /substrate:orchestrate) reads these and runs them; it NEVER guesses your toolchain.
+# Order run: gate.compile → gate.test → gate.lint. A missing file or a missing required
+# key aborts execution with an explanation (no probing, no fallback).
+#
+# Gate design notes (this fork — see CLAUDE.md "Workflow gotchas"):
+#   • All gates run under the CI-pinned toolchain via toolchain-pin.env (RUSTUP_TOOLCHAIN=1.93.0),
+#     so clippy matches CI exactly and the ~41 newer-local-toolchain lints do NOT spuriously red a worktree.
+#   • `cargo fmt --all -- --check` is DELIBERATELY NOT a gate: it fails on a clean checkout today
+#     (pre-existing drift, per CLAUDE.md). Format neutrality is captured by epic bead zc-h1l5 and the
+#     standalone repo-clean chore zc-43q7 — not by the per-wave merge gate. Putting it here would
+#     red-fail every worktree.
+#   • compile uses --all-targets so lib + tests + benches all compile (subsumes CI's `cargo bench --no-run`).
+version: 1
+gate:
+  compile: "cargo build --all-targets --locked"
+  test:    "cargo nextest run --locked"   # process-per-test isolation (matches CI); avoids the in-process parallel flakes (content_search, personality/zc-vyca) that `cargo test` hits
+  lint:    "cargo clippy --all-targets -- -D warnings"
+
+# --- Execution partition policy (deviatable prior; see agents-parallel-execution-doctrine.md) ---
+execution:
+  context-budget: 0.4      # max fraction of a window a group may fill before graph-spec splits it
+  default-rung: auto       # auto | monolith | phase | group | per-bead
+
+# --- Out-of-band gates (not run on every step; a human runs them) ---
+out-of-band:
+  - name: live-laminar
+    command: "see bead zc-b78l — live Laminar battery vs dev ClickHouse + blank-headers negative control"
+    when: manual           # zc-b78l is tagged a manual gate: merge unblocks dependents, close waits for this.
+
+# --- worktree-seed[] + toolchain-pin: copied into each fresh git worktree before dispatch ---
+# A fresh worktree holds only TRACKED files. Rust compiles from tracked source, so `target/` is a
+# build CACHE, not a required input — it is intentionally NOT seeded (each worktree cold-builds;
+# slower but correct). The gitignored inputs below ARE seeded because tests may read them.
+worktree-seed:
+  - ".env"
+  - ".env.local"
+  - ".secret_key"
+toolchain-pin:
+  # Idempotent: 1.93.0 + components + nextest. rustup step is a no-op re-assert; nextest is a global
+  # binary in ~/.cargo/bin (shared across worktrees), so `cargo-nextest --version` short-circuits if present.
+  install: "rustup toolchain install 1.93.0 --component clippy --component rustfmt && (command -v cargo-nextest >/dev/null || curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C \"$HOME/.cargo/bin\")"
+  env:
+    RUSTUP_TOOLCHAIN: "1.93.0"   # pin every gate cargo invocation to the CI toolchain (kills local-lint drift)
+    CARGO_INCREMENTAL: "0"       # match CI; deterministic, avoids incremental-cache surprises across worktrees

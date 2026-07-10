@@ -1,0 +1,22 @@
+{
+  "_comment": "Demo bead DAG for bead-tui. Mirrors a real substrate epic and exercises the layout's hard cases: fan-out (a1 -> 3), a long edge spanning waves (a1 -> f6, f6 -> g7), fan-in (g7 <- d4,e5,f6), and a wide parallel wave. Edit statuses or add nodes/edges while `node watch.mjs` is running to watch it re-render live.",
+  "nodes": [
+    { "id": "sub-a1", "title": "json contract", "status": "closed" },
+    { "id": "sub-b2", "title": "fetch layer", "status": "in_progress" },
+    { "id": "sub-c3", "title": "status glyphs", "status": "open" },
+    { "id": "sub-d4", "title": "arrow router", "status": "in_progress" },
+    { "id": "sub-e5", "title": "delta diff", "status": "open" },
+    { "id": "sub-f6", "title": "poll loop", "status": "open" },
+    { "id": "sub-g7", "title": "Ink shell", "status": "open" }
+  ],
+  "edges": [
+    { "from": "sub-a1", "to": "sub-b2" },
+    { "from": "sub-a1", "to": "sub-c3" },
+    { "from": "sub-a1", "to": "sub-f6" },
+    { "from": "sub-b2", "to": "sub-d4" },
+    { "from": "sub-c3", "to": "sub-e5" },
+    { "from": "sub-d4", "to": "sub-g7" },
+    { "from": "sub-e5", "to": "sub-g7" },
+    { "from": "sub-f6", "to": "sub-g7" }
+  ]
+}
