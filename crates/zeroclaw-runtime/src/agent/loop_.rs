@@ -2011,6 +2011,15 @@ pub async fn run_tool_call_loop(
 
     let turn_id = Uuid::new_v4().to_string();
     let loop_started_at = Instant::now();
+
+    // Root input mirror (FD-07 follow-up, zc-gnpx): the triggering user message
+    // — the last user-role entry in `history` at loop entry — on the activation
+    // root, so the shared gateway/webhook/channels/CLI ingress path populates
+    // Laminar's root-span input column. Ambient no-op outside an activation scope.
+    if let Some(user_msg) = history.iter().rev().find(|m| m.role == "user") {
+        crate::observability::stamp_root_input(&user_msg.content);
+    }
+
     let loop_ignore_tools: HashSet<&str> = pacing
         .loop_ignore_tools
         .iter()
@@ -2899,6 +2908,7 @@ pub async fn run_tool_call_loop(
             }
             history.push(ChatMessage::assistant(fallback.to_string()));
             crate::observability::stamp_turn_exit("malformed_tool_protocol", iteration + 1);
+            crate::observability::stamp_root_output(&accumulated_display_text);
             return Ok(accumulated_display_text);
         }
 
@@ -2970,6 +2980,7 @@ pub async fn run_tool_call_loop(
                     };
                     accumulated_display_text.push_str(&final_text);
                     crate::observability::stamp_turn_exit("continuation_exhausted", iteration + 1);
+                    crate::observability::stamp_root_output(&accumulated_display_text);
                     return Ok(accumulated_display_text);
                 }
             }
@@ -3019,8 +3030,10 @@ pub async fn run_tool_call_loop(
             }
 
             history.push(ChatMessage::assistant(response_text.clone()));
-            // Queryable turn-outcome on the activation root (zc-ug3w).
+            // Queryable turn-outcome + root output mirror on the activation root
+            // (zc-ug3w; FD-07 follow-up zc-gnpx).
             crate::observability::stamp_turn_exit("final_answer", iteration + 1);
+            crate::observability::stamp_root_output(&accumulated_display_text);
             return Ok(accumulated_display_text);
         }
 

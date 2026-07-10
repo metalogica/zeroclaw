@@ -35,7 +35,7 @@ pub use traits::{Observer, ObserverEvent};
 // `traits`) resolve as `observability::{Span, AttrValue, …}`. Consumers land
 // with Step 5.2 (otel pipeline wiring); allow dead_code until then.
 #[allow(unused_imports)]
-pub use active::{current_span, scope_span, stamp_turn_exit};
+pub use active::{current_span, scope_span, stamp_root_input, stamp_root_output, stamp_turn_exit};
 #[allow(unused_imports)]
 pub use identity::{pod_user_id, tag_channel, tag_user_id, trigger_for_channel};
 #[allow(unused_imports)]

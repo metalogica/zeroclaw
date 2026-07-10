@@ -58,6 +58,44 @@ pub fn stamp_turn_exit(reason: &str, iterations: usize) {
     }
 }
 
+/// Root I/O mirrors are truncated to this many chars before export — matches the
+/// `llm.call` mirror budget in the agent loop and the 0.6.9 fork's root sites.
+const ROOT_IO_MAX_CHARS: usize = 16_000;
+
+/// Mirror the turn's triggering user message onto the ambient activation root as
+/// `lmnr.span.input` (FD-07 follow-up, zc-gnpx). Laminar derives its root-span
+/// *input* view from this attribute (its manual-override path); a bare
+/// `gen_ai.prompt` is never read for the root, so without this the root's typed
+/// `input` column is silently empty. Unlike [`stamp_turn_exit`], the payload is
+/// PII-bearing content, so it is credential-scrubbed and truncated once here.
+/// Called at each tool loop's entry, where the triggering message is known; a
+/// no-op outside an activation scope (tests, untraced paths).
+pub fn stamp_root_input(raw: &str) {
+    if let Some(sp) = current_span() {
+        let value = crate::util::truncate_with_ellipsis(
+            &crate::agent::loop_::scrub_credentials(raw),
+            ROOT_IO_MAX_CHARS,
+        );
+        sp.set_attr("lmnr.span.input", AttrValue::Str(value));
+    }
+}
+
+/// Mirror the turn's final assistant response onto the ambient activation root as
+/// `lmnr.span.output` (FD-07 follow-up, zc-gnpx). Laminar reads its root-span
+/// *output* view from this attribute. Scrubbed + truncated exactly like
+/// [`stamp_root_input`]. Called at each tool loop's final-answer terminals (the
+/// success returns, never the error/`max_iterations` bail — mirroring the fork's
+/// `Ok(text)`-only rule); a no-op outside an activation scope.
+pub fn stamp_root_output(raw: &str) {
+    if let Some(sp) = current_span() {
+        let value = crate::util::truncate_with_ellipsis(
+            &crate::agent::loop_::scrub_credentials(raw),
+            ROOT_IO_MAX_CHARS,
+        );
+        sp.set_attr("lmnr.span.output", AttrValue::Str(value));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +151,40 @@ mod tests {
                 .any(|(k, v)| k == "agent.turn.iterations" && matches!(v, AttrValue::Int(3))),
             "stamp_turn_exit must write the iteration count onto the ambient root"
         );
+    }
+
+    #[tokio::test]
+    async fn stamp_root_io_writes_scrubbed_input_output_onto_the_ambient_root() {
+        let root = Arc::new(RecordingSpan(Mutex::new(Vec::new())));
+        let root_dyn: Arc<dyn Span> = root.clone();
+
+        scope_span(root_dyn, async {
+            // Loop entry mirrors the triggering message; the final-answer
+            // terminal mirrors the response — both reach the ambient root.
+            stamp_root_input("what is the capital of france?");
+            stamp_root_output("The capital of France is Paris.");
+        })
+        .await;
+
+        let attrs = root.0.lock().unwrap();
+        assert!(
+            attrs.iter().any(|(k, v)| k == "lmnr.span.input"
+                && matches!(v, AttrValue::Str(s) if s.contains("capital of france"))),
+            "stamp_root_input must write the triggering message to lmnr.span.input on the root"
+        );
+        assert!(
+            attrs.iter().any(|(k, v)| k == "lmnr.span.output"
+                && matches!(v, AttrValue::Str(s) if s.contains("Paris"))),
+            "stamp_root_output must write the final response to lmnr.span.output on the root"
+        );
+    }
+
+    #[test]
+    fn stamp_root_io_are_noops_without_an_activation_scope() {
+        // Outside a scope there is no ambient root; the mirrors must not panic.
+        stamp_root_input("no scope here");
+        stamp_root_output("no scope here");
+        assert!(current_span().is_none());
     }
 
     #[tokio::test]

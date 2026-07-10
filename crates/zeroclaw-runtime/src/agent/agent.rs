@@ -2522,6 +2522,11 @@ impl Agent {
             ));
         }
 
+        // Root input mirror (FD-07 follow-up, zc-gnpx): the triggering user
+        // message on the activation root, so Laminar's root-span input column
+        // populates. Ambient no-op if this turn runs outside an activation scope.
+        observability::stamp_root_input(user_message);
+
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
             self.history
@@ -2628,6 +2633,7 @@ impl Agent {
                             cached.clone(),
                         )));
                     self.trim_history();
+                    observability::stamp_root_output(&cached);
                     return Ok(cached);
                 }
                 self.observer.record_event(&ObserverEvent::CacheMiss {
@@ -2811,6 +2817,7 @@ impl Agent {
                         };
                         self.trim_history();
                         observability::stamp_turn_exit("continuation_exhausted", iteration + 1);
+                        observability::stamp_root_output(&final_text);
                         return Ok(final_text);
                     }
                 }
@@ -2833,6 +2840,7 @@ impl Agent {
                 self.trim_history();
 
                 observability::stamp_turn_exit("final_answer", iteration + 1);
+                observability::stamp_root_output(&final_text);
                 return Ok(final_text);
             }
 
@@ -2984,6 +2992,11 @@ impl Agent {
             });
         }
 
+        // Root input mirror (FD-07 follow-up, zc-gnpx): the triggering user
+        // message on the activation root (the WS/streamed ingress path). Ambient
+        // no-op outside an activation scope.
+        observability::stamp_root_input(user_message);
+
         // ── Preamble (identical to turn) ───────────────────────────────
         if self.history.is_empty() {
             let system_prompt = self
@@ -3107,6 +3120,7 @@ impl Agent {
                     self.trim_history();
                     self.observer.record_event(&ObserverEvent::TurnComplete);
                     committed_response.push_str(&cached);
+                    observability::stamp_root_output(&committed_response);
                     return Ok(StreamedTurnSuccess {
                         response: committed_response,
                         new_messages: new_msgs,
@@ -3644,6 +3658,7 @@ impl Agent {
                         committed_response.push_str(&final_text);
                         self.trim_history();
                         observability::stamp_turn_exit("continuation_exhausted", iteration + 1);
+                        observability::stamp_root_output(&committed_response);
                         self.observer.record_event(&ObserverEvent::TurnComplete);
                         return Ok(StreamedTurnSuccess {
                             response: committed_response,
@@ -3706,6 +3721,7 @@ impl Agent {
                 committed_response.push_str(&final_text);
                 self.trim_history();
                 observability::stamp_turn_exit("final_answer", iteration + 1);
+                observability::stamp_root_output(&committed_response);
                 self.observer.record_event(&ObserverEvent::TurnComplete);
                 return Ok(StreamedTurnSuccess {
                     response: committed_response,
