@@ -1,0 +1,125 @@
+# fork-delta-check.yml — trailer↔ledger bijection CI (Fork-Delta: FD-09)
+#
+# Enforces the invariant from docs/FORK_DELTA.md and the migration spec §3.7 / Step 7.1:
+#   (i)   every commit in refs/heads/upstream..HEAD carries a `Fork-Delta: FD-NN` trailer
+#         whose id has a row in docs/FORK_DELTA.md;
+#   (ii)  every FD-NN row in docs/FORK_DELTA.md matches ≥1 commit in that range;
+#   (iii) every `transitional` row carries a non-empty end-state AND removal-ref
+#         (and every `upstreaming` row carries an open PR URL).
+#
+# AMBIGUOUS-REFNAME GOTCHA (Fable): `upstream` is ambiguous — it can resolve to a local
+# branch OR a remote-tracking ref. This workflow (and the local one-liner it mirrors) ALWAYS
+# spells the ref as `refs/heads/upstream` explicitly, never bare `upstream`.
+#
+# CI MATERIALIZATION ASSUMPTION: on a fresh `fetch-depth: 0` checkout the runner has the full
+# sovereign history but does NOT necessarily have a local branch `refs/heads/upstream`
+# (it is a fork-maintenance ref, not always pushed). `refs/heads/upstream` = the exact upstream
+# ref the series is rebased onto = the merge-base of the sovereign tip with upstream's history.
+# We pin it here to the v0.8.0 tag SHA (the base of the squashed series). If that tag is not
+# fetched, we fall back to the first-parent root of the range. Either way the range endpoint is
+# materialized as `refs/heads/upstream` before the check runs.
+
+name: fork-delta-check
+
+on:
+  pull_request:
+    branches: [core/v0.8.0]
+  push:
+    branches: [core/v0.8.0]
+
+permissions:
+  contents: read
+
+jobs:
+  bijection:
+    name: trailer ↔ ledger bijection
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Materialize refs/heads/upstream (pinned base)
+        env:
+          # The v0.8.0 tag SHA the sovereign series is rebased onto. Update this in the same
+          # ff-only operation that advances the `upstream` branch (see FORK_DELTA.md cadence).
+          UPSTREAM_BASE_SHA: 5fc9d3c387c84208579b52aebe87e2734d2b402f
+        run: |
+          set -euo pipefail
+          if git show-ref --verify --quiet refs/heads/upstream; then
+            echo "refs/heads/upstream already present: $(git rev-parse refs/heads/upstream)"
+          elif git rev-parse --verify --quiet "${UPSTREAM_BASE_SHA}^{commit}" >/dev/null; then
+            git update-ref refs/heads/upstream "${UPSTREAM_BASE_SHA}"
+            echo "Pinned refs/heads/upstream -> ${UPSTREAM_BASE_SHA}"
+          else
+            # Fallback: the base of the range is the root of the sovereign-only commits.
+            base="$(git rev-list --max-parents=0 HEAD | tail -n1)"
+            git update-ref refs/heads/upstream "$base"
+            echo "WARN: pinned base SHA not fetched; fell back to history root ${base}" >&2
+          fi
+
+      - name: Assert trailer ↔ ledger bijection
+        env:
+          LEDGER: docs/FORK_DELTA.md
+          BASE_REF: refs/heads/upstream
+        run: |
+          set -euo pipefail
+
+          RANGE="${BASE_REF}..HEAD"
+          fail=0
+
+          # (i) — every commit in the range has a Fork-Delta trailer with a matching ledger row.
+          declare -A ledger_hit
+          while read -r sha; do
+            [ -z "$sha" ] && continue
+            id="$(git show -s --format='%(trailers:key=Fork-Delta,valueonly)' "$sha" \
+                    | head -n1 | tr -d '[:space:]')"
+            if [ -z "$id" ]; then
+              echo "FAIL (i): commit $sha has no Fork-Delta: trailer"
+              fail=1
+              continue
+            fi
+            if ! grep -qE "^\| ${id} " "$LEDGER"; then
+              echo "FAIL (i): commit $sha trailer ${id} has no ledger row"
+              fail=1
+            fi
+            ledger_hit["$id"]=$(( ${ledger_hit["$id"]:-0} + 1 ))
+          done < <(git rev-list "$RANGE")
+
+          # (ii) + (iii) — walk every FD row: it must match ≥1 commit, and if its disposition is
+          # `transitional` it must carry end-state + removal-ref; `upstreaming` must carry a PR URL.
+          # Columns (pipe-split): $2=id $3=title $4=bead $5=crate $6=disposition
+          #                       $7=rationale $8=end-state $9=removal-ref
+          while IFS='|' read -r _ c_id _c_title _c_bead _c_crate c_disp c_rat c_end c_rm _rest; do
+            id="$(echo "$c_id" | tr -d '[:space:]')"
+            case "$id" in FD-[0-9]*) ;; *) continue ;; esac
+            disp="$(echo "$c_disp" | sed 's/^ *//;s/ *$//')"
+            end="$(echo "${c_end:-}" | sed 's/^ *//;s/ *$//')"
+            rmf="$(echo "${c_rm:-}"  | sed 's/^ *//;s/ *$//')"
+
+            if [ -z "${ledger_hit[$id]:-}" ]; then
+              echo "FAIL (ii): ledger row ${id} matches no commit in ${RANGE}"
+              fail=1
+            fi
+
+            if [ "$disp" = "transitional" ]; then
+              if [ -z "$end" ] || [ "$end" = "—" ] || [ -z "$rmf" ] || [ "$rmf" = "—" ]; then
+                echo "FAIL (iii): transitional row ${id} missing end-state and/or removal-ref"
+                fail=1
+              fi
+            fi
+            if [ "$disp" = "upstreaming" ]; then
+              if ! echo "${c_rat} ${c_end}" | grep -qE 'https?://'; then
+                echo "FAIL (iii): upstreaming row ${id} missing an open PR URL"
+                fail=1
+              fi
+            fi
+          done < <(grep -E '^\| FD-[0-9]+ ' "$LEDGER")
+
+          if [ "$fail" -eq 0 ]; then
+            commits="$(git rev-list --count "$RANGE")"
+            rows="$(grep -cE '^\| FD-[0-9]+ ' "$LEDGER")"
+            echo "OK: trailer↔ledger bijection holds over ${RANGE} (${commits} commits ↔ ${rows} rows)"
+          fi
+          exit "$fail"
