@@ -46,3 +46,4 @@ Columns: `id (FD-NN) | title | bead | crate(s) | disposition | rationale [| end-
 | id (FD-NN) | title | bead | crate(s) | disposition | rationale | end-state | removal-ref |
 |------------|-------|------|----------|-------------|-----------|-----------|-------------|
 | FD-00 | Fork-delta ledger infrastructure (this file + trailer protocol) | zc-d5i0 | — | private | Establishes the sovereign-delta ledger, `Fork-Delta:` trailer protocol, branch semantics, and rebase cadence. Self-describing row so the trailer↔row bijection holds from the first commit. | — | — |
+| FD-01 | Wolfi+praxis release image over v0.8.0 multi-crate builder | zc-n6so | Dockerfile | private | Fork ships a Wolfi runtime with a bundled praxis 0.10.0 sidecar (node) instead of upstream's distroless image; builder narrowed to `-p zeroclawlabs --bin zeroclaw`, web/zerocode stages dropped. | — | — |

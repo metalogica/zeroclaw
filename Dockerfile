@@ -1,44 +1,16 @@
 # syntax=docker/dockerfile:1.7-labs
 
-# ── Stage 0: Frontend build ─────────────────────────────────────
-FROM node:22-bookworm-slim@sha256:9f6d5975c7dca860947d3915877f85607946403fc55349f39b4bc3688448bb6e AS web-node
-
-FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS web-builder
-WORKDIR /app
-COPY --from=web-node /usr/local/bin/node /usr/local/bin/node
-COPY --from=web-node /usr/local/lib/node_modules /usr/local/lib/node_modules
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y \
-        pkg-config \
-    && ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
-    && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
-    && rm -rf /var/lib/apt/lists/*
-COPY web/package.json web/package-lock.json web/
-RUN cd web && npm ci --ignore-scripts
-COPY . .
-RUN mkdir -p apps/tauri/src \
-    && echo "fn main() {}" > apps/tauri/src/main.rs \
-    && echo "fn main() {}" > apps/tauri/build.rs
-RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=zeroclaw-web-target,target=/app/target,sharing=locked \
-    cargo web build
-
 # ── Stage 1: Build ────────────────────────────────────────────
 FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS builder
 
 WORKDIR /app
-ARG ZEROCLAW_CARGO_FEATURES="channel-lark,whatsapp-web"
+ARG ZEROCLAW_CARGO_FEATURES="channel-lark,whatsapp-web,rag-pdf,observability-otel"
 
-# Install build dependencies. g++ is required by inkjet (zerocode's syntax
-# highlighter) to compile its tree-sitter grammars; the slim base ships cc but
-# not a C++ compiler.
+# Install build dependencies.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y \
         pkg-config \
-        g++ \
     && rm -rf /var/lib/apt/lists/*
 
 # 1. Copy manifests to cache dependencies
@@ -83,13 +55,13 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-tra
     && mkdir -p crates/zeroclaw-hardware/examples \
     && echo "fn main() {}" > crates/zeroclaw-hardware/examples/esp32_sim.rs \
     && for d in crates/*/; do mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done
-RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
+RUN --mount=type=cache,id=zeroclaw-cargo-registry-v080,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=zeroclaw-cargo-git-v080,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zeroclaw-target-v080,target=/app/target,sharing=locked \
     if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked -p zeroclawlabs -p zerocode --features "$ZEROCLAW_CARGO_FEATURES"; \
+      cargo build --release --locked -p zeroclawlabs --bin zeroclaw --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \
-      cargo build --release --locked -p zeroclawlabs -p zerocode; \
+      cargo build --release --locked -p zeroclawlabs --bin zeroclaw; \
     fi
 RUN rm -rf src benches crates xtask tools/fill-translations
 
@@ -99,47 +71,28 @@ COPY benches/ benches/
 COPY crates/ crates/
 COPY xtask/ xtask/
 COPY tools/fill-translations/ tools/fill-translations/
-# apps/zerocode ships in the image; copy its real source. Its build.rs reads the
-# dashboard theme registry under web/src/contexts, so that path must be present.
-COPY apps/zerocode/ apps/zerocode/
-COPY web/src/ web/src/
 # locales.toml lives at repo root and is embedded by zeroclaw-runtime via
 # include_str!("../../../locales.toml"); the real build needs it present.
 COPY locales.toml .
 COPY *.rs .
-RUN touch src/main.rs apps/zerocode/src/main.rs
-RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
+RUN touch src/main.rs
+RUN --mount=type=cache,id=zeroclaw-cargo-registry-v080,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=zeroclaw-cargo-git-v080,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zeroclaw-target-v080,target=/app/target,sharing=locked \
     rm -rf target/release/.fingerprint/zeroclawlabs-* \
            target/release/deps/zeroclawlabs-* \
-           target/release/incremental/zeroclawlabs-* \
-           target/release/.fingerprint/zeroclaw-* \
-           target/release/deps/zeroclaw_* \
-           target/release/incremental/zeroclaw_* \
-           target/release/.fingerprint/xtask-* \
-           target/release/deps/xtask-* \
-           target/release/.fingerprint/fill-translations-* \
-           target/release/deps/fill_translations-* \
-           target/release/.fingerprint/zerocode-* \
-           target/release/deps/zerocode-* \
-           target/release/incremental/zerocode-* && \
+           target/release/incremental/zeroclawlabs-* && \
     if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked -p zeroclawlabs -p zerocode --features "$ZEROCLAW_CARGO_FEATURES"; \
+      cargo build --release --locked -p zeroclawlabs --bin zeroclaw --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \
-      cargo build --release --locked -p zeroclawlabs -p zerocode; \
+      cargo build --release --locked -p zeroclawlabs --bin zeroclaw; \
     fi && \
     cp target/release/zeroclaw /app/zeroclaw && \
-    cp target/release/zerocode /app/zerocode && \
-    strip /app/zeroclaw /app/zerocode
-RUN for b in zeroclaw zerocode; do \
-      size=$(stat -c%s "/app/$b") && \
-      if [ "$size" -lt 1000000 ]; then echo "ERROR: $b too small (${size} bytes), likely dummy build artifact" && exit 1; fi; \
-    done
+    strip /app/zeroclaw
+RUN size=$(stat -c%s /app/zeroclaw) && \
+    if [ "$size" -lt 1000000 ]; then echo "ERROR: binary too small (${size} bytes), likely dummy build artifact" && exit 1; fi
 
 # Prepare runtime directory structure and default config inline (no extra stage).
-# Dashboard assets live at /usr/share/zeroclawlabs/web/dist (outside the documented
-# /zeroclaw-data mount point) so a bind mount on /zeroclaw-data cannot shadow them.
 RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/data && \
     printf '%s\n' \
         'api_key = ""' \
@@ -171,10 +124,6 @@ RUN apt-get update && apt-get install -y \
 
 COPY --from=builder /zeroclaw-data /zeroclaw-data
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
-COPY --from=builder /app/zerocode /usr/local/bin/zerocode
-# Install the dashboard at /usr/share/zeroclawlabs/web/dist (outside the
-# documented /zeroclaw-data mount) so user volumes do not shadow it (#6400).
-COPY --from=web-builder /app/web/dist /usr/share/zeroclawlabs/web/dist
 
 # Overwrite minimal config with DEV template (Ollama defaults)
 COPY dev/config.template.toml /zeroclaw-data/.zeroclaw/config.toml
@@ -202,30 +151,55 @@ HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
 ENTRYPOINT ["zeroclaw"]
 CMD ["daemon"]
 
-# ── Stage 3: Production Runtime (Distroless) ─────────────────
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
+# ── Stage 2.5: Praxis install (private GH Packages) ──────────
+FROM node:20-alpine AS praxis-install
+
+ARG PRAXIS_VERSION=0.10.0
+
+# Install the private @soulbound-labs/praxis CLI using a BuildKit secret for the
+# npm token (never an ARG/ENV — the token must not persist in any image layer).
+# The scoped .npmrc is written just for the install and removed immediately after.
+# The installed package is relocated to /opt/praxis so the release stage can
+# `COPY --from=praxis-install /opt/praxis /opt/praxis` with a stable path.
+RUN --mount=type=secret,id=npm_token \
+    sh -c 'set -eu; \
+      { \
+        echo "@soulbound-labs:registry=https://npm.pkg.github.com"; \
+        echo "//npm.pkg.github.com/:_authToken=$(cat /run/secrets/npm_token)"; \
+        echo "always-auth=true"; \
+      } > ~/.npmrc; \
+      npm install -g "@soulbound-labs/praxis@${PRAXIS_VERSION}"; \
+      rm -f ~/.npmrc; \
+      mkdir -p /opt; \
+      cp -R /usr/local/lib/node_modules/@soulbound-labs/praxis /opt/praxis'
+
+# ── Stage 3: Production Runtime (Wolfi) ───────────────────────
+FROM cgr.dev/chainguard/wolfi-base:latest AS release
+
+RUN apk add --no-cache ca-certificates bash coreutils vim git nodejs
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
-COPY --from=builder /app/zerocode /usr/local/bin/zerocode
 COPY --from=builder /zeroclaw-data /zeroclaw-data
-# Install the dashboard at /usr/share/zeroclawlabs/web/dist (outside the
-# documented /zeroclaw-data mount) so user volumes do not shadow it (#6400).
-COPY --from=web-builder /app/web/dist /usr/share/zeroclawlabs/web/dist
+
+# Praxis CLI (private @soulbound-labs/praxis from GH Packages)
+COPY --from=praxis-install /opt/praxis /opt/praxis
+RUN ln -sf /opt/praxis/dist/bin-bootstrap.cjs /usr/local/bin/praxis
 
 # Environment setup
 # Ensure UTF-8 locale so CJK / multibyte input is handled correctly
 ENV LANG=C.UTF-8
-ENV ZEROCLAW_DATA_DIR=/zeroclaw-data/data
+# v0.8.0 data-dir pin (canonical). ZEROCLAW_WORKSPACE is kept during the
+# transition as a deprecated alias; DATA_DIR wins (with a WARN) when both are
+# set. Never set ZEROCLAW_CONFIG_DIR — it would re-pin data under
+# <config_dir>/data and orphan the existing /zeroclaw-data/workspace PVC.
+ENV ZEROCLAW_DATA_DIR=/zeroclaw-data/workspace
+ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
 ENV HOME=/zeroclaw-data
-# Default provider and model are set in config.toml, not here,
-# so config file edits are not silently overridden
-#ENV PROVIDER=
-ENV ZEROCLAW_GATEWAY_PORT=42617
 
 # API_KEY must be provided at runtime!
 
 WORKDIR /zeroclaw-data
-USER 65534:65534
+USER 65534
 EXPOSE 42617
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
     CMD ["zeroclaw", "status", "--format=exit-code"]
