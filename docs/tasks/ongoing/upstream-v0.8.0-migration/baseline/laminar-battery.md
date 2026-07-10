@@ -3,13 +3,28 @@
 **Bead:** `zc-b78l` (manual gate) · **Epic:** `upstream-v0.8.0-migration`
 **Sovereign tip under test:** `core/v0.8.0` @ `315220221` (FD-07 Laminar re-home) — battery run 2026-07-10
 **Root-I/O fix landed:** `core/v0.8.0` @ `b4288dc0b` (FD-07 follow-up, zc-gnpx) — **live re-verify PENDING**
-**Status:** 🟡 **PARTIAL — one live re-verify pass away from GREEN.** After re-run (b): root I/O FIXED &
-PROVEN (chat + webhook); negative control PASS; a NEW gap (ws has no root) found + FIXED in code
-(zc-a1bp); redaction conditional-pass (fork-faithful). Remaining before GREEN: ws root live re-verify +
-a `token:`-shaped redaction positive-probe. Triggers 4&5 remain BLOCKED-manual (zc-zb2t).
+**Status:** ✅ **GREEN (FD-07 scope) — passed 2026-07-10 @ `core/v0.8.0 @ 8e309c9a8`.** Every FD-07-scoped
+§4.4 clause verified live: 3 roots / 3 surfaces (ws no longer hollow), root **+** `llm.call` I/O non-empty
+(3/3), typed `user_id`, `session_id` absence-not-empty (Adj B), `final_answer` exit stamped, redaction
+fires on the mirror (`api_key: sk-l*[REDACTED]`), negative control drops all spans, 0 key leaks.
+**Documented carve-out:** triggers 4 & 5 (multi-iteration tool loop → `max_iterations`/`error` exit, and
+tool-call-only `llm.call` rows) remain **BLOCKED-manual** behind the tool-approval gap (`zc-zb2t`,
+separate prod-rollout track) — re-verify rides zc-zb2t, NOT FD-07.
 
 Query transport: `docker exec clawcraft-laminar-clickhouse clickhouse-client -q "…"` (ClickHouse has no
 host port).
+
+---
+
+## Final pass 2026-07-10 (c) — GREEN — `core/v0.8.0 @ 8e309c9a8` (zc-gnpx + zc-a1bp). Window `> '2026-07-10 21:40:35'`
+
+- **3 roots / 3 surfaces** — webhook `webhook_battery_battery`, web_chat/web ×2 (chat sid="", **ws sid=`gw_37602bf5-…`**). ws is no longer hollow.
+- **Root + llm.call I/O** — `agent.activation` 3/3 in+out, `llm.call` 3/3 in+out. ws root: in=`"WSPROBEYANKEE say hello…"`, out=`"Hello! I am ZeroClaw…"`, exit=`final_answer`.
+- **Redaction (key-value)** — `api_key: sk-l*[REDACTED]` on BOTH `agent.activation` and `llm.call`; `raw_hit=0`, `redacted_hit>0`. Proves scrub fires on the FD-07 root mirror. (Bare-token / Bearer value-form limits tracked in `zc-1qoq`.)
+- **No key leak** — 0 rows.
+- **Webhook shape correction** — 42618 is `[channels.webhook.default]` expecting `{"sender","content"}` (not `{"message"}` — that's `/api/chat`). Prior notes mislabeled it. → zc-t0ii post-exec note.
+- **Optional enhancement (non-gating):** chat vs ws share `trigger=web_chat`/`channel=web` (distinguished only by `session_id`); a ws-distinct `trigger`/`surface` attr would sharpen dashboards. Not filed unless wanted.
+- **BLOCKED-manual (deferred → zc-zb2t):** triggers 4 & 5.
 
 ---
 
