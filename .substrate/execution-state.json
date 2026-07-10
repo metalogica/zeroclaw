@@ -52,7 +52,9 @@
       "Control-plane model: orchestrator checkout stays on scaffolding branch (holds .tbd/spec/doctrines/substrate.yaml); product work runs in worktrees off core/v0.8.0 to avoid losing the tracker.",
       "Close preserves per-theme Fork-Delta: FD-NN trailer commits (no final squash) \u2014 required by the fork-delta-check bijection (zc-4leb).",
       "Waves 1\u20132 run serially by the orchestrator (foundation + human-gated STOP points), not as a fleet.",
-      "substrate.yaml + docs/scripts/bead-graph.sh installed surgically (not via full /substrate:adopt) because the repo is already partially substrate-governed (custom docs/doctrine + real AGENTS.md/CLAUDE.md)."
+      "substrate.yaml + docs/scripts/bead-graph.sh installed surgically (not via full /substrate:adopt) because the repo is already partially substrate-governed (custom docs/doctrine + real AGENTS.md/CLAUDE.md).",
+      "GATE 2026-07-09: zc-jfun re-scoped to the 4-step Laminar re-home plan (option a) and re-opened; write-scope expanded across zeroclaw-api + otel.rs + rpc/turn.rs + agent.rs (approved, recorded in bead notes). Conservative edges zc-4leb/zc-p7tx <- zc-jfun dropped; zc-b78l edge retained.",
+      "GATE 2026-07-09: OTel-globals race extracted as P1 bug bead zc-ju48 (OnceLock + shutdown_shared_providers, 6 racing sites); zc-jfun blocked-by zc-ju48 (both edit otel.rs); zc-ju48 parallelizable with Wave 5, does not gate it. Upstreaming candidate."
     ],
     "re-gates": [
       {
@@ -249,8 +251,8 @@
     "blockers": [
       {
         "bead": "zc-jfun",
-        "kind": "scope-gap",
-        "detail": "Laminar layer needs re-homing dropped span infra across zeroclaw-api (start_activation trait) + otel.rs (OtelSpan + OnceLock sharing) + rpc/turn.rs (activation owner) + agent.rs (mirrors) \u2014 4-step plan from runner a5437e9ec184969ac"
+        "kind": "scope-gap-RESOLVED",
+        "detail": "2026-07-09 gate decision: option (a) re-scope + execute. Bead re-opened with 4-step write-scope (zeroclaw-api start_activation trait + otel.rs OtelSpan on shared provider + rpc/turn.rs activation owner + agent.rs mirrors). Pre-req extracted as zc-ju48 (OnceLock). Runs as own window after Wave 5. Do NOT re-wire .with_headers() (already applied upstream)."
       }
     ]
   }

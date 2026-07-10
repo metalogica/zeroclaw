@@ -61,6 +61,26 @@ v0.8.0 **deleted the span-*producing* half** of observability. zc-jfun is a subs
 
 Headers are ALREADY applied on both exporters upstream (verified) — do NOT re-wire `.with_headers()`. zc-jfun **blocks** zc-b78l (live battery — manual gate), zc-4leb, zc-p7tx (the latter two edges are likely conservative — CI-workflow beads don't consume Laminar code).
 
+## GATE DECISIONS (2026-07-09, tech-lead review — supersedes the zc-jfun "blocked" state below)
+
+1. **zc-jfun = option (a): re-scope + execute the 4-step plan.** Laminar emission is a §7
+   integration-contract item (prod Laminar Cloud live since 2026-06-02); deferring doesn't take it
+   off the release critical path — it just ships identity/active (zc-yz6h, merged) as inert dead
+   code and moves first verification to prod. Recon is done (attach points line-pinned), so the
+   residual is execution, not discovery. Bead re-opened with expanded write-scope (recorded in the
+   bead notes — not silent). Runs as its **own window after Wave 5** (agent.rs adjacency vs
+   zc-n1mx). Conservative edges **dropped**: zc-4leb/zc-p7tx no longer wait on it (they consume no
+   Laminar code); zc-b78l edge retained — the manual battery stays gated on real span production.
+2. **OTel-globals race = new P1 bug bead `zc-ju48`** (window-5), extracted from zc-jfun step 2 so
+   the fix lands even if the Laminar window stalls again. Sequenced **before** zc-jfun
+   (`zc-jfun blocked-by zc-ju48` — both edit otel.rs; no co-edited files in one wave). Does NOT
+   gate Wave 5 (zc-n1mx/zc-e6t0 are verify+document+ledger; file-disjoint) — dispatchable in
+   parallel with it. `upstreaming` candidate: the race exists at v0.8.0 upstream; PR it after
+   landing (ledger row stays `private` until a PR URL exists).
+
+Resume order becomes: **Wave 5** (zc-n1mx, zc-e6t0) ∥ **zc-ju48** → **zc-jfun window** →
+Wave 6 (zc-vja9, zc-4leb, zc-p7tx) → zc-b78l (manual) → zc-t0ii → zc-garf.
+
 ## Remaining waves (resume order)
 
 - **Wave 5 — UNBLOCKED (do first on resume):**
