@@ -1068,7 +1068,28 @@ async fn process_chat_message(
     // from the other branch.
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
-    let turn_fut = async {
+
+    // ── Laminar activation root (FD-07 / zc-a1bp) ───────────────────
+    // `/ws/chat` is a first-class prod ingress (clawcraft's streaming UI), but
+    // unlike the other owners (rpc/turn ACP, gateway /api/chat, channels +
+    // webhook, CLI) it minted no activation root — so the ws surface emitted
+    // only upstream-native `gen_ai.*` spans, with no `agent.activation`/
+    // `llm.call` and no root I/O. Mint the root HERE and scope the whole
+    // streamed turn beneath it; the `stamp_root_*`/`stamp_turn_exit`/`llm.call`
+    // mirrors in `turn_streamed` then resolve against it via `current_span()`.
+    // `session_id` twins from the per-message session key (Adjustment B);
+    // channel + pod-user ride on the root. No-op on a non-tracing backend.
+    let root: std::sync::Arc<dyn zeroclaw_runtime::observability::Span> = {
+        let r = state.observer.start_activation(
+            zeroclaw_runtime::observability::Trigger::WebChat,
+            Some(session_key_owned.as_str()),
+        );
+        zeroclaw_runtime::observability::tag_channel(r.as_ref(), "web");
+        zeroclaw_runtime::observability::tag_user_id(r.as_ref());
+        std::sync::Arc::from(r)
+    };
+
+    let turn_fut = zeroclaw_runtime::observability::scope_span(root, async {
         use ::zeroclaw_log::Instrument as _;
         let span = ::zeroclaw_log::info_span!(
             target: "zeroclaw_log_internal_scope",
@@ -1091,7 +1112,7 @@ async fn process_chat_message(
                 .instrument(span),
         )
         .await
-    };
+    });
 
     // Drive both futures concurrently: the agent turn produces events
     // and we relay them over WebSocket. Track streamed chunks so we
