@@ -148,6 +148,16 @@
         ],
         "result": "green (build ok; workspace 8575/8575 incl. 7 new continuation_auto_drive contract tests; clippy 0; fmt drift 0 after style fixup ace744dc7)",
         "note": "Verification RECLASSIFIED zc-n1mx from Fable's 'verify+document+ledger' to a real code task: spec §3.2/§3.4 mandate the continuation guard on the process_message path but only agent.rs turn/turn_streamed had it. Runner wired the shared run_tool_call_loop (the DRY site process_message/POST /api/chat/42618 webhook/channels/CLI-run delegate through) — verified NO double-drive (agent.rs turn* run their own loops, do not call run_tool_call_loop). Broader-than-process_message but safe (inert without praxis envelope). Initial merge introduced fmt drift on loop_.rs; fixed surgically (cargo fmt -p zeroclaw-runtime, diff confined to loop_.rs)."
+      },
+      {
+        "wave": "5-subwave2b (zc-e6t0)",
+        "tip-sha": "core/v0.8.0@ac3b2df27 (FD-04/05 rows, docs-only)",
+        "commands": [
+          "grep FD-04/FD-05/FD-06 docs/FORK_DELTA.md (3 rows present)",
+          "cargo nextest run -p zeroclaw-runtime webhook_only (1 passed)"
+        ],
+        "result": "green (docs-only; zero Rust added — last cargo union re-gate @ace744dc7 with 8575 tests still covers all compiled code; webhook_only_config_is_supervised passes)",
+        "note": "FD-04/05/06 CODE already landed (zc-2sw0/zc-qwhe/zc-nvqs); zc-e6t0 reduced to FD-04+FD-05 ledger rows (FD-06 present) + drop records. Webhook-supervision covered by existing daemon/mod.rs:1641 test (spec §4.2 no-new-code path) — referenced in FD-04 row. Drops a0d1a8fbd (SYSTEM_DIR) + c276ffe6a recorded in spec post-execution notes."
       }
     ],
     "outcomes": {
@@ -163,6 +173,13 @@
         "commit": "ea310963f",
         "fork-delta": "FD-03 (row @80a8121c6; fmt fixup @ace744dc7)",
         "note": "Continuation auto-drive wired into shared run_tool_call_loop (covers process_message / POST /api/chat / 42618 webhook / channels / CLI run); 7 new contract tests (§4.2 inv 1-6 + §10.5 verifier-failure continuity). spawn_subagent = documented scope-out (depth-1-capped tool, output flows through parent driver). FD-03 ROW landed; theme-squash-into-one-trailer-commit DEFERRED to zc-t0ii finalization (bijection reconciliation, zc-4leb Wave 6) — per pre-flagged plan, so squash sub-criterion of the bead is delegated, not dropped."
+      },
+      "zc-e6t0": {
+        "status": "pass",
+        "wave": "5-subwave2b",
+        "commit": "ac3b2df27",
+        "fork-delta": "FD-04 + FD-05 rows (code pre-landed zc-2sw0/zc-qwhe); FD-06 already present",
+        "note": "Orchestrator-side docs-only: FD-04 (gateway token + config-compat) + FD-05 (POST /api/chat) ledger rows; drops a0d1a8fbd (SYSTEM_DIR, superseded) + c276ffe6a (webhook-supervision, absorbed) recorded in spec post-execution notes. Webhook-supervision covered by daemon/mod.rs:1641 (referenced in FD-04 row, no new test per spec §4.2). Residual optional follow-up: no end-to-end legacy-render→migration→supervision composed test. Trailer-squash deferred to zc-t0ii."
       },
       "zc-7c42": {
         "status": "pass",

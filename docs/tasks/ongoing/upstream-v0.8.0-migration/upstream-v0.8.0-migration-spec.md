@@ -719,3 +719,9 @@ curl -s -X POST https://<pod>/api/chat -H "Authorization: Bearer $TOKEN" -H 'con
 ### Post-execution notes
 
 _(populated during execution — scope expansions per execution-format §7.1, drop verdicts from Steps 4.4/6.2, live-battery results.)_
+
+#### Phase 4 (Themes E+G) drop verdicts — recorded by zc-e6t0
+
+- **`a0d1a8fbd` `ZEROCLAW_SYSTEM_DIR` split-mount — DROP (superseded).** The fork's system/workspace split-mount env is superseded by upstream's per-agent workspace boundaries; `git grep -il ZEROCLAW_SYSTEM_DIR` at v0.8.0 returns zero matches. No re-home; not a ledger row.
+- **`c276ffe6a` webhook-only supervision fix — DROP (absorbed upstream, test-pinned).** Upstream `has_supervised_channels` → `ChannelsConfig::has_any_enabled()` counts webhook (schema.rs:11089) and is regression-pinned by `webhook_only_config_is_supervised` (daemon/mod.rs:1641–1662). The fork intent is fully covered; referenced in the FD-04 ledger-row rationale rather than carried as fork code. No new fork test added.
+- **Scope note (zc-e6t0):** FD-04/05/06 *code* landed earlier (zc-2sw0 config-compat, zc-qwhe token + `/api/chat`, zc-nvqs ws-threadId); zc-e6t0's deliverable reduced to the FD-04 + FD-05 ledger rows (FD-06 already present) + these drop records. Residual optional follow-up: no end-to-end test drives a clawcraft-rendered *legacy* `[channels_config.webhook]` config through migration→supervision (the invariant and the migration are each covered separately, not composed). The per-theme trailer-squash for FD-04/05/06 is deferred to zc-t0ii finalization (bijection reconciliation, zc-4leb).
