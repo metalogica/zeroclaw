@@ -81,11 +81,12 @@ Headers are ALREADY applied on both exporters upstream (verified) — do NOT re-
 Resume order becomes: **Wave 5** (zc-n1mx, zc-e6t0) ∥ **zc-ju48** → **zc-jfun window** →
 Wave 6 (zc-vja9, zc-4leb, zc-p7tx) → zc-b78l (manual) → zc-t0ii → zc-garf.
 
+> **SESSION UPDATE 2026-07-09 (pause @ `core/v0.8.0` `ac3b2df27`, 33 off v0.8.0):** Wave 5 + zc-ju48 are **DONE** (union re-gates green; per-bead detail in `.substrate/execution-state.json`). **zc-jfun is now UNBLOCKED and is the next task on resume.** Paused at user checkpoint before the Laminar re-home. zc-n1mx's continuation guard was wired into the shared `run_tool_call_loop` (covers process_message/`/api/chat`/webhook/channels/CLI — verified no double-drive vs agent.rs `turn*`). New follow-up bead **zc-mk2r** (P3): wire `shutdown_shared_providers` into exit-time drain.
+
 ## Remaining waves (resume order)
 
-- **Wave 5 — UNBLOCKED (do first on resume):**
-  - `zc-n1mx` (Step 3.3) — wire `process_message`/subagent continuation coverage (fact: `process_message` delegates to shared `agent_turn`, so Step 3.2's wiring likely already covers it — verify + document), then **squash Theme B as `Fork-Delta: FD-03`** + ledger row.
-  - `zc-e6t0` — record drops (SYSTEM_DIR, c276ffe6a, webhook-supervision pin) + **land FD-04/05/06 rows** (FD-06 already landed; add FD-04/05).
+- **Wave 5 — ✅ DONE:** `zc-ju48` (OTel OnceLock, @`c5977885b`), `zc-n1mx` (continuation on `run_tool_call_loop`, FD-03 row, @`ea310963f`+`ace744dc7`), `zc-e6t0` (FD-04/05 rows + drop records, @`ac3b2df27`). Trailer-squash for all three themes deferred to zc-t0ii.
+- **NEXT — zc-jfun window (Laminar / FD-07):** the 4-step re-home (§"THE BIG REMAINING PIECE"), now unblocked (zc-ju48 closed → shared-provider OnceLock in place). Own window; touches zeroclaw-api + otel.rs + rpc/turn.rs + agent.rs. Do NOT re-wire `.with_headers()` (already applied upstream).
 - **Wave 6:** `zc-vja9` (coldstart harness `dev/hotswap/verify-coldstart.sh`, needs zc-e6t0), `zc-4leb` (fork-delta-check.yml — trailer↔ledger bijection CI, FD-09), `zc-p7tx` (conflict-canary.yml, FD-10). NOTE: run `zc-4leb`'s bijection check locally against `upstream..core/v0.8.0` — every commit needs a `Fork-Delta:` trailer OR the check must scope to squashed theme-commits. **Current per-bead commits on core/v0.8.0 are NOT squashed-by-theme yet** — the finalization (zc-t0ii) or a pre-4leb squash pass must reconcile this so the bijection holds.
 - **Wave 7:** `zc-b78l` — live Laminar battery (MANUAL gate, needs clawcraft dev ClickHouse; blocked on zc-jfun).
 - **Wave 8:** `zc-t0ii` — archive `migration-playbook.md`, finalize ledger, **squash-by-theme the core/v0.8.0 series** (each theme → one commit + `Fork-Delta:` trailer, so the bijection CI passes), post-execution notes (drops: Themes H, SYSTEM_DIR, c276ffe6a, Phase-6 verdicts).
@@ -94,7 +95,7 @@ Wave 6 (zc-vja9, zc-4leb, zc-p7tx) → zc-b78l (manual) → zc-t0ii → zc-garf.
 ## Resume protocol
 
 1. `git config commit.gpgsign false` (re-disable for fleet worktree commits; restore at true/unset at end).
-2. Confirm integration worktree at `…/zeroclaw-worktrees/core-v0.8.0` (branch `core/v0.8.0` @ `b2ba48608`); recreate with `git worktree add` if gone.
+2. Confirm integration worktree at `…/zeroclaw-worktrees/core-v0.8.0` (branch `core/v0.8.0` @ `ac3b2df27` as of the 2026-07-09 pause); recreate with `git worktree add` if gone.
 3. Read `.substrate/execution-state.json` for the full outcome/re-gate ledger.
 4. Group-runner protocol used: implement per inlined spec-step + env-resolved gate (nextest, 1.93.0); **commit plainly — NO `Fork-Delta:` trailers, NO `FORK_DELTA.md` edits** (orchestrator lands ledger rows single-writer, and squashes-by-theme at finalization to avoid parallel-append conflicts). Resolve `-p zeroclawlabs` test gates to the owning crate (`-p zeroclaw-runtime` etc.).
 5. Per wave: dispatch file-disjoint windows → merge on green → union re-gate the integrated tip (`cargo build --all-targets` + `cargo nextest run --workspace` + clippy + fmt-vs-baseline) → record into execution-state.
