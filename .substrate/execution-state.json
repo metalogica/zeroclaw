@@ -136,6 +136,18 @@
         ],
         "result": "green (build ok; workspace 8567/8567; otel feature-on 15/15 incl. shared_providers_are_single_instance regression test; clippy 0; fmt drift 0)",
         "note": "Serialized from Fable's parallel plan: zc-ju48's Gate-2 rescope (6 observer sites, incl. daemon/mod.rs) collides with zc-e6t0 (daemon/mod.rs) + zc-n1mx (agent.rs/gateway), so ran solo first. Default gate.test under-covers otel tests (feature-gated off) — union re-gate added --features observability-otel to actually exercise the regression test."
+      },
+      {
+        "wave": "5-subwave2a (zc-n1mx)",
+        "tip-sha": "core/v0.8.0@ace744dc7 (code+fmt); FD-03 row @80a8121c6 docs-only",
+        "commands": [
+          "cargo build --all-targets --locked",
+          "cargo nextest run --workspace --locked",
+          "cargo clippy --all-targets -- -D warnings",
+          "cargo fmt -- --check crates/zeroclaw-runtime/src/agent/loop_.rs"
+        ],
+        "result": "green (build ok; workspace 8575/8575 incl. 7 new continuation_auto_drive contract tests; clippy 0; fmt drift 0 after style fixup ace744dc7)",
+        "note": "Verification RECLASSIFIED zc-n1mx from Fable's 'verify+document+ledger' to a real code task: spec §3.2/§3.4 mandate the continuation guard on the process_message path but only agent.rs turn/turn_streamed had it. Runner wired the shared run_tool_call_loop (the DRY site process_message/POST /api/chat/42618 webhook/channels/CLI-run delegate through) — verified NO double-drive (agent.rs turn* run their own loops, do not call run_tool_call_loop). Broader-than-process_message but safe (inert without praxis envelope). Initial merge introduced fmt drift on loop_.rs; fixed surgically (cargo fmt -p zeroclaw-runtime, diff confined to loop_.rs)."
       }
     ],
     "outcomes": {
@@ -144,6 +156,13 @@
         "wave": "5-subwave1",
         "commit": "c5977885b",
         "note": "OnceLock-shared OTLP exporter + shutdown_shared_providers restored; all 7 sites funnel through OtelObserver::new (single factory, no per-site edits). Upstreaming candidate: ledger row stays PRIVATE (no FD-NN) until a PR URL exists. FOLLOW-UP: shutdown_shared_providers restored+re-exported but not yet wired to an exit-time drain caller (main.rs/CLI teardown, out of scope)."
+      },
+      "zc-n1mx": {
+        "status": "pass",
+        "wave": "5-subwave2a",
+        "commit": "ea310963f",
+        "fork-delta": "FD-03 (row @80a8121c6; fmt fixup @ace744dc7)",
+        "note": "Continuation auto-drive wired into shared run_tool_call_loop (covers process_message / POST /api/chat / 42618 webhook / channels / CLI run); 7 new contract tests (§4.2 inv 1-6 + §10.5 verifier-failure continuity). spawn_subagent = documented scope-out (depth-1-capped tool, output flows through parent driver). FD-03 ROW landed; theme-squash-into-one-trailer-commit DEFERRED to zc-t0ii finalization (bijection reconciliation, zc-4leb Wave 6) — per pre-flagged plan, so squash sub-criterion of the bead is delegated, not dropped."
       },
       "zc-7c42": {
         "status": "pass",
