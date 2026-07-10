@@ -113,6 +113,9 @@ pub(crate) fn seed_channel_handles(
     }
     count
 }
+use crate::agent::continuation::{
+    ContinuationDriver, DriveProgress, NextAction, render_cli_command, safety_net_command,
+};
 use crate::cost::types::BudgetCheck;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
@@ -641,7 +644,7 @@ fn build_hardware_context(
 
 // Tool execution moved to `super::tool_execution`.
 pub use super::tool_execution::{
-    ToolExecutionOutcome, execute_tools_parallel, execute_tools_sequential,
+    ToolExecutionOutcome, execute_one_tool, execute_tools_parallel, execute_tools_sequential,
     should_execute_tools_in_parallel,
 };
 
@@ -1529,6 +1532,376 @@ fn maybe_inject_channel_delivery_defaults(
 //   • max_iterations is reached (runaway safety), or
 //   • the cancellation token fires (external abort).
 
+// ── NextAction continuation auto-drive (rnk-h6g3 / zc-n1mx) ────────────────
+// Port of the `Agent::turn`/`turn_streamed` integration (agent.rs) onto the
+// `run_tool_call_loop` path, so the restored `POST /api/chat` + the webhook
+// route (`handle_webhook → run_gateway_chat_with_tools → process_message →
+// agent_turn → run_tool_call_loop`) enforce praxis continuations too. Without
+// this, guarding only the WS/ACP surfaces reproduced the documented
+// `agent_work_then_call` stall through prod's front door (spec §3.2). The
+// per-turn FSM lives in `continuation.rs` and is shared; only the wiring
+// differs — this path threads `history: &mut Vec<ChatMessage>`, the free
+// `execute_one_tool` (hook/span parity with model-initiated calls), and the
+// `observer` rather than the `Agent` struct's fields.
+
+/// Resolution of the turn-termination continuation guard (rnk-h6g3): how a
+/// model stop-attempt was handled when a praxis continuation was pending.
+enum ContinuationGuardOutcome {
+    /// No continuation pending — the turn may end normally.
+    NoPending,
+    /// The stop was refused (chain auto-driven to completion or a bounded
+    /// forcing re-drive injected) — re-enter the iteration loop.
+    Resume,
+    /// The re-drive budget is exhausted; the safety net was routed. The
+    /// notice must be appended to the final reply.
+    Exhausted(String),
+}
+
+/// Drive pending `kind:"call"` continuations mechanically — zero model
+/// round-trips, no model cooperation required. Loops until the pending state
+/// is no longer a `call` (terminal, agent-work, or a surfaced failure) or the
+/// per-turn drive budget runs out (the caller surfaces/routes that). Each
+/// driven call and its result are appended to `history` so the model keeps
+/// full context. Mirrors `Agent::drive_continuation_calls`.
+#[allow(clippy::too_many_arguments)]
+async fn drive_continuation_calls(
+    continuation: &mut ContinuationDriver,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+    receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
+    // Threaded for call-site parity with `Agent::drive_continuation_calls`;
+    // `execute_one_tool` carries its own per-call id/span so it is unused here.
+    _turn_id: &str,
+    trace_channel: &str,
+) -> Result<()> {
+    loop {
+        let Some(NextAction::Call { tool, args }) = continuation.pending().cloned() else {
+            return Ok(());
+        };
+        if continuation.drive_budget_exhausted() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "target_tool": tool })),
+                "NextAction auto-drive budget exhausted"
+            );
+            return Ok(());
+        }
+
+        // Resolve the continuation target: a registered tool by exact name,
+        // else the praxis CLI via the shell tool. The shell tool's own
+        // security policy still applies — auto-drive is never more privileged
+        // than a model-initiated call.
+        let (exec_name, exec_args, rendered) = if tools_registry.iter().any(|t| t.name() == tool) {
+            let rendered = format!("{tool} {}", serde_json::Value::Object(args.clone()));
+            (
+                tool.clone(),
+                serde_json::Value::Object(args.clone()),
+                rendered,
+            )
+        } else if tools_registry.iter().any(|t| t.name() == "shell") {
+            let cmd = render_cli_command(&tool, &args);
+            (
+                "shell".to_string(),
+                serde_json::json!({ "command": cmd }),
+                cmd,
+            )
+        } else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "target_tool": tool })),
+                "no executable tool for pending continuation"
+            );
+            history.push(ChatMessage::system(format!(
+                "[NextAction auto-drive] Cannot drive the pending continuation \
+                     `{tool}`: no matching tool and no shell tool is registered. \
+                     Complete it with your own tools before replying."
+            )));
+            continuation.clear_pending();
+            return Ok(());
+        };
+
+        let call_id = Uuid::new_v4().to_string();
+        let outcome = execute_one_tool(
+            &exec_name,
+            exec_args,
+            Some(&call_id),
+            tools_registry,
+            activated_tools,
+            observer,
+            cancellation_token,
+            receipt_generator,
+        )
+        .await?;
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(if outcome.success {
+                    ::zeroclaw_log::EventOutcome::Success
+                } else {
+                    ::zeroclaw_log::EventOutcome::Failure
+                })
+                .with_attrs(::serde_json::json!({
+                    "event": "continuation_auto_drive",
+                    "channel": trace_channel,
+                    "command": scrub_credentials(&rendered),
+                })),
+            "NextAction continuation call driven mechanically"
+        );
+
+        history.push(ChatMessage::user(format!(
+            "[NextAction auto-drive] Ran `{rendered}`:\n{}",
+            outcome.output
+        )));
+
+        if !outcome.success {
+            // Surfaced, not silent: the model sees the failure and the
+            // instruction to recover; the continuation is no longer
+            // mechanically drivable.
+            history.push(ChatMessage::system(format!(
+                "[NextAction auto-drive] The continuation call `{rendered}` failed; \
+                 the execution walk is paused. Inspect the error above, fix it, and \
+                 resume the walk before replying."
+            )));
+            continuation.clear_pending();
+            return Ok(());
+        }
+
+        if continuation.register_driven(&tool, &args, &outcome.output) == DriveProgress::Stalled {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "event": "continuation_auto_drive_stall",
+                        "channel": trace_channel,
+                        "reason": "identical continuation call reproduced identical output",
+                        "command": scrub_credentials(&rendered),
+                    })),
+                "NextAction auto-drive stalled"
+            );
+            anyhow::bail!(
+                "Agent loop aborted: NextAction auto-drive stalled (identical \
+                 continuation call reproduced identical output — the execution FSM is \
+                 not advancing)"
+            );
+        }
+
+        continuation.observe_driven_result(&outcome.output, outcome.success);
+    }
+}
+
+/// Route the failure safety net for a continuation that could not be
+/// completed: best-effort `praxis update <bead> --state waiting_for
+/// --assignee user` with the failure reason, an explicit notice for the
+/// model/user, and a trace event. A pending continuation is never dropped
+/// silently. Mirrors `Agent::route_continuation_safety_net`.
+#[allow(clippy::too_many_arguments)]
+async fn route_continuation_safety_net(
+    continuation: &mut ContinuationDriver,
+    tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    observer: &dyn Observer,
+    receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
+    reason: &str,
+    trace_channel: &str,
+) -> String {
+    let pending_summary = continuation.pending_summary();
+    let bead_id = continuation.pending_bead_id();
+    let mut notice = format!(
+        "\u{26a0} A praxis execution continuation could not be completed \
+         ({pending_summary}): {reason}."
+    );
+    match &bead_id {
+        Some(bead) if tools_registry.iter().any(|t| t.name() == "shell") => {
+            let cmd = safety_net_command(bead, reason);
+            // Cancellation is intentionally NOT threaded here: the safety net
+            // is the response to a cancel/exhaustion and must still route the
+            // pending bead to waiting_for (spec §10.9) before yielding.
+            let outcome = execute_one_tool(
+                "shell",
+                serde_json::json!({ "command": cmd }),
+                Some(&Uuid::new_v4().to_string()),
+                tools_registry,
+                activated_tools,
+                observer,
+                None,
+                receipt_generator,
+            )
+            .await;
+            match outcome {
+                Ok(o) if o.success => {
+                    let _ = write!(
+                        notice,
+                        " Bead {bead} was routed to waiting_for (assignee: user) for manual \
+                         follow-up."
+                    );
+                }
+                Ok(o) => {
+                    let _ = write!(
+                        notice,
+                        " Safety-net routing of bead {bead} to waiting_for FAILED: {}.",
+                        truncate_with_ellipsis(&o.output, 300)
+                    );
+                }
+                Err(e) => {
+                    let _ = write!(
+                        notice,
+                        " Safety-net routing of bead {bead} to waiting_for FAILED: {e}."
+                    );
+                }
+            }
+        }
+        Some(bead) => {
+            let _ = write!(
+                notice,
+                " Bead {bead} requires manual routing (no shell tool available)."
+            );
+        }
+        None => {
+            notice.push_str(
+                " No bead id is associated with this continuation; the execution \
+                 requires manual attention.",
+            );
+        }
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Defer)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "event": "continuation_safety_net",
+                "channel": trace_channel,
+                "reason": reason,
+                "pending": pending_summary,
+                "bead": bead_id,
+            })),
+        "praxis continuation routed to failure safety net"
+    );
+    continuation.clear_pending();
+    notice
+}
+
+/// Turn-termination guard (rnk-h6g3): the model wants to end the turn while a
+/// praxis continuation is pending — the documented stall shape (traces
+/// f3246a74 / e54257b3). Refuse: drive call-kind continuations mechanically
+/// and force agent-work continuations back into the loop (bounded); route the
+/// waiting_for safety net on exhaustion. Mirrors
+/// `Agent::enforce_continuation_on_turn_end`.
+#[allow(clippy::too_many_arguments)]
+async fn enforce_continuation_on_turn_end(
+    continuation: &mut ContinuationDriver,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+    receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
+    final_text: &str,
+    turn_id: &str,
+    trace_channel: &str,
+    iteration: usize,
+) -> Result<ContinuationGuardOutcome> {
+    if !continuation.has_pending() {
+        return Ok(ContinuationGuardOutcome::NoPending);
+    }
+
+    // Keep the model's narration in history so the conversation stays coherent
+    // across the re-drive.
+    history.push(ChatMessage::assistant(final_text.to_string()));
+
+    drive_continuation_calls(
+        continuation,
+        history,
+        tools_registry,
+        activated_tools,
+        observer,
+        cancellation_token,
+        receipt_generator,
+        turn_id,
+        trace_channel,
+    )
+    .await?;
+
+    if !continuation.has_pending() {
+        // The runtime completed the chain (e.g. execute → verify → null) after
+        // the model already spoke; give it one fresh look so the final reply
+        // reflects reality.
+        history.push(ChatMessage::system(
+            "[NextAction auto-drive] The pending continuation chain was completed \
+             by the runtime. Review the results above and reply."
+                .to_string(),
+        ));
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "event": "continuation_stop_refused",
+                    "channel": trace_channel,
+                    "iteration": iteration + 1,
+                    "resolution": "auto_drive_completed",
+                })),
+            "continuation stop refused: auto-drive completed the chain"
+        );
+        return Ok(ContinuationGuardOutcome::Resume);
+    }
+
+    let can_redrive = matches!(
+        continuation.pending(),
+        Some(NextAction::AgentWorkThenCall { .. })
+    ) && continuation.try_redrive();
+    if can_redrive {
+        if let Some(directive) = continuation.forcing_directive() {
+            history.push(ChatMessage::system(directive));
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "event": "continuation_stop_refused",
+                    "channel": trace_channel,
+                    "iteration": iteration + 1,
+                    "resolution": "forced_redrive",
+                    "pending": continuation.pending_summary(),
+                })),
+            "continuation stop refused: forced re-drive"
+        );
+        return Ok(ContinuationGuardOutcome::Resume);
+    }
+
+    // Exhausted (agent-work re-drives or the drive budget): route the failure
+    // safety net, surface it, and only then allow the turn to end.
+    let notice = route_continuation_safety_net(
+        continuation,
+        tools_registry,
+        activated_tools,
+        observer,
+        receipt_generator,
+        "the agent repeatedly ended its turn without completing the continuation \
+         and the bounded re-drive budget is exhausted",
+        trace_channel,
+    )
+    .await;
+    history.push(ChatMessage::system(notice.clone()));
+    Ok(ContinuationGuardOutcome::Exhausted(notice))
+}
+
 /// Append a receipt footer to the response text if any receipts were collected.
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
@@ -1591,6 +1964,21 @@ pub async fn run_tool_call_loop(
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
+
+    // Pending praxis NextAction continuation (rnk-h6g3 / zc-n1mx). The turn
+    // must not end while a continuation is pending — this is the gateway/
+    // process_message mirror of the `Agent::turn` guard so `POST /api/chat`
+    // and the webhook enforce continuations too (spec §3.2).
+    let mut continuation = ContinuationDriver::new();
+    // Trace channel label for continuation events on this path.
+    let continuation_channel = "tool_loop";
+    // Scope note (spawn_subagent): the depth-capped `spawn_subagent`/`delegate`
+    // tools are ordinary entries in `tools_registry`, so their outputs already
+    // flow through `observe_tool_result` above like any other tool — a
+    // subagent re-emitting a praxis envelope updates THIS turn's driver
+    // uniformly. We deliberately do NOT open an independent continuation FSM
+    // inside a subagent's own loop: subagents are depth-1-capped and a nested
+    // execution walk is out of scope for the parent-turn guard (rnk-h6g3).
 
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -2385,6 +2773,63 @@ pub async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            // Cancel precedence (rnk-h6g3 / spec §3.2): a user cancel/steer
+            // WINS over the termination guard. Fire the §10.9 safety net on
+            // the pending bead (route to waiting_for/assignee=user) before
+            // yielding, so a mid-walk cancellation never silently abandons the
+            // execution DAG.
+            if continuation.has_pending()
+                && cancellation_token
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+            {
+                let _ = route_continuation_safety_net(
+                    &mut continuation,
+                    tools_registry,
+                    activated_tools,
+                    observer,
+                    receipt_generator,
+                    "the turn was cancelled while a praxis continuation was still pending",
+                    continuation_channel,
+                )
+                .await;
+                return Err(ToolLoopCancelled.into());
+            }
+
+            // Turn-termination guard (rnk-h6g3): the model wants to stop while
+            // a praxis continuation is pending. Refuse, drive/force, or route
+            // the safety net before allowing the turn to end.
+            match enforce_continuation_on_turn_end(
+                &mut continuation,
+                history,
+                tools_registry,
+                activated_tools,
+                observer,
+                cancellation_token.as_ref(),
+                receipt_generator,
+                &display_text,
+                &turn_id,
+                continuation_channel,
+                iteration,
+            )
+            .await?
+            {
+                ContinuationGuardOutcome::NoPending => {}
+                ContinuationGuardOutcome::Resume => continue,
+                ContinuationGuardOutcome::Exhausted(notice) => {
+                    // The model's narration + the notice are already in history
+                    // (pushed by the guard / safety net). Surface the notice in
+                    // the delivered reply and end the turn.
+                    let final_text = if display_text.is_empty() {
+                        notice
+                    } else {
+                        format!("{display_text}\n\n{notice}")
+                    };
+                    accumulated_display_text.push_str(&final_text);
+                    return Ok(accumulated_display_text);
+                }
+            }
+
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
@@ -2887,6 +3332,22 @@ pub async fn run_tool_call_loop(
             .enumerate()
             .filter_map(|(i, opt)| opt.map(|v| (i, v)))
         {
+            // Praxis envelopes update the pending NextAction continuation
+            // (rnk-h6g3); bare/non-praxis outputs are untouched. Observed on
+            // the full output, with args aligned by result_index.
+            {
+                let call_args = tool_calls
+                    .get(result_index)
+                    .map(|c| &c.arguments)
+                    .unwrap_or(&serde_json::Value::Null);
+                continuation.observe_tool_result(
+                    &tool_name,
+                    call_args,
+                    &outcome.output,
+                    outcome.success,
+                );
+            }
+
             if !loop_ignore_tools.contains(tool_name.as_str()) {
                 detection_relevant_output.push_str(&outcome.output);
 
@@ -3062,6 +3523,59 @@ pub async fn run_tool_call_loop(
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
         }
+
+        // ── NextAction auto-drive (rnk-h6g3) ──────────────────────────
+        // `kind:"call"` continuations are executed mechanically — zero model
+        // round-trips, no model cooperation required. A pending
+        // `agent_work_then_call` constrains the next model step via a forcing
+        // directive injected once per continuation.
+        drive_continuation_calls(
+            &mut continuation,
+            history,
+            tools_registry,
+            activated_tools,
+            observer,
+            cancellation_token.as_ref(),
+            receipt_generator,
+            &turn_id,
+            continuation_channel,
+        )
+        .await?;
+        if let Some(directive) = continuation.directive_to_inject() {
+            history.push(ChatMessage::system(directive));
+        }
+    }
+
+    // A continuation pending at iteration exhaustion is never dropped silently
+    // (rnk-h6g3): finish any mechanical call-kind chain (costs no model
+    // iterations), then route what remains to the failure safety net before
+    // the graceful-summary shutdown below.
+    if continuation.has_pending() {
+        drive_continuation_calls(
+            &mut continuation,
+            history,
+            tools_registry,
+            activated_tools,
+            observer,
+            cancellation_token.as_ref(),
+            receipt_generator,
+            &turn_id,
+            continuation_channel,
+        )
+        .await?;
+    }
+    if continuation.has_pending() {
+        let notice = route_continuation_safety_net(
+            &mut continuation,
+            tools_registry,
+            activated_tools,
+            observer,
+            receipt_generator,
+            "the agent hit its tool-iteration cap with the continuation still pending",
+            continuation_channel,
+        )
+        .await;
+        history.push(ChatMessage::system(notice));
     }
 
     ::zeroclaw_log::record!(
@@ -12922,5 +13436,584 @@ Let me check the result."#;
             after_deny.contains(&"file_read"),
             "non-excluded file_read must remain, got {after_deny:?}"
         );
+    }
+
+    // ── NextAction continuation auto-drive on the process_message path ─────
+    // (rnk-h6g3 / zc-n1mx). Mirror of the `agent.rs::continuation_auto_drive`
+    // contract tests onto `run_tool_call_loop` — the loop that
+    // `process_message → agent_turn` drives (spec §4.2 invariants 1–6):
+    //  1. call-chain driven with ZERO model round-trips,
+    //  2. agent_work_then_call re-driven up to MAX_AGENT_WORK_REDRIVES,
+    //  3. termination refused while a continuation is pending,
+    //  4. exhausted re-drives route the §10.9 waiting_for safety net,
+    //  5. cancel fires the safety net then yields (cancel precedence, §3.2),
+    //  6. bare-mode / unknown-kind output is fail-open (no auto-drive).
+    // Plus a verifier-failure-continuity case (spec §10.5): a failed-verifier
+    // `update` envelope still carrying the execute continuation is driven.
+    mod continuation_auto_drive {
+        use super::super::{ContinuationDriver, is_tool_loop_cancelled, run_tool_call_loop};
+        use crate::agent::continuation::MAX_AGENT_WORK_REDRIVES;
+        use crate::approval::ApprovalManager;
+        use crate::observability::NoopObserver;
+        use crate::tools::{Tool, ToolResult};
+        use async_trait::async_trait;
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_api::model_provider::ProviderCapabilities;
+        use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, ModelProvider, ToolCall};
+
+        /// Scripted native-tool provider recording every request's message
+        /// list, with an optional cancel-on-Nth-call hook for the cancel
+        /// precedence scenario. Mirrors agent.rs::ContinuationProvider.
+        struct ContinuationProvider {
+            responses: Mutex<VecDeque<ChatResponse>>,
+            requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+            cancel_on_call: Option<(usize, tokio_util::sync::CancellationToken)>,
+            call_count: AtomicUsize,
+        }
+
+        impl ContinuationProvider {
+            fn new(responses: Vec<ChatResponse>) -> Self {
+                Self {
+                    responses: Mutex::new(responses.into()),
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                    cancel_on_call: None,
+                    call_count: AtomicUsize::new(0),
+                }
+            }
+
+            fn with_cancel_on_call(
+                responses: Vec<ChatResponse>,
+                nth: usize,
+                token: tokio_util::sync::CancellationToken,
+            ) -> Self {
+                Self {
+                    responses: Mutex::new(responses.into()),
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                    cancel_on_call: Some((nth, token)),
+                    call_count: AtomicUsize::new(0),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for ContinuationProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    native_tool_calling: true,
+                    ..ProviderCapabilities::default()
+                }
+            }
+
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("not used")
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push(request.messages.to_vec());
+                if let Some((nth, token)) = &self.cancel_on_call
+                    && *nth == n
+                {
+                    token.cancel();
+                }
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .ok_or_else(|| anyhow::Error::msg("scripted provider exhausted responses"))
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for ContinuationProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "ContinuationProvider"
+            }
+        }
+
+        fn request_count(requests: &Arc<Mutex<Vec<Vec<ChatMessage>>>>) -> usize {
+            requests.lock().unwrap().len()
+        }
+
+        fn any_request_message_contains(
+            requests: &Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+            needle: &str,
+        ) -> bool {
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .any(|m| m.content.contains(needle))
+        }
+
+        /// Scripted `shell` mock: canned outputs matched by command substring
+        /// (first match wins), recording every command.
+        struct ScriptedShellTool {
+            scripts: Vec<(&'static str, String)>,
+            commands: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl ScriptedShellTool {
+            fn new(scripts: Vec<(&'static str, String)>) -> (Self, Arc<Mutex<Vec<String>>>) {
+                let commands = Arc::new(Mutex::new(Vec::new()));
+                (
+                    Self {
+                        scripts,
+                        commands: Arc::clone(&commands),
+                    },
+                    commands,
+                )
+            }
+        }
+
+        #[async_trait]
+        impl Tool for ScriptedShellTool {
+            fn name(&self) -> &str {
+                "shell"
+            }
+
+            fn description(&self) -> &str {
+                "Scripted shell mock for continuation tests"
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } },
+                    "required": ["command"]
+                })
+            }
+
+            async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                let command = args
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                self.commands.lock().unwrap().push(command.clone());
+                // A `--state waiting_for` (safety-net) or unmatched command
+                // returns success; scenario scripts cover the meaningful cases.
+                let output = self
+                    .scripts
+                    .iter()
+                    .find(|(needle, _)| command.contains(needle))
+                    .map(|(_, output)| output.clone())
+                    .unwrap_or_else(|| "ok".to_string());
+                Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                })
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for ScriptedShellTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Shell,
+                )
+            }
+            fn alias(&self) -> &str {
+                "shell"
+            }
+        }
+
+        fn envelope(next_action: serde_json::Value) -> String {
+            serde_json::json!({"data": {"ok": true}, "next_action": next_action}).to_string()
+        }
+
+        fn call_action(tool: &str, args: serde_json::Value) -> serde_json::Value {
+            serde_json::json!({"kind": "call", "tool": tool, "args": args})
+        }
+
+        fn agent_work_action(factory_id: &str, bead_id: &str) -> serde_json::Value {
+            serde_json::json!({
+                "kind": "agent_work_then_call",
+                "factory_id": factory_id,
+                "agent_hint": "summarize the emails",
+                "output_contract": {"summary": "<value>"},
+                "then": {
+                    "tool": "praxis update",
+                    "args_template": {
+                        "id": bead_id,
+                        "state": "done",
+                        "output": "<json-object matching output_contract>"
+                    }
+                }
+            })
+        }
+
+        fn shell_call(id: &str, command: &str) -> ChatResponse {
+            ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![ToolCall {
+                    id: id.to_string(),
+                    name: "shell".to_string(),
+                    arguments: serde_json::json!({ "command": command }).to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            }
+        }
+
+        fn text(content: &str) -> ChatResponse {
+            ChatResponse {
+                text: Some(content.to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            }
+        }
+
+        /// Drive one `run_tool_call_loop` turn with the given provider/shell
+        /// through the same argument shape `agent_turn` (and thus
+        /// `process_message`) uses.
+        #[allow(clippy::too_many_arguments)]
+        async fn run_loop(
+            provider: &ContinuationProvider,
+            shell: ScriptedShellTool,
+            cancellation_token: Option<tokio_util::sync::CancellationToken>,
+        ) -> anyhow::Result<String> {
+            let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(shell)];
+            let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                ..zeroclaw_config::schema::RiskProfileConfig::default()
+            };
+            let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
+            let observer = NoopObserver;
+            let mut history = vec![
+                ChatMessage::system("test-system"),
+                ChatMessage::user("walk the execution"),
+            ];
+            run_tool_call_loop(
+                provider,
+                &mut history,
+                &tools_registry,
+                &observer,
+                "mock-provider",
+                "mock-model",
+                Some(0.0),
+                true,
+                Some(&approval_mgr),
+                "daemon",
+                None,
+                &zeroclaw_config::schema::MultimodalConfig::default(),
+                12,
+                cancellation_token,
+                None,
+                None,
+                &[],
+                &[],
+                None,
+                None,
+                &zeroclaw_config::schema::PacingConfig::default(),
+                false,
+                false,
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        }
+
+        // Invariant 1 — call-chain driven with ZERO extra model steps.
+        #[tokio::test]
+        async fn call_kind_chain_is_driven_with_no_model_steps() {
+            let (shell, commands) = ScriptedShellTool::new(vec![
+                (
+                    "praxis update zc-a1",
+                    envelope(call_action(
+                        "praxis execute",
+                        serde_json::json!({"execution": "e1"}),
+                    )),
+                ),
+                (
+                    "praxis execute",
+                    envelope(call_action(
+                        "praxis verify",
+                        serde_json::json!({"execution": "e1"}),
+                    )),
+                ),
+                ("praxis verify", envelope(serde_json::Value::Null)),
+            ]);
+            let provider = ContinuationProvider::new(vec![
+                shell_call(
+                    "tc1",
+                    "praxis update zc-a1 --state done --output '{}' --json",
+                ),
+                text("walk complete"),
+            ]);
+            let requests = Arc::clone(&provider.requests);
+
+            let result = run_loop(&provider, shell, None)
+                .await
+                .expect("turn should succeed");
+
+            assert_eq!(result, "walk complete");
+            assert_eq!(
+                request_count(&requests),
+                2,
+                "call-kind continuations must not cost model round-trips"
+            );
+            let commands = commands.lock().unwrap();
+            assert_eq!(commands.len(), 3, "commands: {commands:?}");
+            assert_eq!(commands[1], "praxis execute --execution e1 --json");
+            assert_eq!(commands[2], "praxis verify --execution e1 --json");
+        }
+
+        // Invariant 3 — termination refused while pending; agent_work re-driven.
+        #[tokio::test]
+        async fn agent_work_stall_is_refused_and_redriven() {
+            let (shell, commands) = ScriptedShellTool::new(vec![
+                ("praxis execute", envelope(agent_work_action("f1", "zc-b1"))),
+                ("praxis update zc-b1", envelope(serde_json::Value::Null)),
+            ]);
+            let provider = ContinuationProvider::new(vec![
+                shell_call("tc1", "praxis execute --execution e1 --json"),
+                text("Full pipeline complete"), // stall
+                shell_call(
+                    "tc2",
+                    "praxis update zc-b1 --state done --output '{\"summary\":\"ok\"}' --json",
+                ),
+                text("actually done"),
+            ]);
+            let requests = Arc::clone(&provider.requests);
+
+            let result = run_loop(&provider, shell, None)
+                .await
+                .expect("turn should succeed");
+
+            assert_eq!(result, "actually done");
+            assert_eq!(
+                request_count(&requests),
+                4,
+                "the stall must not end the turn"
+            );
+            assert!(
+                any_request_message_contains(&requests, "[NextAction continuation — MANDATORY]"),
+                "forcing directive must be injected into the conversation"
+            );
+            let commands = commands.lock().unwrap();
+            assert!(
+                commands.iter().any(|c| c.contains("praxis update zc-b1")),
+                "then.tool must be invoked before the turn ends: {commands:?}"
+            );
+        }
+
+        // Invariant 2 + 4 — bounded re-drives exhaust to the waiting_for net.
+        #[tokio::test]
+        async fn bounded_redrives_exhaust_to_waiting_for_safety_net() {
+            let (shell, commands) = ScriptedShellTool::new(vec![
+                ("--state waiting_for", envelope(serde_json::Value::Null)),
+                ("praxis execute", envelope(agent_work_action("f1", "zc-c1"))),
+            ]);
+            let provider = ContinuationProvider::new(vec![
+                shell_call("tc1", "praxis execute --execution e1 --json"),
+                text("done!"),
+                text("done!"),
+                text("done!"),
+                text("done!"),
+            ]);
+            let requests = Arc::clone(&provider.requests);
+
+            let result = run_loop(&provider, shell, None)
+                .await
+                .expect("turn should succeed");
+
+            assert_eq!(
+                request_count(&requests),
+                2 + MAX_AGENT_WORK_REDRIVES,
+                "initial attempt + MAX_AGENT_WORK_REDRIVES re-drives + exhausted stop"
+            );
+            assert!(
+                result.contains("could not be completed"),
+                "failure must be surfaced: {result}"
+            );
+            let commands = commands.lock().unwrap();
+            assert!(
+                commands
+                    .iter()
+                    .any(|c| c.contains("praxis update zc-c1 --state waiting_for --assignee user")),
+                "bead must be routed to the failure safety net: {commands:?}"
+            );
+        }
+
+        // Invariant 5 — cancel precedence: safety net fires, then yields.
+        #[tokio::test]
+        async fn cancel_fires_safety_net_then_yields() {
+            let cancel_token = tokio_util::sync::CancellationToken::new();
+            let (shell, commands) = ScriptedShellTool::new(vec![
+                ("--state waiting_for", envelope(serde_json::Value::Null)),
+                ("praxis execute", envelope(agent_work_action("f1", "zc-d1"))),
+            ]);
+            let provider = ContinuationProvider::with_cancel_on_call(
+                vec![
+                    shell_call("tc1", "praxis execute --execution e1 --json"),
+                    // Cancels before returning; the loop-top cancel check on
+                    // the turn-end guard fires the safety net.
+                    text("stalling"),
+                ],
+                1,
+                cancel_token.clone(),
+            );
+
+            let err = run_loop(&provider, shell, Some(cancel_token))
+                .await
+                .expect_err("a cancelled turn must yield an error");
+
+            assert!(
+                is_tool_loop_cancelled(&err),
+                "cancel must yield the ToolLoopCancelled error: {err}"
+            );
+            let commands = commands.lock().unwrap();
+            assert!(
+                commands
+                    .iter()
+                    .any(|c| c.contains("praxis update zc-d1 --state waiting_for --assignee user")),
+                "the pending bead must be routed to the safety net before yielding: {commands:?}"
+            );
+        }
+
+        // Invariant 6 — bare-mode (no envelope) output is fail-open.
+        #[tokio::test]
+        async fn bare_mode_output_is_unaffected() {
+            let (shell, commands) =
+                ScriptedShellTool::new(vec![("praxis execute", r#"{"ready": []}"#.to_string())]);
+            let provider = ContinuationProvider::new(vec![
+                shell_call("tc1", "praxis execute --execution e1"),
+                text("done"),
+            ]);
+            let requests = Arc::clone(&provider.requests);
+
+            let result = run_loop(&provider, shell, None)
+                .await
+                .expect("turn should succeed");
+
+            assert_eq!(result, "done");
+            assert_eq!(request_count(&requests), 2);
+            assert_eq!(
+                commands.lock().unwrap().len(),
+                1,
+                "no auto-drive on bare-mode output"
+            );
+        }
+
+        // Invariant 6 — unknown `kind` is treated as terminal (fail-open),
+        // never wedges the turn open.
+        #[tokio::test]
+        async fn unknown_kind_is_fail_open() {
+            let (shell, commands) = ScriptedShellTool::new(vec![(
+                "praxis execute",
+                envelope(serde_json::json!({"kind": "teleport", "to": "mars"})),
+            )]);
+            let provider = ContinuationProvider::new(vec![
+                shell_call("tc1", "praxis execute --execution e1 --json"),
+                text("done"),
+            ]);
+            let requests = Arc::clone(&provider.requests);
+
+            let result = run_loop(&provider, shell, None)
+                .await
+                .expect("turn should succeed on an unknown continuation kind");
+
+            assert_eq!(result, "done");
+            assert_eq!(
+                request_count(&requests),
+                2,
+                "unknown kind must not re-drive"
+            );
+            let commands = commands.lock().unwrap();
+            assert!(
+                !commands.iter().any(|c| c.contains("--state waiting_for")),
+                "unknown-kind fail-open must not trigger the safety net: {commands:?}"
+            );
+        }
+
+        // Verifier-failure continuity (spec §10.5): a failed-verifier `update`
+        // envelope still carrying the execute continuation must be driven; the
+        // walk is never aborted on verifier failure. Here the model calls
+        // `praxis verify` (fails) which returns an `update`-continuation
+        // envelope; that update-call then re-emits `execute` → null. The chain
+        // completes mechanically.
+        #[tokio::test]
+        async fn verifier_failure_continuation_is_driven() {
+            let (shell, commands) = ScriptedShellTool::new(vec![
+                (
+                    "praxis verify",
+                    envelope(call_action(
+                        "praxis update",
+                        serde_json::json!({"id": "zc-f1", "state": "in_review"}),
+                    )),
+                ),
+                (
+                    "praxis update zc-f1",
+                    envelope(call_action(
+                        "praxis execute",
+                        serde_json::json!({"execution": "e1"}),
+                    )),
+                ),
+                ("praxis execute", envelope(serde_json::Value::Null)),
+            ]);
+            let provider = ContinuationProvider::new(vec![
+                shell_call("tc1", "praxis verify --execution e1 --json"),
+                text("walk complete"),
+            ]);
+            let requests = Arc::clone(&provider.requests);
+
+            let result = run_loop(&provider, shell, None)
+                .await
+                .expect("turn should succeed");
+
+            assert_eq!(result, "walk complete");
+            assert_eq!(
+                request_count(&requests),
+                2,
+                "the verifier-failure continuation must be driven with no extra model steps"
+            );
+            let commands = commands.lock().unwrap();
+            assert_eq!(commands.len(), 3, "commands: {commands:?}");
+            assert!(
+                commands[1].starts_with("praxis update zc-f1"),
+                "the update continuation must be driven after verifier failure: {commands:?}"
+            );
+            assert_eq!(commands[2], "praxis execute --execution e1 --json");
+            assert!(
+                !commands.iter().any(|c| c.contains("--state waiting_for")),
+                "a completed walk must not trip the safety net: {commands:?}"
+            );
+        }
+
+        // A `ContinuationDriver` constructed here confirms the loop path links
+        // against the shared FSM (compile-time guard against divergence).
+        #[test]
+        fn shares_the_continuation_driver_type() {
+            let driver = ContinuationDriver::new();
+            assert!(!driver.has_pending());
+        }
     }
 }
