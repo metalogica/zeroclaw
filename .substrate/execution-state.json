@@ -123,9 +123,28 @@
           "file/grep/yaml gates green per bead"
         ],
         "result": "green (non-code additions; Batch-A cargo re-gate @52547a243 with 8567 tests still covers all compiled code)"
+      },
+      {
+        "wave": "5-subwave1 (zc-ju48)",
+        "tip-sha": "core/v0.8.0@c5977885b",
+        "commands": [
+          "cargo build --all-targets --locked",
+          "cargo nextest run --workspace --locked",
+          "cargo nextest run -p zeroclaw-runtime --features observability-otel observability::otel",
+          "cargo clippy --all-targets -- -D warnings",
+          "cargo fmt -- --check (2 touched files)"
+        ],
+        "result": "green (build ok; workspace 8567/8567; otel feature-on 15/15 incl. shared_providers_are_single_instance regression test; clippy 0; fmt drift 0)",
+        "note": "Serialized from Fable's parallel plan: zc-ju48's Gate-2 rescope (6 observer sites, incl. daemon/mod.rs) collides with zc-e6t0 (daemon/mod.rs) + zc-n1mx (agent.rs/gateway), so ran solo first. Default gate.test under-covers otel tests (feature-gated off) — union re-gate added --features observability-otel to actually exercise the regression test."
       }
     ],
     "outcomes": {
+      "zc-ju48": {
+        "status": "pass",
+        "wave": "5-subwave1",
+        "commit": "c5977885b",
+        "note": "OnceLock-shared OTLP exporter + shutdown_shared_providers restored; all 7 sites funnel through OtelObserver::new (single factory, no per-site edits). Upstreaming candidate: ledger row stays PRIVATE (no FD-NN) until a PR URL exists. FOLLOW-UP: shutdown_shared_providers restored+re-exported but not yet wired to an exit-time drain caller (main.rs/CLI teardown, out of scope)."
+      },
       "zc-7c42": {
         "status": "pass",
         "wave": 1,
