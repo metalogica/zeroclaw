@@ -5150,6 +5150,16 @@ pub struct MultimodalConfig {
     /// Only used when `vision_model_provider` is set.
     #[serde(default)]
     pub vision_model: Option<String>,
+    /// Maximum number of audio attachments accepted per request.
+    ///
+    /// Caps the total number of `[AUDIO:...]` markers that survive into the
+    /// provider request after multimodal preprocessing. Older audio files are
+    /// dropped first when the cumulative count exceeds this limit.
+    #[serde(default = "default_multimodal_max_audio")]
+    pub max_audio_files: usize,
+    /// Maximum audio payload size in MiB before base64 encoding.
+    #[serde(default = "default_multimodal_max_audio_size_mb")]
+    pub max_audio_size_mb: usize,
 }
 
 fn default_multimodal_max_images() -> usize {
@@ -5160,12 +5170,27 @@ fn default_multimodal_max_image_size_mb() -> usize {
     5
 }
 
+fn default_multimodal_max_audio() -> usize {
+    2
+}
+
+fn default_multimodal_max_audio_size_mb() -> usize {
+    25
+}
+
 impl MultimodalConfig {
     /// Clamp configured values to safe runtime bounds.
     pub fn effective_limits(&self) -> (usize, usize) {
         let max_images = self.max_images.clamp(1, 16);
         let max_image_size_mb = self.max_image_size_mb.clamp(1, 20);
         (max_images, max_image_size_mb)
+    }
+
+    /// Clamp configured audio values to safe runtime bounds.
+    pub fn effective_audio_limits(&self) -> (usize, usize) {
+        let max_audio = self.max_audio_files.clamp(1, 8);
+        let max_audio_size_mb = self.max_audio_size_mb.clamp(1, 50);
+        (max_audio, max_audio_size_mb)
     }
 }
 
@@ -5178,6 +5203,8 @@ impl Default for MultimodalConfig {
             allow_remote_fetch: false,
             vision_model_provider: None,
             vision_model: None,
+            max_audio_files: default_multimodal_max_audio(),
+            max_audio_size_mb: default_multimodal_max_audio_size_mb(),
         }
     }
 }

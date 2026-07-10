@@ -12,6 +12,7 @@ use futures_util::stream;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use zeroclaw_api::identity::validate_pod_user_id;
 use zeroclaw_api::tool::ToolSpec;
 
 pub struct OpenRouterModelProvider {
@@ -27,6 +28,18 @@ pub struct OpenRouterModelProvider {
 pub(crate) const BASE_URL: &str = "https://openrouter.ai/api/v1";
 const OPENROUTER_CONNECT_TIMEOUT_SECS: u64 = 10;
 
+/// Read `CLAW_USER_ID` from the environment (set by the clawcraft K8s
+/// deployment) and validate its shape via the single-source pod-user-id
+/// validator in `zeroclaw-api`. Returns `None` when the env var is unset or
+/// malformed — callers treat `None` as "no user" and omit the `user` field
+/// entirely (absence-not-empty), never synthesizing a stand-in.
+fn detect_pod_user_id() -> Option<String> {
+    std::env::var("CLAW_USER_ID")
+        .ok()
+        .as_deref()
+        .and_then(validate_pod_user_id)
+}
+
 #[derive(Debug, Serialize)]
 struct ChatRequest {
     model: String,
@@ -35,6 +48,10 @@ struct ChatRequest {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// Stable per-pod user id forwarded to OpenRouter for attribution
+    /// (populated from `CLAW_USER_ID`; omitted when unset/malformed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -72,11 +89,20 @@ enum MessagePart {
     ImageUrl {
         image_url: ImageUrlPart,
     },
+    InputAudio {
+        input_audio: InputAudioPart,
+    },
 }
 
 #[derive(Debug, Serialize)]
 struct ImageUrlPart {
     url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InputAudioPart {
+    data: String,
+    format: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +134,10 @@ struct NativeChatRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    /// Stable per-pod user id forwarded to OpenRouter for attribution
+    /// (populated from `CLAW_USER_ID`; omitted when unset/malformed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,7 +151,11 @@ struct NativeMessage {
     tool_calls: Option<Vec<NativeToolCall>>,
     /// Raw reasoning content from thinking models; pass-through for model_providers
     /// that require it in assistant tool-call history messages.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// Accepts the field as either `reasoning_content` (legacy / older OpenRouter
+    /// responses) or `reasoning` (current OpenRouter responses) on deserialization.
+    /// Serializes as `reasoning_content` (alias does not affect Serialize).
+    #[serde(skip_serializing_if = "Option::is_none", alias = "reasoning")]
     reasoning_content: Option<String>,
 }
 
@@ -189,8 +223,11 @@ struct NativeChoice {
 struct NativeResponseMessage {
     #[serde(default)]
     content: Option<String>,
-    /// Reasoning/thinking models may return output in `reasoning_content`.
-    #[serde(default)]
+    /// Reasoning/thinking models may return output in `reasoning_content`
+    /// (legacy) or `reasoning` (current OpenRouter). The alias accepts both
+    /// so the agent's downstream reasoning surface stays populated as
+    /// OpenRouter's response schema evolves.
+    #[serde(default, alias = "reasoning")]
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<NativeToolCall>>,
@@ -339,11 +376,13 @@ impl OpenRouterModelProvider {
         }
 
         let (cleaned_text, image_refs) = multimodal::parse_image_markers(content);
-        if image_refs.is_empty() {
+        let (cleaned_text, audio_refs) = multimodal::parse_audio_markers(&cleaned_text);
+
+        if image_refs.is_empty() && audio_refs.is_empty() {
             return MessageContent::Text(content.to_string());
         }
 
-        let mut parts = Vec::with_capacity(image_refs.len() + 1);
+        let mut parts = Vec::with_capacity(image_refs.len() + audio_refs.len() + 1);
         let trimmed_text = cleaned_text.trim();
         if !trimmed_text.is_empty() {
             parts.push(MessagePart::Text {
@@ -356,6 +395,20 @@ impl OpenRouterModelProvider {
             parts.push(MessagePart::ImageUrl {
                 image_url: ImageUrlPart { url: image_ref },
             });
+        }
+
+        // Audio markers are embedded as [AUDIO:base64data|format] by
+        // `multimodal::prepare_messages_for_provider`. Parse the pipe-separated
+        // payload into an `input_audio` content part.
+        for audio_ref in audio_refs {
+            if let Some((data, format)) = audio_ref.split_once('|') {
+                parts.push(MessagePart::InputAudio {
+                    input_audio: InputAudioPart {
+                        data: data.to_string(),
+                        format: format.to_string(),
+                    },
+                });
+            }
         }
 
         MessageContent::Parts(parts)
@@ -576,6 +629,7 @@ impl ModelProvider for OpenRouterModelProvider {
             messages,
             temperature,
             max_tokens: self.max_tokens,
+            user: detect_pod_user_id(),
         };
 
         let body = self.merge_extra_body(&request)?;
@@ -648,6 +702,7 @@ impl ModelProvider for OpenRouterModelProvider {
             messages: api_messages,
             temperature,
             max_tokens: self.max_tokens,
+            user: detect_pod_user_id(),
         };
 
         let body = self.merge_extra_body(&request)?;
@@ -716,6 +771,7 @@ impl ModelProvider for OpenRouterModelProvider {
             tools,
             max_tokens: self.max_tokens,
             stream: None,
+            user: detect_pod_user_id(),
         };
 
         let body = self.merge_extra_body(&native_request)?;
@@ -811,6 +867,7 @@ impl ModelProvider for OpenRouterModelProvider {
             tools,
             max_tokens: self.max_tokens,
             stream: Some(true),
+            user: detect_pod_user_id(),
         };
 
         let payload = match serde_json::to_value(&native_request) {
@@ -942,6 +999,7 @@ impl ModelProvider for OpenRouterModelProvider {
             tools: native_tools,
             max_tokens: self.max_tokens,
             stream: None,
+            user: detect_pod_user_id(),
         };
 
         let body = self.merge_extra_body(&native_request)?;
@@ -1127,6 +1185,7 @@ mod tests {
             tool_choice: None,
             max_tokens: None,
             stream: Some(true),
+            user: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"stream\":true"));
@@ -1142,6 +1201,7 @@ mod tests {
             tool_choice: None,
             max_tokens: None,
             stream: None,
+            user: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("stream"));
@@ -1236,6 +1296,7 @@ mod tests {
             ],
             temperature: Some(0.5),
             max_tokens: None,
+            user: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1270,6 +1331,7 @@ mod tests {
                 .collect(),
             temperature: Some(0.0),
             max_tokens: None,
+            user: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1493,6 +1555,80 @@ mod tests {
         assert_eq!(parts[0]["text"], "Describe this");
         assert_eq!(parts[1]["type"], "image_url");
         assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,abcd");
+    }
+
+    #[test]
+    fn to_message_content_converts_audio_markers_to_input_audio() {
+        let content = "Transcribe this\n\n[AUDIO:dGVzdA==|webm]";
+        let value =
+            serde_json::to_value(OpenRouterModelProvider::to_message_content("user", content))
+                .unwrap();
+        let parts = value
+            .as_array()
+            .expect("multimodal content should be an array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "Transcribe this");
+        assert_eq!(parts[1]["type"], "input_audio");
+        assert_eq!(parts[1]["input_audio"]["data"], "dGVzdA==");
+        assert_eq!(parts[1]["input_audio"]["format"], "webm");
+    }
+
+    #[test]
+    fn to_message_content_mixed_image_and_audio() {
+        let content = "[IMAGE:data:image/png;base64,img]\n\n[AUDIO:aud|mp3]\n\nDescribe both";
+        let value =
+            serde_json::to_value(OpenRouterModelProvider::to_message_content("user", content))
+                .unwrap();
+        let parts = value
+            .as_array()
+            .expect("multimodal content should be an array");
+        assert_eq!(parts.len(), 3);
+        // Text part
+        assert_eq!(parts[0]["type"], "text");
+        assert!(parts[0]["text"].as_str().unwrap().contains("Describe both"));
+        // Image part
+        assert_eq!(parts[1]["type"], "image_url");
+        // Audio part
+        assert_eq!(parts[2]["type"], "input_audio");
+        assert_eq!(parts[2]["input_audio"]["format"], "mp3");
+    }
+
+    #[test]
+    fn to_message_content_audio_only_no_text() {
+        let content = "[AUDIO:dGVzdA==|wav]";
+        let value =
+            serde_json::to_value(OpenRouterModelProvider::to_message_content("user", content))
+                .unwrap();
+        let parts = value.as_array().expect("should be array");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "input_audio");
+    }
+
+    #[test]
+    fn to_message_content_ignores_audio_in_non_user_role() {
+        let content = "[AUDIO:dGVzdA==|wav]";
+        let value = serde_json::to_value(OpenRouterModelProvider::to_message_content(
+            "assistant",
+            content,
+        ))
+        .unwrap();
+        // Non-user messages are plain text, not parsed.
+        assert!(value.is_string());
+    }
+
+    #[test]
+    fn input_audio_serializes_correctly() {
+        let part = MessagePart::InputAudio {
+            input_audio: InputAudioPart {
+                data: "abc123".into(),
+                format: "mp3".into(),
+            },
+        };
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(json["type"], "input_audio");
+        assert_eq!(json["input_audio"]["data"], "abc123");
+        assert_eq!(json["input_audio"]["format"], "mp3");
     }
 
     #[test]
@@ -1753,6 +1889,28 @@ mod tests {
     }
 
     #[test]
+    fn native_response_deserializes_reasoning_alias() {
+        // Current OpenRouter responses use the `reasoning` key, not
+        // `reasoning_content`. Without the serde alias, this field silently
+        // deserializes to None and the downstream reasoning surface stays empty.
+        let json = r#"{
+            "choices":[{
+                "message":{
+                    "role":"assistant",
+                    "content":"17 * 23 = 391",
+                    "reasoning":"Let me compute step by step: 17 * 23 = 17*20 + 17*3 = 340 + 51 = 391."
+                }
+            }]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let message = &resp.choices[0].message;
+        assert_eq!(
+            message.reasoning_content.as_deref(),
+            Some("Let me compute step by step: 17 * 23 = 17*20 + 17*3 = 340 + 51 = 391.")
+        );
+    }
+
+    #[test]
     fn convert_messages_round_trips_reasoning_content() {
         let history_json = serde_json::json!({
             "content": "I will check",
@@ -1960,6 +2118,7 @@ mod tests {
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
+            user: None,
         };
 
         let base = serde_json::to_value(&request).unwrap();
@@ -1976,6 +2135,7 @@ mod tests {
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
+            user: None,
         };
 
         let base = serde_json::to_value(&request).unwrap();
@@ -1992,6 +2152,7 @@ mod tests {
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
+            user: None,
         };
 
         let merged = model_provider.merge_extra_body(&request).unwrap();
@@ -2013,6 +2174,7 @@ mod tests {
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
+            user: None,
         };
 
         let merged = model_provider.merge_extra_body(&request).unwrap();
@@ -2029,6 +2191,7 @@ mod tests {
             messages: vec![],
             temperature: Some(0.5),
             max_tokens: None,
+            user: None,
         };
 
         let merged = model_provider.merge_extra_body(&request).unwrap();
@@ -2053,6 +2216,7 @@ mod tests {
             tool_choice: None,
             max_tokens: None,
             stream: None,
+            user: None,
         };
 
         let merged = model_provider.merge_extra_body(&request).unwrap();
