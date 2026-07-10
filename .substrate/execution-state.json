@@ -57,7 +57,9 @@
       "GATE 2026-07-09: OTel-globals race extracted as P1 bug bead zc-ju48 (OnceLock + shutdown_shared_providers, 6 racing sites); zc-jfun blocked-by zc-ju48 (both edit otel.rs); zc-ju48 parallelizable with Wave 5, does not gate it. Upstreaming candidate.",
       "GATE 2026-07-10 (Fable, Decision 1): zc-jfun GO — single fleet worktree, 4-step plan CONFIRMED + 2 scope adjustments. Adj A: step-3 activation roots MUST also be minted at the run_tool_call_loop/process_message ingress owners (gateway/webhook/channels/CLI), not only rpc/turn.rs execute_turn (§7 root-span risk / FMEA #4 — prod front doors bypass execute_turn); step-4 mirrors+stamp_turn_exit at BOTH agent.rs turn* AND loop_.rs run_tool_call_loop sites. Adj B: port association-property guards verbatim (session_id None on /api/chat per claw §4.1; user_id gated on CLAW_USER_ID 32-char) — do NOT synthesize a session key. GATE: bead + union re-gate MUST add `cargo nextest run -p zeroclaw-runtime --features observability-otel` (default gate.test under-covers feature-gated otel). FD-07 = PRIVATE.",
       "GATE 2026-07-10 (Fable, Decision 2): bijection (a)-variant — squash-by-theme is a dedicated ORCHESTRATOR step (bead zc-hnah) run immediately after zc-jfun merges, BEFORE Wave 6, pulled OUT of zc-t0ii (so zc-4leb never ships red-by-design). Rewrite refs/heads/upstream..core/v0.8.0 into ~12 trailered theme commits; assert `git diff old..new` empty; refresh worktree. zc-ju48 kept as its own commit trailered Fork-Delta: FD-12 (new PRIVATE row, upstreaming-candidate note). MUST use refs/heads/upstream explicitly (ambiguous refname). zc-hnah blocks zc-4leb; zc-t0ii reduced to archive + post-exec notes + final bijection AUDIT.",
-      "GATE 2026-07-10 (Fable, Decision 3): zc-jfun runner stays plain-commit + defer — NO runner-authored trailer. Orchestrator lands the FD-07 row (private) at merge; the zc-hnah squash pass materializes the FD-07 trailer commit minutes later. One protocol for all runners, one history rewrite total."
+      "GATE 2026-07-10 (Fable, Decision 3): zc-jfun runner stays plain-commit + defer — NO runner-authored trailer. Orchestrator lands the FD-07 row (private) at merge; the zc-hnah squash pass materializes the FD-07 trailer commit minutes later. One protocol for all runners, one history rewrite total.",
+      "GATE 2026-07-10 (Fable amend, zc-hnah): Decision 2's `git diff old..new == empty` assertion was AMENDED (approved in-thread, HIL checkpoint) because folding ledger rows into theme commits forces a canonical re-sort of docs/FORK_DELTA.md — byte-identical-tree and one-atomic-commit-per-theme cannot both hold. Replaced by: (2) code-tree assert `git diff old..new -- ':!docs/FORK_DELTA.md'` == empty (PASS — compiled tree provably unchanged, no re-gate needed); (3) ledger set-equality — existing rows byte-identical, only re-sorted (PASS); (4) local bijection dry-run over refs/heads/upstream..HEAD (PASS, 11 commits ⇄ 11 rows). Pre-tag `archive/pre-hnah-squash` = e9201a7c1 (one-command rollback).",
+      "GATE 2026-07-10 (Fable amend, zc-hnah): FD-08 ledger row was DISCOVERED MISSING during the squash (code landed via zc-ul1f 2e30b156c + zc-qskr 7d00334b3 but the row was deferred to zc-t0ii under the old plan). Since zc-hnah IS the bijection-reconciliation step, the FD-08 row was authored + landed here (private, zeroclaw-providers/zeroclaw-config) so the trailer↔row bijection holds. This is the sole ADD to the ledger row-set (assert 3 confirms all other rows byte-identical)."
     ],
     "re-gates": [
       {
@@ -161,6 +163,29 @@
         ],
         "result": "green (docs-only; zero Rust added — last cargo union re-gate @ace744dc7 with 8575 tests still covers all compiled code; webhook_only_config_is_supervised passes)",
         "note": "FD-04/05/06 CODE already landed (zc-2sw0/zc-qwhe/zc-nvqs); zc-e6t0 reduced to FD-04+FD-05 ledger rows (FD-06 present) + drop records. Webhook-supervision covered by existing daemon/mod.rs:1641 test (spec §4.2 no-new-code path) — referenced in FD-04 row. Drops a0d1a8fbd (SYSTEM_DIR) + c276ffe6a recorded in spec post-execution notes."
+      },
+      {
+        "wave": "5-jfun-window (zc-jfun Laminar re-home)",
+        "tip-sha": "core/v0.8.0@d1db0c8fd (pre-squash)",
+        "commands": [
+          "cargo build --all-targets --locked",
+          "cargo nextest run -p zeroclaw-runtime --features observability-otel",
+          "cargo clippy --all-targets -- -D warnings"
+        ],
+        "result": "green (build ok 1m24s; otel-feature 2148 passed/1 skipped incl. 14 new span-production tests; clippy clean). Runner's own gate additionally ran workspace nextest 8585 passed on the byte-identical ff tip. fmt drift 0.",
+        "note": "Fable Decision 1 gate: added -p zeroclaw-runtime --features observability-otel (default gate.test has otel feature OFF, under-covers). ff-merge means integrated tip == runner-gated tip; independent re-gate ran the load-bearing subset."
+      },
+      {
+        "wave": "5-squash (zc-hnah)",
+        "tip-sha": "core/v0.8.0@05ce4c459 (post-squash)",
+        "commands": [
+          "git diff e9201a7c1 05ce4c459 -- ':!docs/FORK_DELTA.md'  (assert 2: empty)",
+          "ledger set-equality  (assert 3: existing rows byte-identical, FD-08 sole add)",
+          "bijection dry-run over refs/heads/upstream..HEAD  (assert 4: 11 commits ⇄ 11 rows)",
+          "cargo build --all-targets --locked  (belt, warm)"
+        ],
+        "result": "green (assert 2/3/4 PASS; belt build 1.52s — code tree provably unchanged, no full re-gate needed per Fable amend)",
+        "note": "History rewrite; compiled tree identical to the already-green d1db0c8fd/e9201a7c1 lineage."
       }
     ],
     "outcomes": {
@@ -290,11 +315,18 @@
         "note": "merged; hotswap seeded+re-pointed; docker :dev OUT-OF-BAND (NPM_TOKEN)"
       },
       "zc-jfun": {
-        "status": "ready-dispatching",
+        "status": "pass",
         "wave": "5-jfun-window",
         "batch": null,
-        "commit": null,
-        "note": "2026-07-10 Fable GO (Decision 1): scope-gap RESOLVED \u2014 dispatching a single fleet worktree off core/v0.8.0@ac3b2df27 with the 4-step plan + Adj A (root-span at run_tool_call_loop/process_message ingress owners, not only execute_turn) + Adj B (port association-property guards verbatim). Bead gate + union re-gate include `cargo nextest run -p zeroclaw-runtime --features observability-otel`. Plain commit (Decision 3); orchestrator lands FD-07 row (private) at merge; zc-hnah squash materializes the trailer. Blocks zc-b78l (manual battery)."
+        "commit": "d1db0c8fd (pre-squash window tip; folded into FD-07 theme commit 05ce4c459 by zc-hnah)",
+        "fork-delta": "FD-07 (row landed @e9201a7c1, trailer materialized in squash)",
+        "note": "2026-07-10 Fable GO (Decision 1) DONE. Runner (bead-implementer) implemented the 4-step Laminar re-home across zeroclaw-api + zeroclaw-runtime(observability/otel.rs,agent.rs,loop_.rs) + zeroclaw-gateway + zeroclaw-channels, 3 plain commits (e60a01ee4/6f8d0e735/d1db0c8fd). Adj A satisfied: activation roots minted at execute_turn AND run_tool_call_loop/process_message ingress owners (gateway run_gateway_chat_with_tools, channels orchestrator+42618 webhook one shared call site, CLI run); mirrors+stamp_turn_exit at BOTH agent.rs turn/turn_streamed AND loop_.rs. Adj B satisfied: session_id absence-not-empty (None on /api/chat, never synthesized), user_id via CLAW_USER_ID 32-char validator; scrub+truncate once/site; tool-call-only summaries. Deviations (accepted): deployment.environment sourced from env (v0.8.0 config lacks the field \u2014 zc-t0ii follow-up); stack-overflow regression on the oversized orchestrator loop future fixed via Box::pin. ff-merged; union re-gate @d1db0c8fd green. Blocks zc-b78l (manual live battery)."
+      },
+      "zc-hnah": {
+        "status": "pass",
+        "wave": "5-squash (orchestrator single-writer, pre-Wave-6)",
+        "commit": "05ce4c459 (new core/v0.8.0 tip)",
+        "note": "Squash-by-theme (Fable Decision 2, (a)-variant, amended asserts). Rewrote refs/heads/upstream(5fc9d3c38)..core/v0.8.0 from 37 commits (26 content + 11 merges) into 11 dependency-ordered theme commits, each atomic with its ledger row + Fork-Delta: FD-NN trailer. Order [00,01,02,03,04,06,05,08,11,12,07] preserves shared-file relative order (gateway 04\u219206\u219205\u219207, otel 12\u219207, agent 03\u219207). zc-ju48 kept as its OWN FD-12 commit (bf19bd7d1, upstreaming-candidate). FD-08 row authored+landed (was deferred). Asserts 2/3/4 PASS; belt build 1.52s warm. Pre-tag archive/pre-hnah-squash=e9201a7c1. zc-4leb now validates its bijection against this squashed tree."
       }
     },
     "notes": "Upstream advanced to v0.8.1/v0.8.2 during Wave 1; base held at v0.8.0 per locked spec decision. Continuation STOP-check negative.",

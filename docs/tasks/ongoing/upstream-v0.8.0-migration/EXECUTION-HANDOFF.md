@@ -41,7 +41,7 @@ Upstream advanced to **v0.8.1 / v0.8.2** during the run (continuation STOP-check
 | **zc-n6so** | **open** | 81bbc3a | FD-01 |
 | **zc-8zdt** | **open** | 688424 | FD-02 |
 
-**FD ledger landed:** FD-00, 01, 02, 06, 11. **Deferred** (land at theme-completion beads): FD-03 (zc-n1mx), FD-04/05 (zc-e6t0), FD-07 (zc-jfun), FD-08 (finalization / zc-t0ii).
+**FD ledger — ALL rows landed + bijection green (post zc-hnah squash @`05ce4c459`):** FD-00,01,02,03,04,05,06,07,08,11,12 — 11 rows ⇄ 11 trailered theme commits. (FD-08 authored during the squash; FD-12 = zc-ju48 OTel OnceLock, upstreaming-candidate.) No deferred rows remain.
 
 ## Out-of-band (merged but OPEN — need `NPM_TOKEN` for the private praxis npm package)
 
@@ -95,6 +95,13 @@ Wave 6 (zc-vja9, zc-4leb, zc-p7tx) → zc-b78l (manual) → zc-t0ii → zc-garf.
 **Decision 3 — zc-jfun trailer:** runner stays **plain-commit + defer**. Orchestrator lands the FD-07 row (private) at merge; the `zc-hnah` squash materializes the trailer commit minutes later. One protocol for all runners, one history rewrite total.
 
 > **RESUME SEQUENCE (Fable):** zc-jfun window → merge + union re-gate (incl. `--features observability-otel`) + land FD-07 row (private) + FD-12 row (zc-ju48) → **zc-hnah squash-by-theme** → Wave 6 (zc-vja9, zc-4leb, zc-p7tx; post-squash commits carry trailers at commit time) → zc-b78l manual battery (batch with the zc-n6so/zc-8zdt NPM_TOKEN docker smokes) → zc-t0ii (reduced) → zc-garf doctrine review.
+
+> **SESSION UPDATE 2026-07-10b — zc-jfun + zc-hnah DONE; sovereign tip now `core/v0.8.0` @ `05ce4c459`.**
+> - **zc-jfun (FD-07, Laminar re-home)** implemented by a bead-implementer worktree runner (3 plain commits), Adj A + Adj B satisfied, ff-merged; union re-gate @`d1db0c8fd` green (build + otel-feature nextest 2148 + clippy; runner also ran workspace nextest 8585). FD-07 + FD-12 (zc-ju48) rows landed. Runner notes: `deployment.environment` sourced from env (v0.8.0 config lacks the field — zc-t0ii follow-up); a stack-overflow regression on the oversized orchestrator loop future was fixed with `Box::pin`.
+> - **zc-hnah squash-by-theme** rewrote `refs/heads/upstream(5fc9d3c38)..core/v0.8.0` → **11 dependency-ordered theme commits**, each atomic with its ledger row + `Fork-Delta: FD-NN` trailer. Per Fable's amended verification: code-tree assert (`git diff old..new -- ':!docs/FORK_DELTA.md'`) EMPTY, ledger set-equality PASS, bijection dry-run PASS (11⇄11), belt build 1.52s. Rollback tag `archive/pre-hnah-squash` = `e9201a7c1`.
+> - **FD-08 row** (openrouter `user`/`[AUDIO:]` + provider verdicts, zc-ul1f/zc-qskr) was found MISSING (deferred at wave time) and authored+landed during the squash so the bijection holds — the sole ledger row-set addition.
+> - **Empty-diff assertion amendment** (code-tree-identical + ledger-set-equality) approved by Fable in-thread; recorded in `.substrate/execution-state.json` deviations as the audit trail.
+> - **NEXT: Wave 6** — `zc-vja9` (coldstart harness), `zc-4leb` (bijection CI — now validates GREEN against this squashed tree; use `refs/heads/upstream`), `zc-p7tx` (canary). All Wave-6+ commits carry their `Fork-Delta:` trailer at commit time (no further squash). **Paused here for user checkpoint before Wave 6.** Signing stays disabled until epic close.
 
 ## Remaining waves (resume order)
 
