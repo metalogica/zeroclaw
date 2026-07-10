@@ -7,7 +7,55 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+
+/// Process-wide OTLP providers, built once and shared by every component's
+/// `OtelObserver`. Multiple subsystems (daemon, gateway, channels, agent loop,
+/// heartbeat, SSE, …) each construct an observer via
+/// [`super::create_observer`], but they all run in one process with one
+/// `[observability]` config — so they share a single TracerProvider +
+/// MeterProvider (and therefore one OTLP exporter) rather than spinning up N
+/// exporters and re-installing the OpenTelemetry globals N times. The N-exporter
+/// path races `global::set_tracer_provider`/`set_meter_provider`, dropping or
+/// duplicating exporters and leaking providers. First caller wins (builds the
+/// exporters, installs the globals, logs); components initialize sequentially
+/// at startup, so the slot is effectively uncontended.
+static OTEL_PROVIDERS: OnceLock<(SdkTracerProvider, SdkMeterProvider)> = OnceLock::new();
+
+/// Terminally shut down the process-wide OTLP providers, if they were built.
+///
+/// Ends and drains the batch span/metric processors and **blocks** until export
+/// completes (or the SDK's internal timeout). Unlike [`OtelObserver::flush`],
+/// which `force_flush`es but only ships spans that have already ended, this is
+/// the right call on process exit: a short-lived one-shot (`zeroclaw agent -m …`)
+/// would otherwise terminate before the batch processor's periodic tick, and a
+/// bare `force_flush` does not reliably drain on a tearing-down runtime.
+///
+/// No-op when no OTel backend was ever initialized (the shared slot is empty).
+/// **Terminal** — the providers are unusable afterward, so only call when the
+/// process is actually exiting (never from the daemon/gateway/cron mid-life).
+pub fn shutdown_shared_providers() {
+    if let Some((tracer_provider, meter_provider)) = OTEL_PROVIDERS.get() {
+        if let Err(e) = tracer_provider.shutdown() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "OTel trace shutdown failed"
+            );
+        }
+        if let Err(e) = meter_provider.shutdown() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "OTel metric shutdown failed"
+            );
+        }
+    }
+}
 
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
 pub struct OtelObserver {
@@ -48,53 +96,69 @@ impl OtelObserver {
         let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
         let service_name = service_name.unwrap_or("zeroclaw");
 
-        // ── Trace exporter ──────────────────────────────────────
-        let mut span_builder = opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_endpoint(&traces_endpoint);
-        if let Some(ref h) = headers {
-            span_builder = span_builder.with_headers(h.clone());
-        }
-        let span_exporter = span_builder
-            .build()
-            .map_err(|e| format!("Failed to create OTLP span exporter: {e}"))?;
+        // ── Trace + metric providers (built once per process) ───
+        // Reuse the shared providers if another component already initialized
+        // them; otherwise build the OTLP exporters, install the globals, and
+        // publish to the shared slot. Instruments below always bind to the
+        // global meter, so every observer records into the same pipeline. This
+        // guards against the six construction sites each building their own
+        // exporter and racing `global::set_*_provider`.
+        let (tracer_provider, meter_provider_clone) = match OTEL_PROVIDERS.get() {
+            Some(providers) => providers.clone(),
+            None => {
+                // ── Trace exporter ──────────────────────────────
+                let mut span_builder = opentelemetry_otlp::SpanExporter::builder()
+                    .with_http()
+                    .with_endpoint(&traces_endpoint);
+                if let Some(ref h) = headers {
+                    span_builder = span_builder.with_headers(h.clone());
+                }
+                let span_exporter = span_builder
+                    .build()
+                    .map_err(|e| format!("Failed to create OTLP span exporter: {e}"))?;
 
-        let tracer_provider = SdkTracerProvider::builder()
-            .with_batch_exporter(span_exporter)
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name(service_name.to_string())
-                    .build(),
-            )
-            .build();
+                let tracer_provider = SdkTracerProvider::builder()
+                    .with_batch_exporter(span_exporter)
+                    .with_resource(
+                        opentelemetry_sdk::Resource::builder()
+                            .with_service_name(service_name.to_string())
+                            .build(),
+                    )
+                    .build();
 
-        global::set_tracer_provider(tracer_provider.clone());
+                // ── Metric exporter ─────────────────────────────
+                let mut metric_builder = opentelemetry_otlp::MetricExporter::builder()
+                    .with_http()
+                    .with_endpoint(&metrics_endpoint);
+                if let Some(ref h) = headers {
+                    metric_builder = metric_builder.with_headers(h.clone());
+                }
+                let metric_exporter = metric_builder
+                    .build()
+                    .map_err(|e| format!("Failed to create OTLP metric exporter: {e}"))?;
 
-        // ── Metric exporter ─────────────────────────────────────
-        let mut metric_builder = opentelemetry_otlp::MetricExporter::builder()
-            .with_http()
-            .with_endpoint(&metrics_endpoint);
-        if let Some(ref h) = headers {
-            metric_builder = metric_builder.with_headers(h.clone());
-        }
-        let metric_exporter = metric_builder
-            .build()
-            .map_err(|e| format!("Failed to create OTLP metric exporter: {e}"))?;
+                let metric_reader =
+                    opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
 
-        let metric_reader =
-            opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
+                let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+                    .with_reader(metric_reader)
+                    .with_resource(
+                        opentelemetry_sdk::Resource::builder()
+                            .with_service_name(service_name.to_string())
+                            .build(),
+                    )
+                    .build();
 
-        let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-            .with_reader(metric_reader)
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name(service_name.to_string())
-                    .build(),
-            )
-            .build();
+                global::set_tracer_provider(tracer_provider.clone());
+                global::set_meter_provider(meter_provider.clone());
 
-        let meter_provider_clone = meter_provider.clone();
-        global::set_meter_provider(meter_provider);
+                let pair = (tracer_provider, meter_provider);
+                // Publish for later components; if a concurrent caller won the
+                // race, keep the winner's providers for consistency.
+                let _ = OTEL_PROVIDERS.set(pair.clone());
+                OTEL_PROVIDERS.get().cloned().unwrap_or(pair)
+            }
+        };
 
         // ── Create metric instruments ────────────────────────────
         let meter = global::meter("zeroclaw");
@@ -925,6 +989,39 @@ mod tests {
             agent_alias: None,
             turn_id: None,
         });
+    }
+
+    /// Regression test for zc-ju48 — the process-wide OTLP providers must be
+    /// built exactly once and shared across every construction site. Two
+    /// separate `OtelObserver::new` calls (as the six/seven real sites do) must
+    /// resolve to the *same* provider instance: the second call reuses the
+    /// `OnceLock` slot instead of re-initializing the OpenTelemetry globals and
+    /// racing a second exporter into `global::set_*_provider`.
+    #[test]
+    fn shared_providers_are_single_instance_across_two_constructions() {
+        // First construction populates the shared slot.
+        let _first = OtelObserver::new(Some("http://127.0.0.1:12345"), Some("zeroclaw-a"), None)
+            .expect("first observer creation should succeed");
+        let after_first = OTEL_PROVIDERS
+            .get()
+            .expect("first construction must publish the shared providers");
+
+        // Second construction (a different service name / call site) must NOT
+        // rebuild the providers — it reuses the same OnceLock value.
+        let _second = OtelObserver::new(Some("http://127.0.0.1:12345"), Some("zeroclaw-b"), None)
+            .expect("second observer creation should succeed");
+        let after_second = OTEL_PROVIDERS
+            .get()
+            .expect("providers must still be present after the second construction");
+
+        // The OnceLock yields a single `&'static` value; both reads point at the
+        // exact same stored provider tuple — proof the second call did not
+        // re-init the globals or spin up a second exporter.
+        assert!(
+            std::ptr::eq(after_first, after_second),
+            "OTEL_PROVIDERS must hold a single shared provider instance across \
+             two construction calls (second call re-initialized the exporter)"
+        );
     }
 
     #[test]

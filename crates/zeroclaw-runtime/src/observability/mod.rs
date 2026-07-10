@@ -17,6 +17,12 @@ pub use self::multi::MultiObserver;
 pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
+// Terminal drain of the process-wide OTLP providers on exit. Wiring into CLI
+// teardown paths is a downstream concern; re-exported here so exit handlers can
+// reach it as `observability::shutdown_shared_providers()`.
+#[cfg(feature = "observability-otel")]
+#[allow(unused_imports)]
+pub use otel::shutdown_shared_providers;
 #[cfg(feature = "observability-prometheus")]
 pub use prometheus::PrometheusObserver;
 pub use traits::{Observer, ObserverEvent};
