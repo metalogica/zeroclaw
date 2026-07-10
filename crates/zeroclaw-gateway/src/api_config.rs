@@ -2330,9 +2330,11 @@ mod tests {
         // Secrets under `[gateway]` that are OPERATOR-EDITED (not gateway-
         // managed). Add the field's prop-field name here only if the gateway
         // does NOT mint/rotate/persist it itself, so legitimate drift between
-        // disk and memory IS surfaceable. Empty for now — `paired_tokens` is
-        // the only `[gateway]` secret and it's gateway-managed.
-        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] = &[];
+        // disk and memory IS surfaceable. `pre_shared_token` is rendered into
+        // config.toml by the operator/clawcraft and only READ by the gateway
+        // (hashed into the PairingGuard token list on load) — never minted or
+        // rotated here — so it is operator-edited, not gateway-managed.
+        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] = &["gateway.pre_shared_token"];
 
         let cfg = zeroclaw_config::schema::Config::default();
         let unclassified: Vec<String> = cfg

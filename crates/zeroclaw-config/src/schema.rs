@@ -5657,6 +5657,18 @@ pub struct GatewayConfig {
     #[serde(default = "default_true")]
     pub session_persistence: bool,
 
+    /// Pre-shared bearer token — skips the pairing dance for headless
+    /// deployments. When set, it is injected into the gateway's accepted
+    /// token list alongside `paired_tokens`, so a caller presenting it is
+    /// authenticated without going through `/pair`. Fork-extra field carried
+    /// forward from `archive/0.6.9-alpha-p10.7:src/gateway/mod.rs`; the pod
+    /// runtime (clawcraft) renders it into `[gateway] pre_shared_token`.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub pre_shared_token: Option<String>,
+
     /// Auto-archive stale gateway sessions older than N hours. 0 = disabled. Default: 0.
     #[serde(default)]
     pub session_ttl_hours: u32,
@@ -5752,6 +5764,7 @@ impl Default for GatewayConfig {
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             session_persistence: true,
+            pre_shared_token: None,
             session_ttl_hours: 0,
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
@@ -9359,7 +9372,7 @@ pub struct ObservabilityConfig {
     /// [observability.otel_headers]
     /// Authorization = "Bearer sk-..."
     /// ```
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_otel_headers")]
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub otel_headers: Option<std::collections::HashMap<String, String>>,
@@ -9417,6 +9430,74 @@ impl Default for ObservabilityConfig {
             log_tool_io: default_log_tool_io(),
             log_tool_io_truncate_bytes: default_log_tool_io_truncate_bytes(),
             log_tool_io_denylist: Vec::new(),
+        }
+    }
+}
+
+/// Deserialize `otel_headers` from EITHER a map form or a string form.
+///
+/// - **Map form** (upstream / native TOML):
+///   ```toml
+///   [observability.otel_headers]
+///   Authorization = "Bearer sk-..."
+///   ```
+/// - **String form** (clawcraft-rendered, fork-extra): a single inline value
+///   `"k=v[,k=v]"`, e.g. `otel_headers = "Authorization=Bearer sk-..."`.
+///   Each comma-separated pair is split on the **FIRST `=` only** so header
+///   values may themselves contain `=` and spaces (e.g. `Bearer <b64...==>`).
+///   An **empty string** (after trimming) deserializes to `None`.
+///
+/// Both forms are optional; an absent key stays `None` via `#[serde(default)]`.
+fn deserialize_otel_headers<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OtelHeaders {
+        Str(String),
+        Map(HashMap<String, String>),
+    }
+
+    match Option::<OtelHeaders>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(OtelHeaders::Map(map)) => Ok(Some(map)),
+        Some(OtelHeaders::Str(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            let mut map = HashMap::new();
+            for pair in trimmed.split(',') {
+                let pair = pair.trim();
+                if pair.is_empty() {
+                    continue;
+                }
+                // Split on the FIRST `=` only: the value may contain `=`
+                // (e.g. base64 padding) and spaces (e.g. `Bearer <token>`).
+                let (key, value) = match pair.split_once('=') {
+                    Some((k, v)) => (k.trim(), v.trim()),
+                    None => {
+                        return Err(serde::de::Error::custom(format!(
+                            "otel_headers string entry {pair:?} is missing a '=' separator; \
+                             expected \"key=value[,key=value]\""
+                        )));
+                    }
+                };
+                if key.is_empty() {
+                    return Err(serde::de::Error::custom(format!(
+                        "otel_headers string entry {pair:?} has an empty header name"
+                    )));
+                }
+                map.insert(key.to_string(), value.to_string());
+            }
+            if map.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(map))
+            }
         }
     }
 }
@@ -21132,6 +21213,212 @@ allowed_numbers = ["+1", "+2"]
         );
     }
 
+    /// Golden test: clawcraft's pod-runtime `buildConfigToml` renders a
+    /// verbatim `config.toml` (see
+    /// `soulbound-labs/clawcraft/apps/clawcraft/domain/claw-config.ts`).
+    /// This fixture reproduces the exact rendered shape for an OTel-enabled
+    /// pod — `[gateway] pre_shared_token`, legacy `[autonomy]`,
+    /// `[observability]` with a **string** `otel_headers` + the fork-extra
+    /// `otel_deployment_environment` / `runtime_trace_*` keys, and
+    /// `[channels_config.webhook]` — and asserts the fork schema parses +
+    /// auto-migrates it correctly.
+    ///
+    /// What this pins:
+    ///  - `[gateway] pre_shared_token` deserializes (fork-extra field, zc-2sw0).
+    ///  - `otel_headers = "Authorization=Bearer <key>"` string form is split
+    ///    on the FIRST `=` only, so the `Bearer <key>` value (with `=` and
+    ///    spaces) survives intact — and `backend = "otel"` is selected.
+    ///  - The fork-extra observability keys (`otel_deployment_environment`,
+    ///    `runtime_trace_mode`, `runtime_trace_max_entries`) parse without a
+    ///    `deny_unknown_fields` rejection (the aliased ones map onto
+    ///    `log_persistence*`, the unmodeled one is tolerated).
+    ///  - Legacy flat `[autonomy]` migrates into `risk_profiles.default` with
+    ///    the rendered permissive posture (`level = full`, medium-risk
+    ///    approval off, high-risk block off).
+    ///  - Flat `[channels_config.webhook]` alias-wraps into `webhook.default`
+    ///    with `enabled` / `port` / `send_url` intact.
+    #[test]
+    async fn golden_clawcraft_rendered_config_parses_and_migrates() {
+        // Reproduces clawcraft `buildConfigToml` output for an OTel-enabled,
+        // full-tool-policy pod. Header value intentionally carries a trailing
+        // `==` (base64 padding) and an interior space to exercise the
+        // first-`=`-split rule.
+        let raw = r#"
+api_key = "sk-or-test-key"
+default_provider = "openrouter"
+default_model = "google/gemini-3.1-pro-preview"
+default_temperature = 0.3
+
+[gateway]
+port = 42617
+host = "0.0.0.0"
+pre_shared_token = "zc_psk_abcdef123456"
+allow_public_bind = true
+request_timeout_secs = 300
+
+[autonomy]
+level = "full"
+workspace_only = true
+max_actions_per_hour = 100
+max_cost_per_day_cents = 500
+require_approval_for_medium_risk = false
+block_high_risk_commands = false
+shell_timeout_secs = 60
+allowed_commands = ["ls", "cat", "echo", "pwd", "head", "tail", "base64", "jq", "cp", "link-cli", "praxis", "git"]
+forbidden_paths = ["/etc", "/var", "/root", "/home", "/proc", "/sys"]
+non_cli_excluded_tools = []
+auto_approve = ["file_read", "memory_recall", "web_search_tool", "web_fetch", "shell", "http_request"]
+
+[coordination]
+enabled = true
+
+[observability]
+backend = "otel"
+otel_endpoint = "http://host.docker.internal:8000"
+otel_service_name = "zeroclaw"
+otel_headers = "Authorization=Bearer proj-key-eyJ0eXAiOiJ==, x-scope=laminar prod"
+otel_deployment_environment = "dev"
+runtime_trace_mode = "rolling"
+runtime_trace_max_entries = 500
+
+[security.audit]
+enabled = true
+log_path = "audit.log"
+
+[security.otp]
+enabled = false
+
+[identity]
+format = "openclaw"
+
+[channels_config]
+cli = true
+message_timeout_secs = 300
+
+[channels_config.webhook]
+enabled = true
+port = 8081
+send_url = "https://example.convex.site/container-webhook"
+auth_header = "Bearer zc_psk_abcdef123456"
+"#;
+
+        let parsed = crate::migration::migrate_to_current(raw)
+            .expect("clawcraft-rendered config must parse + migrate");
+
+        // ── [gateway] pre_shared_token intact ──────────────────────────
+        assert_eq!(
+            parsed.gateway.pre_shared_token.as_deref(),
+            Some("zc_psk_abcdef123456"),
+            "fork-extra [gateway] pre_shared_token must round-trip"
+        );
+
+        // ── [observability] backend selected + string otel_headers ─────
+        assert_eq!(
+            parsed.observability.backend, "otel",
+            "backend = \"otel\" must be selected"
+        );
+        assert_eq!(
+            parsed.observability.otel_endpoint.as_deref(),
+            Some("http://host.docker.internal:8000")
+        );
+        let headers = parsed
+            .observability
+            .otel_headers
+            .as_ref()
+            .expect("string-form otel_headers must deserialize to Some(map)");
+        // FIRST-`=`-split: the Authorization value keeps its `Bearer ` prefix,
+        // interior chars, AND the trailing `==` base64 padding.
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Bearer proj-key-eyJ0eXAiOiJ=="),
+            "otel_headers must split on the FIRST '=' only (value keeps '=' + spaces)"
+        );
+        // Second comma-separated pair, whitespace-trimmed around the comma.
+        assert_eq!(
+            headers.get("x-scope").map(String::as_str),
+            Some("laminar prod"),
+            "second header pair must parse with a space-containing value"
+        );
+        assert_eq!(headers.len(), 2, "exactly the two rendered headers");
+
+        // ── fork-extra observability keys tolerated / aliased ──────────
+        // runtime_trace_mode aliases onto log_persistence.
+        assert_eq!(parsed.observability.log_persistence, "rolling");
+        // runtime_trace_max_entries aliases onto log_persistence_max_entries.
+        assert_eq!(parsed.observability.log_persistence_max_entries, 500);
+        // otel_deployment_environment is unmodeled but tolerated (no
+        // deny_unknown_fields on ObservabilityConfig) — migration succeeded,
+        // which is the assertion.
+
+        // ── legacy [autonomy] migrated into risk_profiles.default ──────
+        let profile = parsed
+            .risk_profiles
+            .get("default")
+            .expect("legacy [autonomy] must fold into risk_profiles.default");
+        assert_eq!(
+            profile.level,
+            AutonomyLevel::Full,
+            "rendered `level = full` must survive migration"
+        );
+        assert!(
+            !profile.require_approval_for_medium_risk,
+            "full policy: medium-risk approval OFF"
+        );
+        assert!(
+            !profile.block_high_risk_commands,
+            "full policy: high-risk block OFF"
+        );
+
+        // ── flat [channels_config.webhook] alias-wrapped to .default ───
+        let webhook = parsed
+            .channels
+            .webhook
+            .get("default")
+            .expect("flat [channels_config.webhook] must alias-wrap into webhook.default");
+        assert!(webhook.enabled, "webhook.default must be enabled");
+        assert_eq!(webhook.port, 8081, "webhook port must survive");
+        assert_eq!(
+            webhook.send_url.as_deref(),
+            Some("https://example.convex.site/container-webhook"),
+            "webhook send_url must survive"
+        );
+    }
+
+    #[test]
+    async fn otel_headers_string_form_empty_is_none() {
+        // Empty string ⇒ None (clawcraft omits the line entirely when the
+        // header is empty, but a defensively-rendered empty must not error).
+        let raw = r#"
+backend = "otel"
+otel_headers = ""
+"#;
+        let obs: ObservabilityConfig = toml::from_str(raw).expect("empty otel_headers parses");
+        assert!(
+            obs.otel_headers.is_none(),
+            "empty-string otel_headers ⇒ None"
+        );
+    }
+
+    #[test]
+    async fn otel_headers_map_form_still_supported() {
+        // The native/upstream map form must keep working after adding the
+        // string-or-map custom deserializer.
+        let raw = r#"
+backend = "otel"
+
+[otel_headers]
+Authorization = "Bearer sk-map-form"
+x-tenant = "acme"
+"#;
+        let obs: ObservabilityConfig = toml::from_str(raw).expect("map-form otel_headers parses");
+        let headers = obs.otel_headers.expect("map form ⇒ Some");
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Bearer sk-map-form")
+        );
+        assert_eq!(headers.get("x-tenant").map(String::as_str), Some("acme"));
+    }
+
     #[test]
     async fn checklist_gateway_default_no_tokens() {
         let g = GatewayConfig::default();
@@ -21179,6 +21466,7 @@ allowed_numbers = ["+1", "+2"]
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
             session_persistence: true,
+            pre_shared_token: Some("zc_psk_test".into()),
             session_ttl_hours: 0,
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
@@ -21193,6 +21481,7 @@ allowed_numbers = ["+1", "+2"]
         assert_eq!(parsed.session_ttl_hours, 0);
         assert!(!parsed.allow_public_bind);
         assert_eq!(parsed.paired_tokens, vec!["zc_test_token"]);
+        assert_eq!(parsed.pre_shared_token.as_deref(), Some("zc_psk_test"));
         assert_eq!(parsed.pair_rate_limit_per_minute, 12);
         assert_eq!(parsed.webhook_rate_limit_per_minute, 80);
         assert!(parsed.trust_forwarded_headers);
