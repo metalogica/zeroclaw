@@ -186,6 +186,17 @@
         ],
         "result": "green (assert 2/3/4 PASS; belt build 1.52s — code tree provably unchanged, no full re-gate needed per Fable amend)",
         "note": "History rewrite; compiled tree identical to the already-green d1db0c8fd/e9201a7c1 lineage."
+      },
+      {
+        "wave": "6 (file-disjoint fleet: w6a zc-vja9 ∥ w6b zc-4leb→zc-p7tx)",
+        "tip-sha": "core/v0.8.0@315220221",
+        "commands": [
+          "bijection over refs/heads/upstream..HEAD  (14 commits ⇄ 13 rows; FD-04 carries 2)",
+          "bash -n dev/hotswap/verify-coldstart.sh",
+          "yaml.safe_load both .github/workflows/*.yml"
+        ],
+        "result": "green (bijection holds incl. new FD-09/FD-10 + coldstart's 2nd FD-04 commit; coldstart syntax ok; workflows valid YAML)",
+        "note": "Wave-6 delta (05ce4c459..HEAD) is bash/yaml/docs ONLY — zero .rs added, so no cargo re-gate (cf wave 4-B). Merged linearly via cherry-pick (no merge commit — a merge commit in upstream..HEAD would carry no trailer and break the bijection). Coldstart live run + actionlint are out-of-band (zc-b78l / CI)."
       }
     ],
     "outcomes": {
@@ -327,6 +338,27 @@
         "wave": "5-squash (orchestrator single-writer, pre-Wave-6)",
         "commit": "05ce4c459 (new core/v0.8.0 tip)",
         "note": "Squash-by-theme (Fable Decision 2, (a)-variant, amended asserts). Rewrote refs/heads/upstream(5fc9d3c38)..core/v0.8.0 from 37 commits (26 content + 11 merges) into 11 dependency-ordered theme commits, each atomic with its ledger row + Fork-Delta: FD-NN trailer. Order [00,01,02,03,04,06,05,08,11,12,07] preserves shared-file relative order (gateway 04\u219206\u219205\u219207, otel 12\u219207, agent 03\u219207). zc-ju48 kept as its OWN FD-12 commit (bf19bd7d1, upstreaming-candidate). FD-08 row authored+landed (was deferred). Asserts 2/3/4 PASS; belt build 1.52s warm. Pre-tag archive/pre-hnah-squash=e9201a7c1. zc-4leb now validates its bijection against this squashed tree."
+      },
+      "zc-vja9": {
+        "status": "pass",
+        "wave": "6-w6a",
+        "commit": "f33832f3d (cherry-picked onto core; orig 284d42e42)",
+        "fork-delta": "FD-04 (rides the config-compat theme; no new row)",
+        "note": "Cold-start parity harness dev/hotswap/verify-coldstart.sh (358 lines, mode 0755). bash -n + shellcheck clean. Live run OUT-OF-BAND (needs live pod + :dev image + dev ClickHouse) — batched into zc-b78l. Self-review note: §9 sentinel uses memories(content) as a representative durable row; confirm table name against live schema during zc-b78l. Blocks zc-b78l."
+      },
+      "zc-4leb": {
+        "status": "pass",
+        "wave": "6-w6b",
+        "commit": "c23ab7934 (cherry-picked; orig e06c6c77d)",
+        "fork-delta": "FD-09",
+        "note": ".github/workflows/fork-delta-check.yml (125 lines) — bijection CI asserting (i) every commit->trailer->row, (ii) every row->>=1 commit, (iii) transitional rows carry end-state+removal-ref. Uses refs/heads/upstream EXPLICITLY (ambiguous refname — an upstream remote IS configured here); materializes it from pinned base 5fc9d3c38 on fetch-depth:0 CI. Local green + 2 negative controls. actionlint is CI-only (absent locally)."
+      },
+      "zc-p7tx": {
+        "status": "pass",
+        "wave": "6-w6b",
+        "commit": "315220221 (cherry-picked; orig 1ceafeb53)",
+        "fork-delta": "FD-10",
+        "note": ".github/workflows/conflict-canary.yml (188 lines) — weekly informational merge-tree walk vs upstream/main, attributes conflicts to FD ids, single pinned tracking issue, ALWAYS exits 0 on successful analysis. DEVIATION (correct): spec's positional `git merge-tree --write-tree $(merge-base) tip up` errors on git 2.47 — runner used the `--merge-base=<mb>` flag form (same semantics). Local dry-run vs refs/heads/upstream proxy exit 0 + negative control. gh-issue upsert is CI-only."
       }
     },
     "notes": "Upstream advanced to v0.8.1/v0.8.2 during Wave 1; base held at v0.8.0 per locked spec decision. Continuation STOP-check negative.",

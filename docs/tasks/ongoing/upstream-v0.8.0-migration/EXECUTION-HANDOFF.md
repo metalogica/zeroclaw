@@ -101,7 +101,15 @@ Wave 6 (zc-vja9, zc-4leb, zc-p7tx) → zc-b78l (manual) → zc-t0ii → zc-garf.
 > - **zc-hnah squash-by-theme** rewrote `refs/heads/upstream(5fc9d3c38)..core/v0.8.0` → **11 dependency-ordered theme commits**, each atomic with its ledger row + `Fork-Delta: FD-NN` trailer. Per Fable's amended verification: code-tree assert (`git diff old..new -- ':!docs/FORK_DELTA.md'`) EMPTY, ledger set-equality PASS, bijection dry-run PASS (11⇄11), belt build 1.52s. Rollback tag `archive/pre-hnah-squash` = `e9201a7c1`.
 > - **FD-08 row** (openrouter `user`/`[AUDIO:]` + provider verdicts, zc-ul1f/zc-qskr) was found MISSING (deferred at wave time) and authored+landed during the squash so the bijection holds — the sole ledger row-set addition.
 > - **Empty-diff assertion amendment** (code-tree-identical + ledger-set-equality) approved by Fable in-thread; recorded in `.substrate/execution-state.json` deviations as the audit trail.
-> - **NEXT: Wave 6** — `zc-vja9` (coldstart harness), `zc-4leb` (bijection CI — now validates GREEN against this squashed tree; use `refs/heads/upstream`), `zc-p7tx` (canary). All Wave-6+ commits carry their `Fork-Delta:` trailer at commit time (no further squash). **Paused here for user checkpoint before Wave 6.** Signing stays disabled until epic close.
+> - Wave 6 ran next (see below). Signing stays disabled until epic close.
+
+> **SESSION UPDATE 2026-07-10c — Wave 6 DONE (file-disjoint fleet); sovereign tip `core/v0.8.0` @ `315220221`.**
+> Two parallel windows off `05ce4c459`, merged linearly via cherry-pick (NO merge commits — a merge commit in `upstream..HEAD` carries no trailer and breaks the bijection):
+> - **zc-vja9** (w6a) — `dev/hotswap/verify-coldstart.sh` (358-line cold-start parity harness), `bash -n` + shellcheck clean, rides `Fork-Delta: FD-04` (no new row). Live run is OUT-OF-BAND — batched into zc-b78l. `@f33832f3d`.
+> - **zc-4leb** (w6b) — `.github/workflows/fork-delta-check.yml` bijection CI (FD-09), `refs/heads/upstream` explicit + pinned-base materialization on CI. `@c23ab7934`.
+> - **zc-p7tx** (w6b) — `.github/workflows/conflict-canary.yml` weekly informational merge-tree walk (FD-10), always-exit-0. Corrected the `git merge-tree --write-tree` base to the git-2.47 `--merge-base=` flag form. `@315220221`.
+> - **Final bijection GREEN** over `refs/heads/upstream..HEAD`: 14 commits ⇄ 13 rows (FD-00…FD-12; FD-04 carries 2 commits — theme + coldstart, allowed by criterion ii). Wave-6 delta is bash/yaml/docs only → no cargo re-gate. Beads zc-vja9/zc-4leb/zc-p7tx closed.
+> - **REMAINING TAIL:** `zc-b78l` (manual live Laminar battery — batch with the coldstart run + the zc-n6so/zc-8zdt NPM_TOKEN docker smokes) → `zc-t0ii` (reduced: archive playbook + post-exec notes + final bijection audit) → `zc-garf` (doctrine review). `zc-mk2r` (P3, shutdown drain) is an independent follow-up. Epic close: restore signing (`git config --unset commit.gpgsign`), drop `archive/pre-hnah-squash`.
 
 ## Remaining waves (resume order)
 
