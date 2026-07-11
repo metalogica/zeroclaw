@@ -433,51 +433,73 @@ fn compute_excluded_mcp_tools(
 }
 
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
+    Regex::new(r#"(?i)["']?(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|authorization)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
 });
 
+static BEARER_VALUE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)\b(bearer)\s+([A-Za-z0-9_./+=~-]{8,})"#).unwrap());
+
+static BARE_TOKEN_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"\b(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{8,}|xoxb-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{16})\b"#,
+    )
+    .unwrap()
+});
+
+/// First 4 characters of a redacted value, kept for context.
+/// Uses char_indices to find the byte offset of the 4th character
+/// so we never slice in the middle of a multi-byte UTF-8 sequence.
+fn redaction_prefix(val: &str) -> &str {
+    if val.len() > 4 {
+        val.char_indices()
+            .nth(4)
+            .map(|(byte_idx, _)| &val[..byte_idx])
+            .unwrap_or(val)
+    } else {
+        ""
+    }
+}
+
 /// Scrub credentials from tool output to prevent accidental exfiltration.
-/// Replaces known credential patterns with a redacted placeholder while preserving
-/// a small prefix for context.
+/// Three passes, each preserving a small prefix for context: (1) sensitive
+/// key/value pairs (`api_key: …`, `"authorization": "…"`), (2) the value-form
+/// `Bearer <token>` with no preceding sensitive key (the shape HTTP-auth args
+/// take), (3) bare well-known-prefix tokens (`sk-…`, `ghp_…`, `xoxb-…`, `AKIA…`)
+/// with no key context at all.
 pub fn scrub_credentials(input: &str) -> String {
-    SENSITIVE_KV_REGEX
-        .replace_all(input, |caps: &regex::Captures| {
-            let full_match = &caps[0];
-            let key = &caps[1];
-            let val = caps
-                .get(2)
-                .or(caps.get(3))
-                .or(caps.get(4))
-                .map(|m| m.as_str())
-                .unwrap_or("");
+    let scrubbed = SENSITIVE_KV_REGEX.replace_all(input, |caps: &regex::Captures| {
+        let full_match = &caps[0];
+        let key = &caps[1];
+        let val = caps
+            .get(2)
+            .or(caps.get(3))
+            .or(caps.get(4))
+            .map(|m| m.as_str())
+            .unwrap_or("");
+        let prefix = redaction_prefix(val);
 
-            // Preserve first 4 chars for context, then redact.
-            // Use char_indices to find the byte offset of the 4th character
-            // so we never slice in the middle of a multi-byte UTF-8 sequence.
-            let prefix = if val.len() > 4 {
-                val.char_indices()
-                    .nth(4)
-                    .map(|(byte_idx, _)| &val[..byte_idx])
-                    .unwrap_or(val)
-            } else {
-                ""
-            };
-
-            if full_match.contains(':') {
-                if full_match.contains('"') {
-                    format!("\"{}\": \"{}*[REDACTED]\"", key, prefix)
-                } else {
-                    format!("{}: {}*[REDACTED]", key, prefix)
-                }
-            } else if full_match.contains('=') {
-                if full_match.contains('"') {
-                    format!("{}=\"{}*[REDACTED]\"", key, prefix)
-                } else {
-                    format!("{}={}*[REDACTED]", key, prefix)
-                }
+        if full_match.contains(':') {
+            if full_match.contains('"') {
+                format!("\"{}\": \"{}*[REDACTED]\"", key, prefix)
             } else {
                 format!("{}: {}*[REDACTED]", key, prefix)
             }
+        } else if full_match.contains('=') {
+            if full_match.contains('"') {
+                format!("{}=\"{}*[REDACTED]\"", key, prefix)
+            } else {
+                format!("{}={}*[REDACTED]", key, prefix)
+            }
+        } else {
+            format!("{}: {}*[REDACTED]", key, prefix)
+        }
+    });
+    let scrubbed = BEARER_VALUE_REGEX.replace_all(&scrubbed, |caps: &regex::Captures| {
+        format!("{} {}*[REDACTED]", &caps[1], redaction_prefix(&caps[2]))
+    });
+    BARE_TOKEN_REGEX
+        .replace_all(&scrubbed, |caps: &regex::Captures| {
+            format!("{}*[REDACTED]", redaction_prefix(&caps[1]))
         })
         .to_string()
 }
@@ -6615,6 +6637,47 @@ mod tests {
         let scrubbed = scrub_credentials(input);
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
+        // The match must consume the key's opening quote — no stray `{""` emission.
+        assert!(!scrubbed.contains("{\"\""), "{scrubbed}");
+    }
+
+    #[test]
+    fn scrub_credentials_redacts_value_form_bearer() {
+        let scrubbed = scrub_credentials("Authorization: Bearer sk-1234567890abcdef");
+        assert!(scrubbed.contains("Bearer sk-1*[REDACTED]"), "{scrubbed}");
+        assert!(!scrubbed.contains("abcdef"));
+        // No preceding header key, lowercase.
+        let scrubbed = scrub_credentials("send bearer abcdefgh12345678 to the api");
+        assert!(scrubbed.contains("bearer abcd*[REDACTED]"), "{scrubbed}");
+        assert!(!scrubbed.contains("abcdefgh12345678"));
+    }
+
+    #[test]
+    fn scrub_credentials_redacts_authorization_key_forms() {
+        let scrubbed = scrub_credentials("authorization=Basic0123456789");
+        assert!(
+            scrubbed.contains("authorization=Basi*[REDACTED]"),
+            "{scrubbed}"
+        );
+        let scrubbed = scrub_credentials(r#"{"authorization": "abc123456789"}"#);
+        assert!(
+            scrubbed.contains("\"authorization\": \"abc1*[REDACTED]\""),
+            "{scrubbed}"
+        );
+    }
+
+    #[test]
+    fn scrub_credentials_redacts_bare_prefix_tokens() {
+        let input = "logs: sk-live-DEADBEEFdeadbeef00 ghp_0123456789abcdef xoxb-123456789-abcd AKIAIOSFODNN7EXAMPLE";
+        let scrubbed = scrub_credentials(input);
+        assert!(scrubbed.contains("sk-l*[REDACTED]"), "{scrubbed}");
+        assert!(scrubbed.contains("ghp_*[REDACTED]"));
+        assert!(scrubbed.contains("xoxb*[REDACTED]"));
+        assert!(scrubbed.contains("AKIA*[REDACTED]"));
+        assert!(!scrubbed.contains("DEADBEEF"));
+        assert!(!scrubbed.contains("EXAMPLE"));
+        // Already-redacted output must be a fixed point, not re-mangled.
+        assert_eq!(scrub_credentials(&scrubbed), scrubbed);
     }
 
     #[tokio::test]
