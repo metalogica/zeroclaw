@@ -11,12 +11,11 @@
 # and the rollback drill. Fork-Delta: FD-11.
 #
 # ── Prerequisites (READ docs/RELEASE.md before first run) ────────────────────
-# * PRAXIS_PACKAGES_READ_PAT (repo secret): a GitHub Personal Access Token with
-#   `read:packages` scope on the @soulbound-labs org, used to `npm install` the
-#   private @soulbound-labs/praxis package. THIS FORK LIVES UNDER THE
-#   `metalogica` ORG, NOT `soulbound-labs` — so the ambient `GITHUB_TOKEN` does
-#   NOT carry cross-org packages-read. A dedicated PAT is REQUIRED here (a
-#   soulbound-labs-org repo could rely on the implicit token; this fork cannot).
+# * @soulbound-labs/praxis packages read: this repo lives under the
+#   `soulbound-labs` org (same org as the package), so the ambient
+#   `GITHUB_TOKEN` (`permissions: packages: read`) authenticates the private
+#   npm install — no PAT. One-time setup: grant this repo Actions access on
+#   the praxis package (see docs/RELEASE.md §0.1).
 # * WIF (Workload Identity Federation) to GCP — no JSON service-account keys.
 #   The WIF pool must be extended to trust THIS repo's OIDC subject. That pool
 #   extension is a clawcraft Terraform change (plan-reviewed) — it is NOT made
@@ -24,8 +23,7 @@
 #   error; that is expected and is the Terraform gate, not a workflow bug.
 #
 # ── Required configuration (set in repo Settings) ────────────────────────────
-#   Secrets:
-#     PRAXIS_PACKAGES_READ_PAT   read:packages PAT for @soulbound-labs/praxis
+#   Secrets: (none — the praxis read uses the ambient GITHUB_TOKEN)
 #   Variables (vars):
 #     GCP_WORKLOAD_IDENTITY_PROVIDER  full WIF provider resource name
 #     GCP_DEPLOY_SA_EMAIL             AR-writer-scoped service-account email
@@ -46,6 +44,7 @@ concurrency:
 permissions:
   contents: read
   id-token: write   # required for WIF / google-github-actions/auth OIDC
+  packages: read    # ambient-token read of the private @soulbound-labs/praxis npm
 
 jobs:
   build-smoke-push:
@@ -86,21 +85,18 @@ jobs:
         run: gcloud auth configure-docker "${{ vars.GCP_AR_REGISTRY }}" --quiet
 
       # ── Praxis npm auth (private @soulbound-labs/praxis) ──────────────────
-      # metalogica-org repo → the ambient GITHUB_TOKEN has NO cross-org
-      # packages-read. A dedicated read:packages PAT is REQUIRED. The token is
-      # passed to BuildKit as a `--secret` (id=npm_token) and NEVER as an ARG or
-      # ENV, so it cannot persist in any image layer (Dockerfile stage
-      # `praxis-install` mounts it at `/run/secrets/npm_token`).
+      # Same-org repo → the ambient GITHUB_TOKEN (permissions: packages: read)
+      # covers the private packages read; no PAT. The token is passed to
+      # BuildKit as a `--secret` (id=npm_token) and NEVER as an ARG or ENV, so
+      # it cannot persist in any image layer (Dockerfile stage `praxis-install`
+      # mounts it at `/run/secrets/npm_token`). If the install 403s, the praxis
+      # package hasn't granted this repo Actions access — see RELEASE.md §0.1.
       - name: Provision praxis npm token file
         env:
-          PRAXIS_PACKAGES_READ_PAT: ${{ secrets.PRAXIS_PACKAGES_READ_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ -z "${PRAXIS_PACKAGES_READ_PAT}" ]; then
-            echo "::error::PRAXIS_PACKAGES_READ_PAT is empty. This fork is under the metalogica org and CANNOT use the ambient GITHUB_TOKEN for the private @soulbound-labs/praxis read. Set the read:packages PAT secret — see docs/RELEASE.md." >&2
-            exit 1
-          fi
           umask 077
-          printf '%s' "${PRAXIS_PACKAGES_READ_PAT}" > "${RUNNER_TEMP}/npm_token"
+          printf '%s' "${GITHUB_TOKEN}" > "${RUNNER_TEMP}/npm_token"
 
       # ── Build the release image locally (load, do NOT push yet) ───────────
       # Push is deferred until AFTER the smoke passes (spec §MUST: smoke before

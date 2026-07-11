@@ -15,29 +15,31 @@
 
 ## 0. Prerequisites (READ BEFORE THE FIRST RELEASE)
 
-### 0.1 Packages-read PAT — REQUIRED for this fork (metalogica org)
+### 0.1 Praxis packages read — ambient `GITHUB_TOKEN` (same-org fork)
 
-This fork's `origin` is **`git@github.com:metalogica/zeroclaw.git`** — the repo
-lives under the **`metalogica`** org, **NOT `soulbound-labs`**. The release
-image bundles the **private** `@soulbound-labs/praxis` CLI, installed from GitHub
-Packages during the Docker build.
+This fork's `origin` is **`git@github.com:soulbound-labs/zeroclaw.git`** — the
+repo lives under the **`soulbound-labs`** org, the same org that publishes the
+**private** `@soulbound-labs/praxis` CLI to GitHub Packages (bundled into the
+release image during the Docker build).
 
-**A repo under the `soulbound-labs` org could authenticate that npm read with the
-ambient `GITHUB_TOKEN`. This fork cannot** — `GITHUB_TOKEN` does not carry
-cross-org `read:packages`. Therefore the workflow consumes a dedicated
-**`secrets.PRAXIS_PACKAGES_READ_PAT`**:
+Same-org means **no PAT is needed**: the workflow authenticates the npm read
+with the ambient **`GITHUB_TOKEN`** (declared `permissions: packages: read`).
+One-time setup only:
 
-- A GitHub **Personal Access Token** (classic or fine-grained) with **`read:packages`**
-  scope, authorized against the `soulbound-labs` org (SSO-authorized if the org
-  enforces SAML SSO).
-- Stored as the repo secret **`PRAXIS_PACKAGES_READ_PAT`** (Settings → Secrets and
-  variables → Actions).
+- Grant this repo access on the praxis package: **soulbound-labs org → Packages
+  → praxis → Package settings → Manage Actions access → add `zeroclaw`**
+  (read). Packages published from the clawcraft repo are not automatically
+  readable by sibling repos' workflows until granted.
 - The token is passed to BuildKit **as a `--secret` (`id=npm_token`)**, never as an
   `ARG`/`ENV`, so it never persists in an image layer (see the `praxis-install`
   stage in `Dockerfile`).
 
-If this secret is missing/empty, the workflow **fails fast** with a message
-pointing here — it does not silently fall back to `GITHUB_TOKEN`.
+> History: before 2026-07-11 the fork lived under the `metalogica` org, where
+> the cross-org read required a dedicated `PRAXIS_PACKAGES_READ_PAT`. The repo
+> transfer to `soulbound-labs` retired that secret entirely.
+
+For **local** builds/smokes (`NPM_TOKEN` env), any token with `read:packages`
+on the org works — e.g. `gh auth token` from a soulbound-labs member.
 
 ### 0.2 WIF (Workload Identity Federation) to GCP — no JSON keys
 
@@ -256,4 +258,4 @@ The durable procedure (see `docs/FORK_DELTA.md` header for the authoritative cop
 | Convex prod deployment | `colorful-rook-584` |
 | Rollback | re-pin previous SHA (§2.1) + restore brain.db `backup-*` (§2.2) |
 | Praxis pin | `0.10.0` (`Dockerfile ARG PRAXIS_VERSION`; bump is out of scope for this workflow) |
-| PAT secret | `PRAXIS_PACKAGES_READ_PAT` (read:packages; metalogica org can't use `GITHUB_TOKEN`) |
+| Praxis npm auth | ambient `GITHUB_TOKEN` (`permissions: packages: read`; same-org — no PAT, see §0.1) |
